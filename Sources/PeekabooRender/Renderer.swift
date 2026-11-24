@@ -300,7 +300,7 @@ public final class Renderer {
 
     // Prepared neighbours (GPU resources built ahead of time).
     private var prepared: [(id: ObjectIdentifier, gpu: GPUImage)] = []
-    private static let preparedLimit = 6
+    private static let preparedLimit = 4
 
     private var hdrActive = false
 

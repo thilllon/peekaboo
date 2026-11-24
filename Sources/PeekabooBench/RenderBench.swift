@@ -16,6 +16,7 @@ func runRenderBench(_ args: ArraySlice<String>) throws {
     var frames = 20
     var noAR = false
     var pngDir: String?
+    var rgba = false
     var size = (3456, 2234)
     var it = args.makeIterator()
     while let a = it.next() {
@@ -23,6 +24,7 @@ func runRenderBench(_ args: ArraySlice<String>) throws {
         case "--frames": frames = Int(it.next() ?? "") ?? frames
         case "--no-ar": noAR = true
         case "--png": pngDir = it.next()
+        case "--rgba": rgba = true
         case "--size":
             let parts = (it.next() ?? "").split(separator: "x").compactMap { Int($0) }
             if parts.count == 2 { size = (parts[0], parts[1]) }
@@ -41,8 +43,18 @@ func runRenderBench(_ args: ArraySlice<String>) throws {
     let contextMs = Trace.ms(since: contextStart)
     let pool = PixelBufferPool(device: context.device)
     let decodeStart = Trace.now()
-    let image = try ImageIODecoder().decode(URL(fileURLWithPath: path), tier: .full, targetLongSide: 0, pool: pool)
+    var image = try ImageIODecoder().decode(URL(fileURLWithPath: path), tier: .full, targetLongSide: 0, pool: pool)
     let decodeMs = Trace.ms(since: decodeStart)
+    if rgba, image.pixels.layout == .bgra8, case .metal(let buffer) = image.pixels.storage {
+        // Experiment: the same pixels as RGBA bytes.
+        let px = image.pixels
+        let p = px.baseAddress.assumingMemoryBound(to: UInt8.self)
+        for y in 0..<px.height { for x in 0..<px.width { let o = y * px.bytesPerRow + x * 4; let b = p[o]; p[o] = p[o + 2]; p[o + 2] = b } }
+        let swapped = PixelBuffer(width: px.width, height: px.height, bytesPerRow: px.bytesPerRow, layout: .rgba8, alpha: px.alpha,
+                                  colorSpace: px.colorSpace, storage: .metal(buffer))
+        image = DecodedImage(pixels: swapped, tier: .full, fullWidth: image.fullWidth, fullHeight: image.fullHeight,
+                             orientation: image.orientation, isHDR: false, decodeNanos: 0)
+    }
     print("image: \(URL(fileURLWithPath: path).lastPathComponent) \(image.pixels.width)x\(image.pixels.height) "
           + "(decode \(String(format: "%.1f", decodeMs)) ms, shader/pipeline init \(String(format: "%.1f", contextMs)) ms)")
     print("frame: \(size.0)x\(size.1) device px into bgra8Unorm, median of \(frames) frames, GPU time (gpuEnd - gpuStart)")
@@ -107,6 +119,21 @@ func runRenderBench(_ args: ArraySlice<String>) throws {
         print(String(format: "gesture %@: %.3f ms (%@)", name, t, renderer.lastPath))
         renderer.endInteraction()
     }
+    // The usual fit view: the screen tier (decoded to cover the screen), treated as pyramid level k.
+    let screen = try ImageIODecoder().decode(URL(fileURLWithPath: path), tier: .screen, targetLongSide: max(size.0, size.1), pool: pool)
+    let tiered = Renderer(layer: CAMetalLayer())
+    tiered.setViewSize(CGSize(width: size.0, height: size.1), backingScale: 1)
+    tiered.setImage(screen, key: "screen")
+    let until = Date().addingTimeInterval(10)
+    while !tiered.isPyramidComplete(for: screen) && Date() < until { RunLoop.main.run(until: Date().addingTimeInterval(0.001)) }
+    var times: [Double] = []
+    for _ in 0..<frames {
+        tiered.discardCanvas()
+        _ = tiered.renderOffscreen(format: .bgra8Unorm)
+        times.append(tiered.lastFrameGPUms)
+    }
+    print(String(format: "fit, screen tier %dx%d: settle frame %.3f ms (%@)", screen.pixels.width, screen.pixels.height,
+                 median(times), tiered.lastPath))
 }
 
 /// Write a `bgra8Unorm` frame (Display P3 encoded) as PNG, for eyeballing the renderer's output.
