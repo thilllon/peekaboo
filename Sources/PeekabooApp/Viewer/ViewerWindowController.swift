@@ -833,7 +833,9 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             } else {
                 window?.performClose(nil)
             }
-        case .close: window?.performClose(nil)
+        case .close:
+            // Instant full screen is borderless: without a close button `performClose` only beeps.
+            if instantFullscreen != nil { window?.close() } else { window?.performClose(nil) }
         case .quit: NSApp.terminate(nil)
         case .open: onOpenPanel?()
         case .undo: handle(fileActions.undo())
