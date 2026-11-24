@@ -31,17 +31,35 @@ struct ColorTransform {
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var cache: [AnyHashable: ColorTransform] = [:]
+    /// Probes of uncommon profiles run here, never on the main thread (1–3 ms each).
+    static let probeQueue = DispatchQueue(label: "com.thilllon.peekaboo.icc-probe", qos: .userInitiated)
 
-    /// The cached transform for `space` (probing unknown profiles once: ~1–3 ms).
-    static func forSpace(_ space: CGColorSpace) -> ColorTransform {
-        let key: AnyHashable = (space.name as String?).map { AnyHashable($0) }
+    private static func key(_ space: CGColorSpace) -> AnyHashable {
+        (space.name as String?).map { AnyHashable($0) }
             ?? space.copyICCData().map { AnyHashable($0 as Data) } ?? AnyHashable("unknown")
-        lock.lock()
-        if let hit = cache[key] { lock.unlock(); return hit }
-        lock.unlock()
-        let made = known(space) ?? probe(space) ?? ColorTransform(rows: srgbToP3Rows, curve: .srgb, lut: [])
-        lock.lock(); cache[key] = made; lock.unlock()
+    }
+
+    /// The cached transform for `space` (probing unknown profiles once: ~1–3 ms). May block: call it off the main
+    /// thread for spaces `cached(_:)` does not know.
+    static func forSpace(_ space: CGColorSpace) -> ColorTransform {
+        if let hit = cached(space) { return hit }
+        let made = probe(space) ?? ColorTransform(rows: srgbToP3Rows, curve: .srgb, lut: [])
+        lock.lock(); cache[key(space)] = made; lock.unlock()
         return made
+    }
+
+    /// The transform for `space` if it needs no probe (named sRGB / Display P3 / linear spaces, or a profile probed
+    /// before); nil otherwise. Cheap enough for the main thread (a name compare or an ICC-data hash lookup).
+    static func cached(_ space: CGColorSpace) -> ColorTransform? {
+        if let made = known(space) { return made }
+        let k = key(space)
+        lock.lock(); defer { lock.unlock() }
+        return cache[k]
+    }
+
+    /// Stand-in while `space` is probed: the sRGB curve with sRGB or (wide-gamut profiles) Display P3 primaries.
+    static func fallback(for space: CGColorSpace) -> ColorTransform {
+        ColorTransform(rows: space.isWideGamutRGB ? identityRows : srgbToP3Rows, curve: .srgb, lut: [])
     }
 
     private static func known(_ space: CGColorSpace) -> ColorTransform? {

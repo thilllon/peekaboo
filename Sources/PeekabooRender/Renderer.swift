@@ -197,6 +197,20 @@ struct Perm: Equatable {
     }
 }
 
+/// HQ canvas (linear Display P3, premultiplied, stored-axis orientation).
+struct HQCanvas {
+    let texture: MTLTexture
+    let width: Int, height: Int
+    var key: AnyHashable?
+    let source: ObjectIdentifier
+    let level: Int
+    let f: Double
+    let minv: Perm
+    /// Stored-space position of canvas pixel (0,0)'s centre.
+    let origin: SIMD2<Double>
+    let drawable: SIMD2<Double>
+}
+
 // MSL mirrors.
 struct RP {
     var ox: Float = 0, oy: Float = 0, sx: Float = 1, sy: Float = 1, kx: Float = 1, ky: Float = 1
@@ -241,7 +255,10 @@ public final class Renderer {
         didSet {
             guard settings != oldValue else { return }
             if settings.filter != oldValue.filter || settings.sharpness != oldValue.sharpness
-                || settings.antiRinging != oldValue.antiRinging { canvas = nil }
+                || settings.antiRinging != oldValue.antiRinging {
+                canvas = nil
+                invalidateFitCanvases()
+            }
             requestDisplay()
         }
     }
@@ -259,6 +276,16 @@ public final class Renderer {
     public private(set) var lastFrameGPUms: Double = 0
     /// Which path drew the last frame (tracing, tests).
     public private(set) var lastPath = "none"
+    /// Present mode of the last frame: true = vsync-aligned (`displaySyncEnabled`), false = immediate. Traced too.
+    public private(set) var lastFrameDisplaySync = false
+    /// The last frame ran a resampling pass (HQ canvas or preview conversion); false = present only (tests, bench).
+    public private(set) var lastFrameRasterised = false
+    /// An animation drives frames (besides gestures between `beginInteraction()` and `endInteraction()`): present
+    /// vsync-aligned while it runs so continuous motion never tears.
+    public var isAnimating = false { didSet { updatePresentMode() } }
+    /// EDR headroom (× SDR white) the drawables of HDR images are tagged with (`contentsHeadroom`): 3 stops, above
+    /// what current gain-map photos use (≈ 2–3 stops); the compositor clamps to what the display can show.
+    public static let hdrHeadroom: CGFloat = 8
 
     private let context: RenderContext
     private var gpu: GPUImage?
@@ -268,19 +295,7 @@ public final class Renderer {
     /// Image-space point (display orientation, full-resolution pixels) at the view centre.
     private var center = SIMD2<Double>(0, 0)
 
-    // HQ canvas (linear Display P3, premultiplied, stored-axis orientation).
-    private struct Canvas {
-        let texture: MTLTexture
-        let width: Int, height: Int
-        let key: AnyHashable?
-        let source: ObjectIdentifier
-        let level: Int
-        let f: Double
-        let minv: Perm
-        /// Stored-space position of canvas pixel (0,0)'s centre.
-        let origin: SIMD2<Double>
-        let drawable: SIMD2<Double>
-    }
+    private typealias Canvas = HQCanvas
     private var canvas: Canvas?
     private var offscreenTarget: MTLTexture?
     private var canvasTexture: MTLTexture?
@@ -302,6 +317,9 @@ public final class Renderer {
     // Prepared neighbours (GPU resources built ahead of time).
     private var prepared: [(id: ObjectIdentifier, gpu: GPUImage)] = []
     private static let preparedLimit = 4
+    /// Pre-rendered fit canvases kept for images other than the shown one (≈ 60 MB each at 3456×2234: next + previous).
+    private static let fitCanvasLimit = 2
+    private var refitWork: DispatchWorkItem?
 
     private var hdrActive = false
 
@@ -314,6 +332,7 @@ public final class Renderer {
         layer.isOpaque = true
         layer.colorspace = CGColorSpace(name: CGColorSpace.displayP3)
         layer.maximumDrawableCount = 3
+        updatePresentMode()
     }
 
     // MARK: Content
@@ -333,10 +352,7 @@ public final class Renderer {
             previousTier = previous
         }
         if let gpu {
-            gpu.onLevelReady = { [weak self, weak gpu] _ in
-                guard let self, let gpu, gpu === self.gpu else { return }
-                if self.waitingForLevel { self.requestDisplay() }
-            }
+            attach(gpu)
             gpu.startPyramid(context: context)
         }
         if isNewFile {
@@ -353,9 +369,33 @@ public final class Renderer {
 
     /// Build GPU resources (textures, colour transform, pyramid) for an image that will probably be shown next,
     /// off the critical path. Cheap on the calling (main) thread; the pyramid builds in the background.
+    ///
+    /// Also pre-renders the HQ canvas of the fit view the image opens with at the current drawable size (once its
+    /// pyramid level is ready), so `setImage` + `render` of a neighbour is a present-only frame (≈ 0.3 ms GPU instead
+    /// of a residual pass). Invalidated by resizes and filter changes; at most `fitCanvasLimit` are kept.
     public func prepare(_ image: DecodedImage) {
         let gpu = gpuImage(for: image)
+        attach(gpu)
         gpu.startPyramid(context: context)
+        guard gpu !== self.gpu else { return }
+        gpu.wantsFitCanvas = true
+        renderFitCanvas(gpu)
+    }
+
+    /// Main-thread callbacks of `g` (shown or prepared).
+    private func attach(_ g: GPUImage) {
+        g.onLevelReady = { [weak self, weak g] _ in
+            guard let self, let g else { return }
+            if g === self.gpu, self.waitingForLevel { self.requestDisplay() }
+            if g.wantsFitCanvas, g.fitCanvas == nil { self.renderFitCanvas(g) }
+        }
+        g.onColorReady = { [weak self, weak g] in
+            guard let self, let g else { return }
+            // Frames drawn with the fallback transform are stale now.
+            if let c = self.canvas, c.source == ObjectIdentifier(g) { self.canvas = nil }
+            if g === self.gpu { self.requestDisplay() }
+            if g.wantsFitCanvas { self.renderFitCanvas(g) }
+        }
     }
 
     private func gpuImage(for image: DecodedImage) -> GPUImage {
@@ -375,6 +415,9 @@ public final class Renderer {
         return made
     }
 
+    /// EDR for HDR images (macOS 26 API: `preferredDynamicRange` + `contentsHeadroom` tag the drawables, so the
+    /// compositor neither tone-maps them to SDR nor spends EDR power on SDR images). Free when the range does not
+    /// change (every SDR → SDR swap).
     private func configureDynamicRange(hdr: Bool) {
         guard hdr != hdrActive else { return }
         hdrActive = hdr
@@ -382,25 +425,41 @@ public final class Renderer {
         if hdr {
             layer.pixelFormat = .rgba16Float
             layer.colorspace = CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)
-            layer.wantsExtendedDynamicRangeContent = true
+            layer.contentsHeadroom = Self.hdrHeadroom
             layer.preferredDynamicRange = .high
         } else {
             layer.pixelFormat = Self.drawableFormat
             layer.colorspace = CGColorSpace(name: CGColorSpace.displayP3)
-            layer.wantsExtendedDynamicRangeContent = false
+            layer.contentsHeadroom = 0
             layer.preferredDynamicRange = .standard
         }
+    }
+
+    // MARK: Present mode
+
+    /// Discrete updates (image swaps, single zoom / rotate steps, refine passes, pyramid-level arrivals) present
+    /// immediately (`displaySyncEnabled = false`): on the built-in 120 Hz panel at a random present phase the median
+    /// present latency measured 13.6 ms (p90 16.1) with display sync and 5.9 ms (p90 8.6) without (2 drawables with
+    /// sync: 12.5 ms; `presentsWithTransaction`: 23.3 ms, never used). Gestures (between `beginInteraction()` and
+    /// `endInteraction()`, which also covers the app's display-link pan and momentum) and `isAnimating` keep display
+    /// sync so continuous motion never tears. `maximumDrawableCount` stays 3: 2 drawables gained only 1.1 ms with
+    /// sync (12.5 ms) and risk `nextDrawable` stalls during motion.
+    private func updatePresentMode() {
+        let sync = interacting || isAnimating
+        if layer.displaySyncEnabled != sync { layer.displaySyncEnabled = sync }
     }
 
     // MARK: Geometry
 
     /// View size in points and the backing scale factor (device pixels per point).
     public func setViewSize(_ size: CGSize, backingScale scale: CGFloat) {
+        let before = drawableSize
         viewSize = CGSize(width: max(size.width, 1), height: max(size.height, 1))
         backingScale = max(scale, 1)
         layer.contentsScale = backingScale
         layer.drawableSize = CGSize(width: viewSize.width * backingScale, height: viewSize.height * backingScale)
         clampCenter()
+        if drawableSize != before { invalidateFitCanvases() }
     }
 
     /// Device pixels per full-resolution image pixel right now.
@@ -468,10 +527,14 @@ public final class Renderer {
 
     /// Gestures (pinch, scroll, drag) in progress: the renderer uses its cheap path while the zoom changes and
     /// re-rasterises at full quality `refineDelayMs` after the zoom settles or `endInteraction()`.
-    public func beginInteraction() { interacting = true }
+    public func beginInteraction() {
+        interacting = true
+        updatePresentMode()
+    }
 
     public func endInteraction() {
         interacting = false
+        updatePresentMode()
         if lastFrameWasCheap { scheduleRefine() } else { requestDisplay() }
     }
 
@@ -535,13 +598,22 @@ public final class Renderer {
         return g.maxLevel < g.firstLevel || g.readyLevel >= g.maxLevel
     }
 
+    /// Whether the colour transform of `image` (shown or prepared) is resolved: false while an uncommon ICC profile
+    /// is still being probed off the main thread (frames use the sRGB / Display P3 fallback meanwhile).
+    public func isColorReady(for image: DecodedImage) -> Bool {
+        knownGPUImage(image)?.colorReady ?? false
+    }
+
     /// Wall and GPU time of the finished pyramid build of `image` (bench).
     public func pyramidBuildTime(for image: DecodedImage) -> (wallMs: Double, gpuMs: Double)? {
         knownGPUImage(image)?.pyramidStats
     }
 
     /// Drop the cached high-quality canvas so the next frame re-rasterises (bench, tests).
-    public func discardCanvas() { canvas = nil }
+    public func discardCanvas() {
+        canvas = nil
+        gpu?.fitCanvas = nil
+    }
 
     private func knownGPUImage(_ image: DecodedImage) -> GPUImage? {
         let id = ObjectIdentifier(image.pixels)
@@ -564,6 +636,8 @@ public final class Renderer {
         var mode = Mode.background
         var g = gpu?.isUsable == true ? gpu : nil
         lastFrameWasCheap = false
+        lastFrameRasterised = false
+        lastFrameDisplaySync = layer.displaySyncEnabled
         waitingForLevel = false
         // A new tier whose pyramid level is still building: keep drawing the previous tier of the same file
         // (same geometry) instead of an aliased frame; redraw when the level is ready.
@@ -626,10 +700,16 @@ public final class Renderer {
             } else {
                 let sameView: (Canvas) -> Bool = { c in c.f == f && c.minv == minv && c.drawable == D }
                 let reusable: Canvas? = {
-                    guard let c = canvas, sameView(c) else { return nil }
-                    if c.source == ObjectIdentifier(g) { return c.level >= g.bestLevel(atMost: wanted) ? c : nil }
-                    // Same file, previous tier: keep showing it until the new tier's level is ready.
-                    if c.key == imageKey, g.bestLevel(atMost: wanted) < wanted { return c }
+                    if let c = canvas, sameView(c) {
+                        if c.source == ObjectIdentifier(g) {
+                            if c.level >= g.bestLevel(atMost: wanted) { return c }
+                        } else if c.key == imageKey, g.bestLevel(atMost: wanted) < wanted {
+                            // Same file, previous tier: keep showing it until the new tier's level is ready.
+                            return c
+                        }
+                    }
+                    // Fit canvas pre-rendered by `prepare` (next / previous image): a present-only first frame.
+                    if let c = g.fitCanvas, sameView(c), c.level >= g.bestLevel(atMost: wanted) { return c }
                     return nil
                 }()
                 let canvasT: (Canvas) -> (SIMD2<Int>, Bool) = { c in
@@ -644,6 +724,11 @@ public final class Renderer {
                 }
                 if let c = reusable, case let (t, inside) = canvasT(c), inside {
                     mode = .canvas
+                    if c.texture !== canvas?.texture {
+                        var adopted = c
+                        adopted.key = imageKey
+                        canvas = adopted
+                    }
                     canvasTex = c.texture
                     q.t = SIMD2(Int32(t.x), Int32(t.y))
                     q.canvasSize = SIMD2(Int32(c.width), Int32(c.height))
@@ -668,22 +753,16 @@ public final class Renderer {
                     let L = g.bestLevel(atMost: wanted)
                     if L < wanted { waitingForLevel = true }
                     let zoomedIn = (x1 - x0) > D.x + 0.5 || (y1 - y0) > D.y + 0.5
-                    let margin = zoomedIn ? Self.panMargin : 0
-                    let ex0 = max(Int(floor(x0)), vis.0 - margin), ey0 = max(Int(floor(y0)), vis.1 - margin)
-                    let ex1 = min(Int(ceil(x1)), vis.2 + margin), ey1 = min(Int(ceil(y1)), vis.3 + margin)
-                    let corners = [SIMD2(ex0, ey0), SIMD2(ex1 - 1, ey0), SIMD2(ex0, ey1 - 1), SIMD2(ex1 - 1, ey1 - 1)].map { minv.apply($0) }
-                    let umin = SIMD2(corners.map(\.x).min()!, corners.map(\.y).min()!)
-                    let umax = SIMD2(corners.map(\.x).max()!, corners.map(\.y).max()!)
-                    let t = SIMD2(-umin.x, -umin.y)
-                    let cw = umax.x - umin.x + 1, ch = umax.y - umin.y + 1
-                    let origin = c0 - f * SIMD2(Double(t.x), Double(t.y)) + f * minv.apply(SIMD2(0.5, 0.5) - D / 2)
-                    if let tex = encodeHQ(commands, g, level: L, f: f, origin: origin, width: cw, height: ch, image: image) {
-                        canvas = Canvas(texture: tex, width: cw, height: ch, key: imageKey, source: ObjectIdentifier(g), level: L,
-                                        f: f, minv: minv, origin: origin, drawable: D)
+                    let e = Self.canvasExtent(rect: (x0, y0, x1, y1), visible: vis, margin: zoomedIn ? Self.panMargin : 0,
+                                              minv: minv, c0: c0, f: f, drawable: D)
+                    if let tex = encodeHQ(commands, g, level: L, f: f, origin: e.origin, width: e.width, height: e.height, image: image) {
+                        canvas = Canvas(texture: tex, width: e.width, height: e.height, key: imageKey, source: ObjectIdentifier(g),
+                                        level: L, f: f, minv: minv, origin: e.origin, drawable: D)
                         mode = .canvas
                         canvasTex = tex
-                        q.t = SIMD2(Int32(t.x), Int32(t.y))
-                        q.canvasSize = SIMD2(Int32(cw), Int32(ch))
+                        lastFrameRasterised = true
+                        q.t = SIMD2(Int32(e.t.x), Int32(e.t.y))
+                        q.canvasSize = SIMD2(Int32(e.width), Int32(e.height))
                     }
                 }
             }
@@ -715,7 +794,8 @@ public final class Renderer {
         }
         if Trace.enabled {
             let cpu = Trace.ms(since: start)
-            Trace.log("render \(mode) cpu=\(String(format: "%.3f", cpu)) ms")
+            Trace.log("render \(mode)\(lastFrameRasterised ? "" : " present-only") cpu=\(String(format: "%.3f", cpu)) ms "
+                      + "sync=\(lastFrameDisplaySync ? "vsync" : "immediate")")
         }
     }
 
@@ -739,6 +819,7 @@ public final class Renderer {
         d.usage = [.shaderRead, .shaderWrite]
         d.storageMode = .private
         guard let tex = context.device.makeTexture(descriptor: d), let e = commands.makeComputeCommandEncoder() else { return nil }
+        lastFrameRasterised = true
         e.setComputePipelineState(context.convertLinear)
         context.bindTiles(e, g)
         e.setTexture(tex, index: 17)
@@ -754,10 +835,10 @@ public final class Renderer {
     /// The PPR residual pass: level `L` of `g` resampled into a `width`×`height` canvas whose pixel (u, v) centre is
     /// at stored position `origin + f·(u, v)`.
     private func encodeHQ(_ commands: MTLCommandBuffer, _ g: GPUImage, level L: Int, f: Double, origin: SIMD2<Double>,
-                          width cw: Int, height ch: Int, image: DecodedImage) -> MTLTexture? {
+                          width cw: Int, height ch: Int, image: DecodedImage, into target: MTLTexture? = nil) -> MTLTexture? {
         guard cw > 0, ch > 0, cw <= GPUImage.maxTextureSide, ch <= GPUImage.maxTextureSide else { return nil }
         // Canvas texture (reused while large enough).
-        if canvasTexture == nil || canvasTexture!.width < cw || canvasTexture!.height < ch {
+        if target == nil, canvasTexture == nil || canvasTexture!.width < cw || canvasTexture!.height < ch {
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: max(cw, canvasTexture?.width ?? 0),
                                                              height: max(ch, canvasTexture?.height ?? 0), mipmapped: false)
             d.usage = [.shaderRead, .shaderWrite]
@@ -781,7 +862,7 @@ public final class Renderer {
                   let wy = dev.makeBuffer(length: cap * 24 * 4, options: .storageModePrivate) else { return nil }
             tables = (fx, wx, fy, wy, cap)
         }
-        guard let canvasTex = canvasTexture, let tmp = tmpTexture, let tables else { return nil }
+        guard let canvasTex = target ?? canvasTexture, let tmp = tmpTexture, let tables else { return nil }
 
         let (lw, lh) = g.levelSize(L)
         let scale = Double(1 << L)
@@ -869,6 +950,90 @@ public final class Renderer {
             Trace.log("HQ L\(L) canvas \(cw)x\(ch) taps \(ntapsX)x\(ntapsY) r=\(String(format: "%.3f", rp.sx)) light=\(rp.light) bands=\((ch + rowsPerBand - 1) / rowsPerBand)")
         }
         return canvasTex
+    }
+
+    /// Canvas covering the image rectangle `rect` (drawable pixels) clipped to `visible` grown by `margin`: the
+    /// drawable -> canvas offset `t`, its size, and the stored position of canvas pixel (0,0)'s centre.
+    private static func canvasExtent(rect: (Double, Double, Double, Double), visible vis: (Int, Int, Int, Int), margin: Int,
+                                     minv: Perm, c0: SIMD2<Double>, f: Double, drawable D: SIMD2<Double>)
+        -> (t: SIMD2<Int>, width: Int, height: Int, origin: SIMD2<Double>) {
+        let ex0 = max(Int(floor(rect.0)), vis.0 - margin), ey0 = max(Int(floor(rect.1)), vis.1 - margin)
+        let ex1 = min(Int(ceil(rect.2)), vis.2 + margin), ey1 = min(Int(ceil(rect.3)), vis.3 + margin)
+        let corners = [SIMD2(ex0, ey0), SIMD2(ex1 - 1, ey0), SIMD2(ex0, ey1 - 1), SIMD2(ex1 - 1, ey1 - 1)].map { minv.apply($0) }
+        let umin = SIMD2(corners.map(\.x).min()!, corners.map(\.y).min()!)
+        let umax = SIMD2(corners.map(\.x).max()!, corners.map(\.y).max()!)
+        let t = SIMD2(-umin.x, -umin.y)
+        let origin = c0 - f * SIMD2(Double(t.x), Double(t.y)) + f * minv.apply(SIMD2(0.5, 0.5) - D / 2)
+        return (t, umax.x - umin.x + 1, umax.y - umin.y + 1, origin)
+    }
+
+    // MARK: Prepared fit canvases
+
+    /// Render the HQ canvas of the view `g` opens with (fit, no user rotation or flip) at the current drawable size,
+    /// in its own command buffer, so that showing `g` next is a present-only frame. Waits (via `onLevelReady` /
+    /// `onColorReady`) for the pyramid level and the colour transform it needs.
+    private func renderFitCanvas(_ g: GPUImage) {
+        guard g.wantsFitCanvas, g.fitCanvas == nil, g !== gpu, g.isUsable, g.colorReady, !keepZoom || zoomMode == .fit
+        else { return }
+        let D = drawableSize
+        let image = g.image
+        let disp = SIMD2(Double(image.fullWidth), Double(image.fullHeight))
+        guard disp.x > 0, disp.y > 0 else { return }
+        let s = min(D.x / disp.x, D.y / disp.y)   // `effectiveScaleFor` at .fit, quarterTurns 0
+        let f = 1 / s
+        let ts = SIMD2(g.scaleX, g.scaleY)
+        let fT = f * max(ts.x, ts.y)
+        // Views the frame does not draw from a canvas (1:1 copy, sharp bilinear, Stage-0 B-spline).
+        if abs(f * ts.x - 1) < 1e-6 && abs(f * ts.y - 1) < 1e-6 || g.isFullResolution && s >= 4
+            || image.tier == .preview && fT <= 1 + 1e-9 {
+            g.wantsFitCanvas = false
+            return
+        }
+        let wanted = fT > 1 + 1e-9 ? min(Int(floor(log2(fT) + 1e-9)), g.maxLevel) : 0
+        guard g.bestLevel(atMost: wanted) >= wanted else { return }   // retried when the level lands
+        let minv = Perm.exif(image.orientation).transposed
+        let center = disp / 2
+        let c0 = minv.apply(center - disp / 2) + SIMD2(g.storedWidth, g.storedHeight) / 2
+        let x0 = -center.x * s + D.x / 2, y0 = -center.y * s + D.y / 2
+        let x1 = (disp.x - center.x) * s + D.x / 2, y1 = (disp.y - center.y) * s + D.y / 2
+        let vis = (max(0, Int(floor(x0))), max(0, Int(floor(y0))), min(Int(D.x), Int(ceil(x1))), min(Int(D.y), Int(ceil(y1))))
+        guard vis.0 < vis.2, vis.1 < vis.3 else { return }
+        let e = Self.canvasExtent(rect: (x0, y0, x1, y1), visible: vis, margin: 0, minv: minv, c0: c0, f: f, drawable: D)
+        guard e.width <= GPUImage.maxTextureSide, e.height <= GPUImage.maxTextureSide else { return }
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: e.width, height: e.height, mipmapped: false)
+        d.usage = [.shaderRead, .shaderWrite]
+        d.storageMode = .private
+        guard let tex = context.device.makeTexture(descriptor: d), let commands = context.queue.makeCommandBuffer() else { return }
+        commands.label = "prepared fit canvas"
+        guard encodeHQ(commands, g, level: wanted, f: f, origin: e.origin, width: e.width, height: e.height,
+                       image: image, into: tex) != nil else { return }
+        let retained = g
+        commands.addCompletedHandler { _ in _ = retained }
+        commands.commit()
+        g.fitCanvas = Canvas(texture: tex, width: e.width, height: e.height, key: nil, source: ObjectIdentifier(g),
+                             level: wanted, f: f, minv: minv, origin: e.origin, drawable: D)
+        // Keep the newest `fitCanvasLimit` (the shown image's adopted canvas is not counted).
+        let holders = prepared.map(\.gpu).filter { $0 !== gpu && $0.fitCanvas != nil }
+        for old in holders.dropLast(Self.fitCanvasLimit) { old.fitCanvas = nil; old.wantsFitCanvas = false }
+    }
+
+    /// Drop every pre-rendered fit canvas (the drawable size or the filter changed) and re-render them once the
+    /// change settles.
+    private func invalidateFitCanvases() {
+        var any = false
+        for entry in prepared where entry.gpu.fitCanvas != nil || entry.gpu.wantsFitCanvas {
+            entry.gpu.fitCanvas = nil
+            any = true
+        }
+        guard any else { return }
+        refitWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.refitWork = nil
+            for entry in self.prepared where entry.gpu.wantsFitCanvas { self.renderFitCanvas(entry.gpu) }
+        }
+        refitWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
     }
 
     // MARK: Internals
