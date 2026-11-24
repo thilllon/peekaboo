@@ -47,7 +47,8 @@ The file is standard TOML, limited to what the schema needs: `# comments`, `[tab
 quoted and dotted keys, basic strings (`"…"` with `\" \\ \n \t \uXXXX` escapes), literal strings
 (`'…'`), integers, floats, booleans and arrays (which may span lines and end with a comma).
 Multi-line strings, inline tables, arrays of tables and dates are not supported and are reported as
-errors. Keys that contain `+`, `,`, `.` or spaces must be quoted: `"cmd+," = "app.config"`.
+errors. A key made of anything other than letters, digits, `_` and `-` must be quoted:
+`"cmd+," = "app.config"`, `"?" = "view.help"`, `"g g" = "nav.first"`.
 
 ## Settings
 
@@ -64,7 +65,7 @@ errors. Keys that contain `+`, `,`, `.` or spaces must be quoted: `"cmd+," = "ap
 | `[rating]` `storage` | `"finder-tags"` | `"finder-tags"` or `"none"` (turns `meta.*` actions off) |
 | `[rating]` `star` | `"★"` | the character a rating is spelled with: 3 stars is the Finder tag `★★★` |
 | `[rating]` `auto_advance` | `false` | `true`: plain `0`–`9`, `p`, `x`, `u` also go to the next image (`shift+` always does) |
-| `[keymap]` `defaults` | `true` | `false` starts from an empty keymap: only your `[keys]` apply |
+| `[keymap]` `defaults` | `true` | `false` starts from an empty keymap: only your `[keys]` (and the vim layer, if on) apply |
 | `[keymap]` `vim` | `false` | add the [vim layer](#vim-layer) on top of the defaults |
 | `[slots]` *name* | none | a folder for `file.move:<name>` / `file.copy:<name>` (see [destinations](#move-and-copy)) |
 | `[apps]` *name* | none | an app for `file.open_with:<name>`: a bundle id, an app name or a path |
@@ -258,7 +259,8 @@ A target is either a slot name from `[slots]` or a path. Paths may start with `~
 (`./_keep`, `../Selects`, or a slot such as `3 = "./_rejects"`) is resolved against **the folder of the
 current image**, so it means "a subfolder next to this photo". Missing folders are created. A file
 never overwrites another one: a name that is taken becomes `name 2.jpg`, `name 3.jpg`, … (like
-Finder's Keep Both). Undo moves the file back (or removes the copy).
+Finder's Keep Both). Undo moves the file back (or removes the copy). Copies, and moves to another
+volume, run in the background: the next image shows at once, and a failure brings the file back.
 
 `file.move:ask` (`m`) and `file.copy:ask` (`c`) open a menu of your slots. A slot whose name is one
 character (`1`…`9`, `k`, …) is chosen with that key. Return picks the previous destination, and `o`
