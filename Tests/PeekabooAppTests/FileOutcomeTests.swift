@@ -2,7 +2,6 @@ import AppKit
 import XCTest
 @testable import PeekabooApp
 @testable import PeekabooCore
-@testable import PeekabooRender
 
 /// How results of file actions (move, undo, redo) change the browsing set and the image on screen.
 final class FileOutcomeTests: ViewerTestCase {

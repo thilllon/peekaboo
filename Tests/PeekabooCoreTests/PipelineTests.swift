@@ -11,7 +11,6 @@ final class FakeDecoder: ImageDecoder, @unchecked Sendable {
         let url: URL
         let tier: Tier
         let start: UInt64
-        var end: UInt64 = 0
     }
 
     private let lock = NSLock()
@@ -54,7 +53,6 @@ final class FakeDecoder: ImageDecoder, @unchecked Sendable {
     func decode(_ url: URL, tier: Tier, targetLongSide: Int, pool: PixelBufferPool) throws -> DecodedImage {
         let lane = self.lane(for: url, info: nil, tier: tier)
         lock.lock()
-        let index = _calls.count
         _calls.append(Call(url: url, tier: tier, start: Trace.now()))
         inFlight[lane, default: 0] += 1
         total += 1
@@ -67,7 +65,6 @@ final class FakeDecoder: ImageDecoder, @unchecked Sendable {
         lock.lock()
         inFlight[lane, default: 1] -= 1
         total -= 1
-        _calls[index].end = Trace.now()
         lock.unlock()
         if fails { throw DecodeError.unreadable(url.lastPathComponent) }
         let side = tier == .preview ? 64 : tier == .screen ? 128 : 256
