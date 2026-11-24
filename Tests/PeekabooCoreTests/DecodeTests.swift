@@ -311,6 +311,36 @@ final class DecodeTests: XCTestCase {
         XCTAssertEqual(failures, 0)
     }
 
+    /// Every decode path must hand the renderer a buffer Metal can wrap without copying, including odd widths
+    /// (IOSurface rows are only 16-byte aligned).
+    func testDecodedBuffersWrapAsTextures() throws {
+        let device = pool.device
+        let props: [CFString: Any] = [kCGImagePropertyJFIFDictionary: [kCGImagePropertyJFIFIsProgressive: true]]
+        let files = [
+            try write(try quadrants(1001, 601), "odd.jpg", type: .jpeg),
+            try write(try quadrants(1001, 601), "oddp.jpg", type: .jpeg, properties: props),
+            try write(try quadrants(333, 201, alpha: 200), "odd.png", type: .png),
+            try write(try quadrants(1001, 601), "odd.heic", type: .heic),
+        ]
+        for url in files {
+            for (tier, target) in [(Tier.preview, 128), (.screen, 400), (.full, 0)] {
+                let image = try decoder.decode(url, tier: tier, targetLongSide: target, pool: pool)
+                let texture = try XCTUnwrap(image.pixels.makeTexture(device: device), "\(url.lastPathComponent) \(tier)")
+                XCTAssertEqual(texture.width, image.pixels.width)
+                var bytes = [UInt8](repeating: 0, count: 4 * image.pixels.layout.bytesPerPixel / 4)
+                let x = image.pixels.width / 4, y = image.pixels.height / 4
+                texture.getBytes(&bytes, bytesPerRow: image.pixels.layout.bytesPerPixel,
+                                 from: MTLRegionMake2D(x, y, 1, 1), mipmapLevel: 0)
+                let direct = pixel(image.pixels, x, y)
+                if image.pixels.layout == .bgra8 {
+                    XCTAssertEqual(Int(bytes[2]), direct.0, "\(url.lastPathComponent) \(tier): texture aliases the pixels")
+                } else if image.pixels.layout == .rgba8 {
+                    XCTAssertEqual(Int(bytes[0]), direct.0, "\(url.lastPathComponent) \(tier): texture aliases the pixels")
+                }
+            }
+        }
+    }
+
     func testUnreadableFileThrows() throws {
         let url = dir.appendingPathComponent("garbage.jpg")
         try Data("not an image".utf8).write(to: url)
