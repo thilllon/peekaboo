@@ -58,7 +58,12 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     let pipeline: ImagePipeline
     private let configStore: ConfigStore
     private var config: AppConfig { configStore.config }
-    private lazy var fileActions = FileActions { [weak self] in self?.configStore.config ?? .default }
+    private lazy var fileActions: FileActions = {
+        let actions = FileActions { [weak self] in self?.configStore.config ?? .default }
+        // Work that finishes later (exec:, open-with, make-default) still updates the list and shows its toast.
+        actions.onLateResult = { [weak self] result in self?.handle(result) }
+        return actions
+    }()
     private let hud: HUD
     private lazy var gate = InteractionGate(
         begin: { [weak self] in self?.renderer.beginInteraction() },
@@ -91,6 +96,14 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private var loadingWork: DispatchWorkItem?
     private var navigationStart: UInt64 = 0
     private var lastAppliedHUDMode: AppConfig.HUDMode?
+    private var lastAppliedBackground: String?
+    /// Re-lists the browsed folder when Finder (or anything else) adds, removes or renames files.
+    private var folderWatcher: FolderWatcher?
+
+    /// True while the app is still launching (until `applicationDidFinishLaunching`): `open` then lists the folder,
+    /// waits for the first tier on the main thread and presents it at once, because AppKit's launch does not
+    /// service the main queue for ~70 ms (`finishLaunching`, the open-documents event).
+    var presentsSynchronously = false
 
     // Full screen and chrome
     private var instantFullscreen: (frame: NSRect, style: NSWindow.StyleMask)?
@@ -143,8 +156,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         renderer = Renderer(layer: viewerView.metalLayer)
         hud = HUD(parent: viewerView.overlayLayer)
         let pool = PixelBufferPool(device: RenderContext.shared.device)
-        var pipelineConfig = PipelineConfig(screenLongSide: Self.largestScreenLongSide())
-        if let mb = configStore.config.cacheBudgetMB { pipelineConfig.memoryBudget = mb << 20 }
+        let pipelineConfig = Self.pipelineConfig(
+            configStore.config, base: PipelineConfig(screenLongSide: Self.largestScreenLongSide()))
         pipeline = ImagePipeline(decoder: ImageIODecoder(), pool: pool, config: pipelineConfig)
         super.init(window: window)
         window.delegate = self
@@ -181,14 +194,18 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// Apply a (re)loaded configuration.
     func apply(_ config: AppConfig) {
         renderer.keepZoom = config.keepZoom
-        let background = Background(rawValue: config.background) ?? .black
-        if renderer.settings.background != background { renderer.settings.background = background }
+        // Only a changed value overrides what the user picked at run time (`view.background`, `view.hud`).
+        if lastAppliedBackground != config.background {
+            lastAppliedBackground = config.background
+            renderer.settings.background = Background(rawValue: config.background) ?? .black
+        }
+        let refine = Double(max(config.refineDelayMs, 0))
+        if renderer.settings.refineDelayMs != refine { renderer.settings.refineDelayMs = refine }
         if lastAppliedHUDMode != config.hud {
             hud.mode = config.hud
             lastAppliedHUDMode = config.hud
         }
-        var pipelineConfig = pipeline.config
-        if let mb = config.cacheBudgetMB { pipelineConfig.memoryBudget = mb << 20 }
+        let pipelineConfig = Self.pipelineConfig(config, base: pipeline.config)
         if pipelineConfig != pipeline.config { pipeline.updateConfig(pipelineConfig) }
         if hud.isHelpVisible { hud.setHelp(KeyLabels.helpSections(config.keymap)) }
         if instantFullscreen != nil, let screen = window?.screen { rootView.topInset = notchInset(screen) }
@@ -214,38 +231,70 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         // First pixel first: decode the opened file before listing its folder. Decide "file or
         // folder" from the URL alone (no file-system access on the main thread).
         let singleFile = urls.count == 1 && !first.hasDirectoryPath && FolderScanner.isSupported(first)
+        let synchronous = presentsSynchronously
+        if synchronous {
+            // Hand the window to the window server now, so the first frame can reach the glass before AppKit
+            // finishes launching.
+            CATransaction.flush()
+        }
         if singleFile {
             browseSource = .folder(first.deletingLastPathComponent())
             beginNavigation()
             pipeline.setFiles([ImageFile(url: first, name: first.lastPathComponent, byteSize: 0, modified: 0, fileID: 0)], index: 0)
             presentCurrent()
+            if synchronous { presentFirstFrameNow() }
         } else {
             browseSource = urls.count == 1 ? .folder(first) : .files
+            if synchronous {
+                // Launched with a folder: list it in this turn (getattrlistbulk, ≈ 0.2 ms per 100 files) instead of
+                // in a main-queue turn that AppKit's launch delays by ~70 ms.
+                applyListing(try? FolderScanner.browse(urls), urls: urls, singleFile: false, opened: opened)
+                presentFirstFrameNow()
+                return
+            }
         }
         updateHUD()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let listing = try? FolderScanner.browse(urls)
             DispatchQueue.main.async {
                 guard let self, generation == self.openGeneration else { return }
-                self.listingPending = false
-                self.lastListing = Trace.now()
-                guard let listing, !listing.files.isEmpty else {
-                    // An unreadable parent folder still shows the opened file on its own.
-                    if singleFile {
-                        self.updateHUD()
-                    } else {
-                        self.showEmpty(urls.count == 1 ? first : nil)
-                    }
-                    return
-                }
-                let previous = self.pipeline.currentFile
-                self.pipeline.setFiles(listing.files, index: listing.index)
-                if self.pipeline.currentFile != previous { self.beginNavigation() }
-                self.presentCurrent()
-                self.updateHUD()
-                Trace.log("folder listed: \(listing.files.count) files, \(String(format: "%.1f", Trace.ms(since: opened))) ms after open")
+                self.applyListing(listing, urls: urls, singleFile: singleFile, opened: opened)
             }
         }
+    }
+
+    private func applyListing(_ listing: (files: [ImageFile], index: Int)?, urls: [URL], singleFile: Bool, opened: UInt64) {
+        listingPending = false
+        lastListing = Trace.now()
+        guard let listing, !listing.files.isEmpty else {
+            // An unreadable parent folder still shows the opened file on its own.
+            if singleFile {
+                updateHUD()
+            } else {
+                showEmpty(urls.count == 1 ? urls.first : nil)
+            }
+            watchFolder()
+            return
+        }
+        let previous = pipeline.currentFile
+        pipeline.setFiles(listing.files, index: listing.index)
+        if pipeline.currentFile != previous { beginNavigation() }
+        presentCurrent()
+        updateHUD()
+        watchFolder()
+        Trace.log("folder listed: \(listing.files.count) files, \(String(format: "%.1f", Trace.ms(since: opened))) ms after open")
+    }
+
+    /// Launch fast path: wait (bounded) for the first tier of the current file and present it in this run-loop turn.
+    private func presentFirstFrameNow() {
+        guard shownFile == nil, let file = pipeline.currentFile else { return }
+        let start = Trace.now()
+        // `onDecoded` → `show` → `renderFrame` runs inside the wait.
+        let ready = pipeline.waitForCurrent(timeout: 0.25)
+        if ready, shownFile != file { presentCurrent() }
+        CATransaction.flush()
+        Trace.log(String(format: "launch: first tier %@ after a %.1f ms main-thread wait",
+                         ready ? "presented" : "not ready", Trace.ms(since: start)))
     }
 
     /// Nothing to show: an empty folder, or no file opened yet.
@@ -275,13 +324,48 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     // MARK: Pipeline → screen
 
     private func decoded(_ image: DecodedImage, for file: ImageFile) {
-        guard file == pipeline.currentFile else { return }
+        guard file == pipeline.currentFile else {
+            prepareIfNeighbour(image, for: file)
+            return
+        }
         if failures.removeValue(forKey: file.url) != nil { hud.setMessage(nil) }
         if shownFile == file, let shownTier, shownTier >= image.tier {
             updateHUD()
             return
         }
         show(image, for: file)
+    }
+
+    /// Neighbours whose GPU resources (texture, colour transform, pyramid) are built ahead of navigation: ±1 and the
+    /// next-but-one in the direction of travel. With the image on screen that is the renderer's limit of 4 prepared
+    /// images, so preparing never evicts what the next key press will show.
+    private func neighbourOffsets() -> [Int] {
+        let direction = pipeline.navigation.direction >= 0 ? 1 : -1
+        return [direction, -direction, 2 * direction]
+    }
+
+    private func prepareIfNeighbour(_ image: DecodedImage, for file: ImageFile) {
+        guard image.tier != .preview, shownFile != nil, !pipeline.isSkimming else { return }
+        let files = pipeline.files
+        let isNeighbour = neighbourOffsets().contains { offset in
+            let j = pipeline.index + offset
+            return files.indices.contains(j) && files[j] == file
+        }
+        // Only the best sharp tier (a late screen tier after a `.full` would be prepared for nothing).
+        guard isNeighbour, let best = pipeline.best(for: file), best.pixels === image.pixels else { return }
+        renderer.prepare(image)
+    }
+
+    /// After the current image is shown: prepare the sharp tiers of the neighbours that are already decoded (the
+    /// farthest first, so the next image is the most recently used entry of the renderer's LRU).
+    private func prepareNeighbours() {
+        guard !pipeline.isSkimming else { return }
+        let files = pipeline.files
+        for offset in neighbourOffsets().reversed() {
+            let j = pipeline.index + offset
+            guard files.indices.contains(j), let best = pipeline.best(for: files[j]), best.tier != .preview else { continue }
+            renderer.prepare(best)
+        }
     }
 
     private func failed(_ file: ImageFile, _ error: Error) {
@@ -319,7 +403,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         let t1 = Trace.now()
         renderFrame()
         let t2 = Trace.now()
-        if renderer.wantsFullResolution { pipeline.requestFullResolution() }
+        requestFullResolutionIfNeeded()
+        prepareNeighbours()
         updateHUD()
         if Trace.enabled {
             Trace.log(String(format: "show main thread: setImage %.3f  render %.3f  hud %.3f ms",
@@ -631,8 +716,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         case .zoomFill: zoom(.fill)
         case .zoomActual: zoom(.scale(1), anchor: mouseInView())
         case .zoomSet(let factor): zoom(.scale(factor), anchor: mouseInView())
-        case .zoomIn: zoomStep(1.25)
-        case .zoomOut: zoomStep(0.8)
+        case .zoomIn: zoomStep(Self.zoomFactor(config.zoomStep))
+        case .zoomOut: zoomStep(1 / Self.zoomFactor(config.zoomStep))
         case .zoomToggle: zoom(renderer.zoomMode == .fit ? .scale(1) : .fit, anchor: mouseInView())
         case .zoomKeep:
             renderer.keepZoom.toggle()
@@ -721,7 +806,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             var files = pipeline.files
             if !files.contains(file) {
                 files.append(file)
-                files.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+                files = NaturalSort.sort(files, by: \.name)
             }
             hud.setMessage(nil)
             beginNavigation()
@@ -748,6 +833,11 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         afterGeometryChange()
     }
 
+    /// `view.zoom_step`, guarded against values that would not zoom (≤ 1) or jump absurdly.
+    static func zoomFactor(_ step: Double) -> Double {
+        step.isFinite && step > 1.001 ? min(step, 16) : 1.25
+    }
+
     private func zoomStep(_ factor: Double) {
         renderer.zoom(by: factor, anchor: mouseInView() ?? CGPoint(x: viewerView.bounds.midX, y: viewerView.bounds.midY))
         afterGeometryChange()
@@ -756,8 +846,22 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// Present the new geometry, ask for full resolution when the view needs it, refresh the zoom %.
     private func afterGeometryChange() {
         renderFrame()
-        if renderer.wantsFullResolution { pipeline.requestFullResolution() }
+        requestFullResolutionIfNeeded()
         updateHUD()
+    }
+
+    /// Ask for `.full` only when the view shows more detail than the tier on screen holds — never when that tier
+    /// already is full resolution (small images: the screen tier is the whole image).
+    private func requestFullResolutionIfNeeded() {
+        guard renderer.wantsFullResolution, let image = renderer.image, !Self.isFullResolution(image) else { return }
+        pipeline.requestFullResolution()
+    }
+
+    /// The tier holds every pixel of the image (`fullWidth`/`fullHeight` are oriented, the pixels may not be yet:
+    /// compare long and short sides).
+    static func isFullResolution(_ image: DecodedImage) -> Bool {
+        max(image.pixels.width, image.pixels.height) >= max(image.fullWidth, image.fullHeight)
+            && min(image.pixels.width, image.pixels.height) >= min(image.fullWidth, image.fullHeight)
     }
 
     private func panToEdge(_ edge: Action.Edge) {
@@ -913,7 +1017,6 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     func windowDidBecomeKey(_ notification: Notification) {
         lastPointerMove = Trace.now()
         scheduleIdleCheck()
-        rescanIfNeeded()
     }
 
     func windowDidChangeScreen(_ notification: Notification) {
@@ -931,11 +1034,15 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
 
     // MARK: Folder refresh
 
-    /// Self-contained fallback for a folder watcher: re-list the folder when the window
-    /// becomes key (files added or removed in Finder while Peekaboo was in the background).
-    private func rescanIfNeeded() {
-        guard Trace.ms(since: lastListing) > 1500 else { return }
-        rescanFolder()
+    /// Watch the browsed folder (vnode events, debounced 50 ms) and re-list it on every change.
+    private func watchFolder() {
+        guard case .folder(let folder) = browseSource else {
+            folderWatcher = nil
+            return
+        }
+        if folderWatcher?.directory == folder { return }
+        folderWatcher = FolderWatcher(directory: folder) { [weak self] in self?.rescanFolder() }
+        if folderWatcher == nil { Trace.log("cannot watch \(folder.lastPathComponent)") }
     }
 
     /// Re-list the browsed folder off the main thread and apply additions, removals and changed
@@ -1084,6 +1191,25 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     }
 
     // MARK: Helpers
+
+    /// `base` with the cache budgets of `config`: `cache_budget_mb` sets the total and scales the per-tier budgets
+    /// with it (so a larger budget is not capped by the automatic tier sizes); no value restores the automatic sizes.
+    static func pipelineConfig(_ config: AppConfig, base: PipelineConfig) -> PipelineConfig {
+        let automatic = PipelineConfig(screenLongSide: base.screenLongSide, previewLongSide: base.previewLongSide)
+        var result = base
+        result.memoryBudget = automatic.memoryBudget
+        result.screenBudget = automatic.screenBudget
+        result.previewBudget = automatic.previewBudget
+        result.fullBudget = automatic.fullBudget
+        guard let mb = config.cacheBudgetMB, mb > 0 else { return result }
+        let total = mb << 20
+        let factor = Double(total) / Double(max(automatic.memoryBudget, 1))
+        result.memoryBudget = total
+        result.screenBudget = Int(Double(automatic.screenBudget) * factor)
+        result.previewBudget = Int(Double(automatic.previewBudget) * factor)
+        result.fullBudget = Int(Double(automatic.fullBudget) * factor)
+        return result
+    }
 
     /// Long side in device pixels of the largest attached screen (the screen tier must cover it).
     static func largestScreenLongSide() -> Int {
