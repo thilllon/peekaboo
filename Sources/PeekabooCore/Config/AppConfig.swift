@@ -46,6 +46,7 @@ public struct AppConfig: Sendable, Equatable {
 }
 
 /// Loads `config.toml`, hot-reloads it and reports errors without dropping the last good config.
+/// Unknown tables and keys are not errors: they are skipped, reported as warnings, and the rest applies.
 ///
 /// Reloads parse on a background queue and apply on the main thread. The file *and* its directory
 /// are watched, so both in-place writes and atomic saves (write a temporary file, rename it over)
