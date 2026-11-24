@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+#MISE description="Package build/Peekaboo.app into build/Peekaboo.dmg (drag-to-Applications layout)"
+# mise runs file tasks from the project root.
+set -euo pipefail
+APP=build/Peekaboo.app
+[[ -d "$APP" ]] || ./.mise/tasks/app
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"' EXIT
+ditto "$APP" "$STAGE/Peekaboo.app"
+ln -s /Applications "$STAGE/Applications"
+rm -f build/Peekaboo.dmg
+hdiutil create -quiet -volname Peekaboo -srcfolder "$STAGE" -format UDZO -ov build/Peekaboo.dmg
+echo build/Peekaboo.dmg
