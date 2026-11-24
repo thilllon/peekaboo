@@ -50,11 +50,19 @@ final class GPUImage {
     var linearPreview: MTLTexture?
     var linearPreviewPending = false
     var onLevelReady: ((Int) -> Void)?
+    /// Wall and summed GPU time of the finished pyramid build (main thread; nil until done).
+    var pyramidStats: (wallMs: Double, gpuMs: Double)?
     private let cancelLock = NSLock()
     private var cancelledFlag = false
     private var buildStarted = false
     /// Keeps a bytesNoCopy wrapper of an IOSurface alive for tiled surfaces.
     private let surfaceBuffer: MTLBuffer?
+
+    /// Private (GPU-tiled) copies of `tiles`, made by the background job: 2× faster to filter than the
+    /// linear layout of decoder buffers. Main thread.
+    var fastTiles: [MTLTexture]?
+    /// The level-0 textures to read from (main thread).
+    var readTiles: [MTLTexture] { fastTiles ?? tiles }
 
     var isUsable: Bool { !tiles.isEmpty }
     var isFullResolution: Bool { abs(scaleX - 1) < 1e-9 && abs(scaleY - 1) < 1e-9 }
@@ -166,7 +174,7 @@ final class GPUImage {
 
     /// Start building the pyramid on the background queue (idempotent).
     func startPyramid(context: RenderContext) {
-        guard !buildStarted, isUsable, maxLevel >= firstLevel else { return }
+        guard !buildStarted, isUsable, maxLevel >= firstLevel || image.tier != .preview else { return }
         buildStarted = true
         let job = PyramidJob(image: self, context: context)
         PyramidJob.queue.async { job.run() }
@@ -215,12 +223,47 @@ private final class PyramidJob: @unchecked Sendable {
         tmpDesc.usage = [.shaderRead, .shaderWrite]
         tmpDesc.storageMode = .private
         guard let tmp = device.makeTexture(descriptor: tmpDesc) else { return }
+        // Step 0: private copies of the level-0 tiles (one blit, ≈ 1 ms for 24 MP); the pyramid reads them too.
+        var levelZero: [MTLTexture?] = img.tiles
+        if img.image.tier != .preview {
+            var copies: [MTLTexture] = []
+            if let blitCB = context.queue.makeCommandBuffer(), let blit = blitCB.makeBlitCommandEncoder() {
+                for t in img.tiles {
+                    let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: t.pixelFormat, width: t.width, height: t.height, mipmapped: false)
+                    d.usage = [.shaderRead]
+                    d.storageMode = .private
+                    if img.image.pixels.layout == .argb8 { d.swizzle = t.swizzle }
+                    guard let c = device.makeTexture(descriptor: d) else { break }
+                    blit.copy(from: t, to: c)
+                    copies.append(c)
+                }
+                blit.endEncoding()
+                blitCB.label = "level-0 copy"
+                blitCB.commit()
+                blitCB.waitUntilCompleted()
+            }
+            if copies.count == img.tiles.count, !img.isCancelled {
+                levelZero = copies
+                DispatchQueue.main.async { img.fastTiles = copies; img.onLevelReady?(0) }
+            }
+        }
+        while levelZero.count < 16 { levelZero.append(context.dummy) }
+        guard img.maxLevel >= img.firstLevel else {
+            DispatchQueue.main.async { img.pyramidStats = (Trace.ms(since: start), 0) }
+            return
+        }
         var cb: MTLCommandBuffer?
         var encoder: MTLComputeCommandEncoder?
         var pending = 0
+        var gpuSeconds = 0.0
+        var chunks = 0
         func flush() {
             encoder?.endEncoding(); encoder = nil
-            if let c = cb { c.commit(); c.waitUntilCompleted() }
+            if let c = cb {
+                c.commit(); c.waitUntilCompleted()
+                gpuSeconds += c.gpuEndTime - c.gpuStartTime
+                chunks += 1
+            }
             cb = nil; pending = 0
         }
         for L in img.firstLevel...img.maxLevel {
@@ -251,8 +294,8 @@ private final class PyramidJob: @unchecked Sendable {
                 var d = DP(taps: Int32(taps), baseOff: Int32(baseOff), factor: Int32(factor), srcW: Int32(sw), srcH: Int32(sh),
                            dstW: Int32(dw), dstH: Int32(dh), rowStart: Int32(hr0), dstRow0: Int32(r0), tmpRows: Int32(tmpRows),
                            fromLevel0: L == img.firstLevel ? 1 : 0, pad: 0)
-                e.setComputePipelineState(context.downH)
-                context.bindTiles(e, img)
+                e.setComputePipelineState(L == img.firstLevel ? context.downHSource : context.downHLevel)
+                e.setTextures(levelZero, range: 0..<16)
                 e.setTexture(previous ?? context.dummy, index: 16)
                 e.setTexture(tmp, index: 17)
                 e.setBytes(&d, length: MemoryLayout<DP>.stride, index: 0)
@@ -279,6 +322,9 @@ private final class PyramidJob: @unchecked Sendable {
             DispatchQueue.main.async { img.publish(level: level, texture: dst) }
         }
         let ms = Trace.ms(since: start)
-        Trace.log("pyramid \(img.width)x\(img.height) levels \(img.firstLevel)...\(img.maxLevel) in \(String(format: "%.2f", ms)) ms")
+        let gpuMs = gpuSeconds * 1000
+        DispatchQueue.main.async { img.pyramidStats = (ms, gpuMs) }
+        Trace.log("pyramid \(img.width)x\(img.height) levels \(img.firstLevel)...\(img.maxLevel): \(chunks) chunks, "
+                  + "GPU \(String(format: "%.2f", gpuMs)) ms, wall \(String(format: "%.2f", ms)) ms")
     }
 }

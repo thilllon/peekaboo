@@ -60,9 +60,14 @@ public final class RenderContext: @unchecked Sendable {
     let presentSDR: MTLRenderPipelineState
     let presentFloat: MTLRenderPipelineState
     let axisWeights: MTLComputePipelineState
-    let resampleHL: MTLComputePipelineState
-    let resampleVL: MTLComputePipelineState
-    let downH: MTLComputePipelineState
+    let resampleHLevel: MTLComputePipelineState
+    let resampleHFast: MTLComputePipelineState
+    let resampleHFastSigmoid: MTLComputePipelineState
+    let resampleHGeneral: MTLComputePipelineState
+    let resampleVLinear: MTLComputePipelineState
+    let resampleVSigmoid: MTLComputePipelineState
+    let downHLevel: MTLComputePipelineState
+    let downHSource: MTLComputePipelineState
     let downV: MTLComputePipelineState
     let convertLinear: MTLComputePipelineState
     /// 1×1 texture bound to unused slots.
@@ -121,9 +126,14 @@ public final class RenderContext: @unchecked Sendable {
             presentSDR = try present(.bgra8Unorm)
             presentFloat = try present(.rgba16Float)
             axisWeights = try compute("axisWeights")
-            resampleHL = try compute("resampleHL")
-            resampleVL = try compute("resampleVL")
-            downH = try compute("downH")
+            resampleHLevel = try compute("resampleH_level")
+            resampleHFast = try compute("resampleH_fast")
+            resampleHFastSigmoid = try compute("resampleH_fastSigmoid")
+            resampleHGeneral = try compute("resampleH_general")
+            resampleVLinear = try compute("resampleV_linear")
+            resampleVSigmoid = try compute("resampleV_sigmoid")
+            downHLevel = try compute("downH_level")
+            downHSource = try compute("downH_source")
             downV = try compute("downV")
             convertLinear = try compute("convertLinear")
         } catch {
@@ -147,7 +157,7 @@ public final class RenderContext: @unchecked Sendable {
 
     func tileArray(_ image: GPUImage?) -> [MTLTexture?] {
         var list: [MTLTexture?] = Array(repeating: dummy, count: 16)
-        if let image { for (i, t) in image.tiles.prefix(16).enumerated() { list[i] = t } }
+        if let image { for (i, t) in image.readTiles.prefix(16).enumerated() { list[i] = t } }
         return list
     }
 }
@@ -275,7 +285,7 @@ public final class Renderer {
     private var canvasTexture: MTLTexture?
     private var tmpTexture: MTLTexture?
     private var tables: (fx: MTLBuffer, wx: MTLBuffer, fy: MTLBuffer, wy: MTLBuffer, capacity: Int)?
-    private static let tmpRowsCapacity = 1024
+    private static let tmpRowsCapacity = 2048
     private static let panMargin = 128
 
     // Interaction / refinement.
@@ -507,11 +517,22 @@ public final class Renderer {
 
     /// Whether the pyramid of `image` (shown or prepared) is complete — for the bench and tests.
     public func isPyramidComplete(for image: DecodedImage) -> Bool {
-        let id = ObjectIdentifier(image.pixels)
-        let g = (gpu.map { ObjectIdentifier($0.image.pixels) == id ? $0 : nil } ?? nil)
-            ?? prepared.first(where: { $0.id == id })?.gpu
-        guard let g else { return false }
+        guard let g = knownGPUImage(image) else { return false }
         return g.maxLevel < g.firstLevel || g.readyLevel >= g.maxLevel
+    }
+
+    /// Wall and GPU time of the finished pyramid build of `image` (bench).
+    public func pyramidBuildTime(for image: DecodedImage) -> (wallMs: Double, gpuMs: Double)? {
+        knownGPUImage(image)?.pyramidStats
+    }
+
+    /// Drop the cached high-quality canvas so the next frame re-rasterises (bench, tests).
+    public func discardCanvas() { canvas = nil }
+
+    private func knownGPUImage(_ image: DecodedImage) -> GPUImage? {
+        let id = ObjectIdentifier(image.pixels)
+        if let gpu, ObjectIdentifier(gpu.image.pixels) == id { return gpu }
+        return prepared.first(where: { $0.id == id })?.gpu
     }
 
     private enum Mode: Int32 { case background = 0, canvas = 1, exact = 2, bspline = 3, sharp = 4, trilinear = 5 }
@@ -741,7 +762,9 @@ public final class Renderer {
         let sc = SIMD2(f * g.scaleX / scale, f * g.scaleY / scale)
         let corner = origin - 0.5 * f   // stored position of canvas pixel (0,0)'s top-left corner
         let blur = 1 - 0.05 * min(max(settings.sharpness, -2), 2)
-        let reducing = max(sc.x, sc.y) > 1 + 1e-9
+        // Enlarging only happens at level 0 (any reduction picks a level with residual r ∈ [1, 2)).
+        let enlarging = L == 0 && max(sc.x, sc.y) < 1 - 1e-9
+        let reducing = !enlarging
         let filter = settings.filter
         var rp = RP()
         rp.ox = Float(corner.x * g.scaleX / scale); rp.oy = Float(corner.y * g.scaleY / scale)
@@ -751,7 +774,7 @@ public final class Renderer {
         rp.B = filter.bc.0; rp.C = filter.bc.1
         rp.filter = filter.id
         rp.antiring = settings.antiRinging ? (reducing ? -0.5 : 0.6) : 0
-        rp.light = (!reducing && !g.hasAlpha && !image.isHDR) ? 1 : 0
+        rp.light = (enlarging && !g.hasAlpha && !image.isHDR) ? 1 : 0
         rp.srcW = Int32(lw); rp.srcH = Int32(lh)
         rp.dstW = Int32(cw); rp.dstH = Int32(ch)
         rp.fromLevel0 = L == 0 ? 1 : 0
@@ -759,6 +782,11 @@ public final class Renderer {
         let ntapsX = min(24, Int(ceil(2 * Double(rp.radius * rp.kx))) + 1)
         let ntapsY = min(24, Int(ceil(2 * Double(rp.radius * rp.ky))) + 1)
 
+        let fastSource = g.src.tileCount == 1 && g.src.trc == 0 && g.src.alpha != 2
+        let hPipeline: MTLComputePipelineState
+        if L > 0 { hPipeline = context.resampleHLevel }
+        else if fastSource { hPipeline = rp.light == 1 ? context.resampleHFastSigmoid : context.resampleHFast }
+        else { hPipeline = context.resampleHGeneral }
         guard let e = commands.makeComputeCommandEncoder() else { return nil }
         e.label = "PPR residual L\(L)"
         e.setComputePipelineState(context.axisWeights)
@@ -787,7 +815,7 @@ public final class Renderer {
             let rowEnd = min(lh - 1, Int(ceil(py1 - ry)) + ntapsY)
             let tmpRows = max(1, min(Self.tmpRowsCapacity, rowEnd - rowStart + 1))
             rp.rowStart = Int32(rowStart); rp.dstRow0 = Int32(b0); rp.tmpRows = Int32(tmpRows)
-            e.setComputePipelineState(context.resampleHL)
+            e.setComputePipelineState(hPipeline)
             e.setTextures(tiles, range: 0..<16)
             e.setTexture(levelTex, index: 16)
             e.setTexture(tmp, index: 17)
@@ -799,7 +827,7 @@ public final class Renderer {
             e.setBuffer(g.lut, offset: 0, index: 5)
             e.dispatchThreads(MTLSize(width: cw, height: tmpRows, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 8, depth: 1))
             e.memoryBarrier(scope: .textures)
-            e.setComputePipelineState(context.resampleVL)
+            e.setComputePipelineState(rp.light == 1 ? context.resampleVSigmoid : context.resampleVLinear)
             e.setTexture(tmp, index: 0)
             e.setTexture(canvasTex, index: 1)
             e.setBytes(&rp, length: MemoryLayout<RP>.stride, index: 0)

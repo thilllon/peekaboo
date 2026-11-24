@@ -1,6 +1,103 @@
 import Foundation
+import Metal
+import PeekabooCore
+import PeekabooRender
+import QuartzCore
 
-/// `peekaboo-bench render` — implemented by the render workstream.
+/// `peekaboo-bench render [image] [--frames N] [--size WxH]`
+///
+/// GPU time per frame of the PPR renderer at fit / 0.5 / 1.0 / 2.5 / 5× (settle frame = pyramid level + residual
+/// Lanczos-3 into the canvas + present; canvas reuse = present only; gesture = trilinear), plus the pyramid build.
+/// The default image is `$PEEKABOO_CORPUS/jpeg/jpeg_24mp_5947x3964.jpg`.
 func runRenderBench(_ args: ArraySlice<String>) throws {
-    print("render bench: not implemented yet")
+    var path: String?
+    var frames = 20
+    var noAR = false
+    var size = (3456, 2234)
+    var it = args.makeIterator()
+    while let a = it.next() {
+        switch a {
+        case "--frames": frames = Int(it.next() ?? "") ?? frames
+        case "--no-ar": noAR = true
+        case "--size":
+            let parts = (it.next() ?? "").split(separator: "x").compactMap { Int($0) }
+            if parts.count == 2 { size = (parts[0], parts[1]) }
+        default: path = a
+        }
+    }
+    if path == nil, let corpus = ProcessInfo.processInfo.environment["PEEKABOO_CORPUS"] {
+        path = corpus + "/jpeg/jpeg_24mp_5947x3964.jpg"
+    }
+    guard let path else {
+        print("usage: peekaboo-bench render <image> [--frames N] [--size WxH]  (or set PEEKABOO_CORPUS)")
+        return
+    }
+    let contextStart = Trace.now()
+    let context = RenderContext.shared
+    let contextMs = Trace.ms(since: contextStart)
+    let pool = PixelBufferPool(device: context.device)
+    let decodeStart = Trace.now()
+    let image = try ImageIODecoder().decode(URL(fileURLWithPath: path), tier: .full, targetLongSide: 0, pool: pool)
+    let decodeMs = Trace.ms(since: decodeStart)
+    print("image: \(URL(fileURLWithPath: path).lastPathComponent) \(image.pixels.width)x\(image.pixels.height) "
+          + "(decode \(String(format: "%.1f", decodeMs)) ms, shader/pipeline init \(String(format: "%.1f", contextMs)) ms)")
+    print("frame: \(size.0)x\(size.1) device px into bgra8Unorm, median of \(frames) frames, GPU time (gpuEnd - gpuStart)")
+
+    // Pyramid build: best of 3 fresh builds.
+    var builds: [(wallMs: Double, gpuMs: Double)] = []
+    for _ in 0..<3 {
+        let copy = DecodedImage(pixels: image.pixels, tier: .full, fullWidth: image.fullWidth, fullHeight: image.fullHeight,
+                                orientation: image.orientation, isHDR: false, decodeNanos: 0)
+        let probe = Renderer(layer: CAMetalLayer())
+        probe.setViewSize(CGSize(width: size.0, height: size.1), backingScale: 1)
+        probe.setImage(copy, key: "rebuild")
+        let until = Date().addingTimeInterval(10)
+        while probe.pyramidBuildTime(for: copy) == nil && Date() < until { RunLoop.main.run(until: Date().addingTimeInterval(0.001)) }
+        if let t = probe.pyramidBuildTime(for: copy) { builds.append(t) }
+    }
+    if let best = builds.min(by: { $0.gpuMs < $1.gpuMs }) {
+        print(String(format: "pyramid build (Lanczos-3, rgba16Float, ≤ 2 ms chunks), best of %d: GPU %.2f ms, wall %.2f ms",
+                     builds.count, best.gpuMs, best.wallMs))
+    }
+
+    let renderer = Renderer(layer: CAMetalLayer())
+    renderer.setViewSize(CGSize(width: size.0, height: size.1), backingScale: 1)
+    renderer.settings.antiRinging = !noAR
+    renderer.setImage(image, key: "bench")
+    let deadline = Date().addingTimeInterval(10)
+    while !renderer.isPyramidComplete(for: image) && Date() < deadline {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.001))
+    }
+
+    func median(_ v: [Double]) -> Double { let s = v.sorted(); return s.isEmpty ? .nan : s[s.count / 2] }
+    func measure(_ body: () -> Void) -> Double {
+        var times: [Double] = []
+        for _ in 0..<frames {
+            body()
+            _ = renderer.renderOffscreen(format: .bgra8Unorm)
+            times.append(renderer.lastFrameGPUms)
+        }
+        return median(times)
+    }
+    let zooms: [(String, ZoomMode)] = [("fit", .fit), ("0.5x", .scale(0.5)), ("1.0x", .scale(1)), ("2.5x", .scale(2.5)), ("5x", .scale(5))]
+    print("zoom   | settle frame ms | path       | next frame ms | path")
+    for (name, mode) in zooms {
+        renderer.setZoom(mode)
+        let settle = measure { renderer.discardCanvas() }
+        let settlePath = renderer.lastPath
+        let reuse = measure {}
+        let reusePath = renderer.lastPath
+        print(name.padding(toLength: 6, withPad: " ", startingAt: 0)
+              + String(format: " | %15.3f | ", settle) + settlePath.padding(toLength: 10, withPad: " ", startingAt: 0)
+              + String(format: " | %13.3f | ", reuse) + reusePath)
+    }
+    // Gesture path: interaction in progress and the zoom just changed.
+    renderer.settings.refineDelayMs = 1_000_000
+    for (name, mode) in [("fit", ZoomMode.fit), ("0.5x", .scale(0.5)), ("2.5x", .scale(2.5))] {
+        renderer.setZoom(mode)
+        renderer.beginInteraction()
+        let t = measure { renderer.zoom(by: 1.0001, anchor: CGPoint(x: size.0 / 2, y: size.1 / 2)) }
+        print(String(format: "gesture %@: %.3f ms (%@)", name, t, renderer.lastPath))
+        renderer.endInteraction()
+    }
 }

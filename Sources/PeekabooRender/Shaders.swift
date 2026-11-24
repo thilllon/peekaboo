@@ -75,7 +75,7 @@ enum Shaders {
         return v;
     }
 
-    inline float4 rawRead(array<texture2d<float>, MAXTILES> tiles, constant SrcInfo& s, int x, int y) {
+    inline float4 rawRead(array<texture2d<float, access::read>, MAXTILES> tiles, constant SrcInfo& s, int x, int y) {
         x = clamp(x, 0, s.width - 1);
         y = clamp(y, 0, s.height - 1);
         if (s.tileCount <= 1) return tiles[0].read(uint2(uint(x), uint(y)));
@@ -83,8 +83,13 @@ enum Shaders {
         return tiles[ty * s.tileCols + tx].read(uint2(uint(x - (tx << s.tileShift)), uint(y - (ty << s.tileShift))));
     }
 
-    // Level-0 texel as linear Display P3, premultiplied.
-    inline float4 fetch0(array<texture2d<float>, MAXTILES> tiles, constant SrcInfo& s, constant float* lut, int x, int y) {
+    inline float4 toP3(float4 c, constant SrcInfo& s) {
+        c.rgb = float3(dot(s.m0.xyz, c.rgb), dot(s.m1.xyz, c.rgb), dot(s.m2.xyz, c.rgb));
+        return c;
+    }
+
+    // Level-0 texel as linear light in the source primaries, premultiplied (apply `toP3` after linear filtering).
+    inline float4 fetch0lin(array<texture2d<float, access::read>, MAXTILES> tiles, constant SrcInfo& s, constant float* lut, int x, int y) {
         float4 c = rawRead(tiles, s, x, y);
         if (s.alpha == 0) {
             c.a = 1.0f;
@@ -98,8 +103,12 @@ enum Shaders {
         } else {
             c.rgb = trcDecode(c.rgb, s, lut) * c.a;
         }
-        c.rgb = float3(dot(s.m0.xyz, c.rgb), dot(s.m1.xyz, c.rgb), dot(s.m2.xyz, c.rgb));
         return c;
+    }
+
+    // Level-0 texel as linear Display P3, premultiplied.
+    inline float4 fetch0(array<texture2d<float, access::read>, MAXTILES> tiles, constant SrcInfo& s, constant float* lut, int x, int y) {
+        return toP3(fetch0lin(tiles, s, lut, x, y), s);
     }
 
     // ---------------- resampling light ----------------
@@ -132,7 +141,7 @@ enum Shaders {
         int tmpRows;
     };
 
-    inline float4 fetchL(array<texture2d<float>, MAXTILES> tiles, texture2d<float> level, constant SrcInfo& s,
+    inline float4 fetchL(array<texture2d<float, access::read>, MAXTILES> tiles, texture2d<float, access::read> level, constant SrcInfo& s,
                          constant float* lut, constant RP& p, int x, int y) {
         if (p.fromLevel0 != 0) return fetch0(tiles, s, lut, x, y);
         return level.read(uint2(uint(clamp(x, 0, p.srcW - 1)), uint(clamp(y, 0, p.srcH - 1))));
@@ -155,34 +164,83 @@ enum Shaders {
         for (int t = 0; t < MAXW; t++) wts[i * MAXW + t] = w[t] * inv;
     }
 
-    kernel void resampleHL(array<texture2d<float>, MAXTILES> tiles [[texture(0)]],
-                           texture2d<float> level [[texture(16)]],
-                           texture2d<float, access::write> tmp [[texture(17)]],
-                           constant RP& p [[buffer(0)]], constant int* first [[buffer(1)]], constant float* wts [[buffer(2)]],
-                           constant int& ntaps [[buffer(3)]], constant SrcInfo& s [[buffer(4)]], constant float* lut [[buffer(5)]],
-                           uint2 gid [[thread_position_in_grid]])
+    // Specialised variants (no dead paths, so no register pressure from unused code):
+    //   MODE 0: pyramid level (rgba16Float, linear light)      MODE 1: level 0, one tile, decoded by the texture unit
+    //   MODE 2: level 0, general (tiles, transfer curve LUT, straight alpha; runtime light)
+    template <int MODE, int LIGHT>
+    inline void resampleHImpl(array<texture2d<float, access::read>, MAXTILES> tiles, texture2d<float, access::read> level, texture2d<float, access::write> tmp,
+                              constant RP& p, constant int* first, constant float* wts, int ntaps,
+                              constant SrcInfo& s, constant float* lut, uint2 gid)
     {
         if (gid.x >= (uint)p.dstW || gid.y >= (uint)p.tmpRows) return;
         int x0 = first[gid.x];
         int yy = p.rowStart + int(gid.y);
         constant float* w = wts + gid.x * MAXW;
         float4 acc = 0.0f;
-        for (int t = 0; t < ntaps; t++) acc += w[t] * toL(fetchL(tiles, level, s, lut, p, x0 + t, yy), p.light);
         float ar = fabs(p.antiring);
-        if (ar > 0.0f && (p.antiring < 0.0f || p.sx < 1.0f)) {
-            int xi = int(floor(p.ox + (float(gid.x) + 0.5f) * p.sx - 0.5f));
-            float4 a = toL(fetchL(tiles, level, s, lut, p, xi, yy), p.light);
-            float4 b = toL(fetchL(tiles, level, s, lut, p, xi + 1, yy), p.light);
-            acc = mix(acc, clamp(acc, min(a, b), max(a, b)), ar);
+        bool doAR = ar > 0.0f && (p.antiring < 0.0f || p.sx < 1.0f);
+        int xi = int(floor(p.ox + (float(gid.x) + 0.5f) * p.sx - 0.5f));
+        if (MODE == 0) {
+            int W1 = p.srcW - 1;
+            uint y = uint(clamp(yy, 0, p.srcH - 1));
+            for (int t = 0; t < ntaps; t++) acc += w[t] * level.read(uint2(uint(clamp(x0 + t, 0, W1)), y));
+            if (doAR) {
+                float4 a = level.read(uint2(uint(clamp(xi, 0, W1)), y)), b = level.read(uint2(uint(clamp(xi + 1, 0, W1)), y));
+                acc = mix(acc, clamp(acc, min(a, b), max(a, b)), ar);
+            }
+        } else if (MODE == 1) {
+            texture2d<float, access::read> t0 = tiles[0];
+            int W1 = s.width - 1;
+            uint y = uint(clamp(yy, 0, s.height - 1));
+            bool opaque = s.alpha == 0;
+            if (LIGHT == 0) {
+                // Linear light: filter in the source primaries, convert once (the matrix commutes with the filter).
+                for (int t = 0; t < ntaps; t++) acc += w[t] * t0.read(uint2(uint(clamp(x0 + t, 0, W1)), y));
+                if (doAR) {
+                    float4 a = t0.read(uint2(uint(clamp(xi, 0, W1)), y)), b = t0.read(uint2(uint(clamp(xi + 1, 0, W1)), y));
+                    acc = mix(acc, clamp(acc, min(a, b), max(a, b)), ar);
+                }
+                if (opaque) acc.a = 1.0f;
+                acc = toP3(acc, s);
+            } else {
+                for (int t = 0; t < ntaps; t++) {
+                    float4 c = t0.read(uint2(uint(clamp(x0 + t, 0, W1)), y));
+                    if (opaque) c.a = 1.0f;
+                    acc += w[t] * toL(toP3(c, s), 1);
+                }
+                if (doAR) {
+                    float4 a = t0.read(uint2(uint(clamp(xi, 0, W1)), y)), b = t0.read(uint2(uint(clamp(xi + 1, 0, W1)), y));
+                    if (opaque) { a.a = 1.0f; b.a = 1.0f; }
+                    a = toL(toP3(a, s), 1); b = toL(toP3(b, s), 1);
+                    acc = mix(acc, clamp(acc, min(a, b), max(a, b)), ar);
+                }
+            }
+        } else {
+            for (int t = 0; t < ntaps; t++) acc += w[t] * toL(fetch0(tiles, s, lut, x0 + t, yy), p.light);
+            if (doAR) {
+                float4 a = toL(fetch0(tiles, s, lut, xi, yy), p.light);
+                float4 b = toL(fetch0(tiles, s, lut, xi + 1, yy), p.light);
+                acc = mix(acc, clamp(acc, min(a, b), max(a, b)), ar);
+            }
         }
         tmp.write(acc, gid);
     }
 
-    kernel void resampleVL(texture2d<float> tmp [[texture(0)]],
-                           texture2d<float, access::write> dst [[texture(1)]],
-                           constant RP& p [[buffer(0)]], constant int* first [[buffer(1)]], constant float* wts [[buffer(2)]],
-                           constant int& ntaps [[buffer(3)]],
-                           uint2 gid [[thread_position_in_grid]])
+    #define RESAMPLE_H(NAME, MODE, LIGHT) \\
+    kernel void NAME(array<texture2d<float, access::read>, MAXTILES> tiles [[texture(0)]], texture2d<float, access::read> level [[texture(16)]], \\
+                     texture2d<float, access::write> tmp [[texture(17)]], \\
+                     constant RP& p [[buffer(0)]], constant int* first [[buffer(1)]], constant float* wts [[buffer(2)]], \\
+                     constant int& ntaps [[buffer(3)]], constant SrcInfo& s [[buffer(4)]], constant float* lut [[buffer(5)]], \\
+                     uint2 gid [[thread_position_in_grid]]) \\
+    { resampleHImpl<MODE, LIGHT>(tiles, level, tmp, p, first, wts, ntaps, s, lut, gid); }
+    RESAMPLE_H(resampleH_level, 0, 0)
+    RESAMPLE_H(resampleH_fast, 1, 0)
+    RESAMPLE_H(resampleH_fastSigmoid, 1, 1)
+    RESAMPLE_H(resampleH_general, 2, 0)
+
+    template <int LIGHT>
+    inline void resampleVImpl(texture2d<float, access::read> tmp, texture2d<float, access::write> dst, constant RP& p,
+                              constant int* first, constant float* wts, int ntaps, uint2 gid)
     {
         int y = p.dstRow0 + int(gid.y);
         if (gid.x >= (uint)p.dstW || y >= p.dstH) return;
@@ -199,33 +257,55 @@ enum Shaders {
             float4 b = tmp.read(uint2(gid.x, uint(clamp(clamp(yi + 1, 0, H1) - p.rowStart, 0, T1))));
             acc = mix(acc, clamp(acc, min(a, b), max(a, b)), ar);
         }
-        float4 o = fromL(acc, p.light);
+        float4 o = LIGHT == 1 ? fromL(acc, 1) : acc;
         o.a = clamp(o.a, 0.0f, 1.0f);
         dst.write(o, uint2(gid.x, uint(y)));
     }
+    kernel void resampleV_linear(texture2d<float, access::read> tmp [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]],
+                                 constant RP& p [[buffer(0)]], constant int* first [[buffer(1)]], constant float* wts [[buffer(2)]],
+                                 constant int& ntaps [[buffer(3)]], uint2 gid [[thread_position_in_grid]])
+    { resampleVImpl<0>(tmp, dst, p, first, wts, ntaps, gid); }
+    kernel void resampleV_sigmoid(texture2d<float, access::read> tmp [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]],
+                                  constant RP& p [[buffer(0)]], constant int* first [[buffer(1)]], constant float* wts [[buffer(2)]],
+                                  constant int& ntaps [[buffer(3)]], uint2 gid [[thread_position_in_grid]])
+    { resampleVImpl<1>(tmp, dst, p, first, wts, ntaps, gid); }
 
     // ---------------- pyramid: separable decimation by `factor` with host weights (linear light) ----------------
     struct DP { int taps, baseOff, factor, srcW, srcH, dstW, dstH, rowStart, dstRow0, tmpRows, fromLevel0, pad; };
-    kernel void downH(array<texture2d<float>, MAXTILES> tiles [[texture(0)]],
-                      texture2d<float> level [[texture(16)]],
-                      texture2d<float, access::write> tmp [[texture(17)]],
-                      constant DP& d [[buffer(0)]], constant float* w [[buffer(1)]],
-                      constant SrcInfo& s [[buffer(4)]], constant float* lut [[buffer(5)]],
-                      uint2 gid [[thread_position_in_grid]])
+    kernel void downH_level(texture2d<float, access::read> level [[texture(16)]],
+                            texture2d<float, access::write> tmp [[texture(17)]],
+                            constant DP& d [[buffer(0)]], constant float* w [[buffer(1)]],
+                            uint2 gid [[thread_position_in_grid]])
+    {
+        int x = int(gid.x);
+        if (x >= d.dstW || int(gid.y) >= d.tmpRows) return;
+        uint y = uint(clamp(d.rowStart + int(gid.y), 0, d.srcH - 1));
+        int base = x * d.factor + d.baseOff;
+        float4 acc = 0.0f;
+        for (int t = 0; t < d.taps; t++) acc += w[t] * level.read(uint2(uint(clamp(base + t, 0, d.srcW - 1)), y));
+        tmp.write(acc, gid);
+    }
+    kernel void downH_source(array<texture2d<float, access::read>, MAXTILES> tiles [[texture(0)]],
+                             texture2d<float, access::write> tmp [[texture(17)]],
+                             constant DP& d [[buffer(0)]], constant float* w [[buffer(1)]],
+                             constant SrcInfo& s [[buffer(4)]], constant float* lut [[buffer(5)]],
+                             uint2 gid [[thread_position_in_grid]])
     {
         int x = int(gid.x);
         if (x >= d.dstW || int(gid.y) >= d.tmpRows) return;
         int y = clamp(d.rowStart + int(gid.y), 0, d.srcH - 1);
         int base = x * d.factor + d.baseOff;
         float4 acc = 0.0f;
-        if (d.fromLevel0 != 0) {
-            for (int t = 0; t < d.taps; t++) acc += w[t] * fetch0(tiles, s, lut, clamp(base + t, 0, d.srcW - 1), y);
+        if (s.tileCount == 1 && s.trc == 0 && s.alpha != 2) {
+            texture2d<float, access::read> t0 = tiles[0];
+            for (int t = 0; t < d.taps; t++) acc += w[t] * t0.read(uint2(uint(clamp(base + t, 0, d.srcW - 1)), uint(y)));
+            if (s.alpha == 0) acc.a = 1.0f;
         } else {
-            for (int t = 0; t < d.taps; t++) acc += w[t] * level.read(uint2(uint(clamp(base + t, 0, d.srcW - 1)), uint(y)));
+            for (int t = 0; t < d.taps; t++) acc += w[t] * fetch0lin(tiles, s, lut, clamp(base + t, 0, d.srcW - 1), y);
         }
-        tmp.write(acc, gid);
+        tmp.write(toP3(acc, s), gid);
     }
-    kernel void downV(texture2d<float> tmp [[texture(0)]],
+    kernel void downV(texture2d<float, access::read> tmp [[texture(0)]],
                       texture2d<float, access::write> dst [[texture(1)]],
                       constant DP& d [[buffer(0)]], constant float* w [[buffer(1)]],
                       uint2 gid [[thread_position_in_grid]])
@@ -242,7 +322,7 @@ enum Shaders {
     }
 
     // Level 0 -> linear float copy (Stage-0 previews: hardware bilinear for the B-spline).
-    kernel void convertLinear(array<texture2d<float>, MAXTILES> tiles [[texture(0)]],
+    kernel void convertLinear(array<texture2d<float, access::read>, MAXTILES> tiles [[texture(0)]],
                               texture2d<float, access::write> dst [[texture(17)]],
                               constant SrcInfo& s [[buffer(4)]], constant float* lut [[buffer(5)]],
                               uint2 gid [[thread_position_in_grid]])
@@ -279,7 +359,7 @@ enum Shaders {
     inline float3 enc3(float3 x) { float3 a = fabs(x); float3 e = select(1.055f * pow(a, 1.0f / 2.4f) - 0.055f, 12.92f * a, a <= 0.0031308f); return copysign(e, x); }
     inline float hash12(float2 p) { float3 p3 = fract(float3(p.xyx) * 0.1031f); p3 += dot(p3, p3.yzx + 33.33f); return fract((p3.x + p3.y) * p3.z); }
 
-    inline float4 bilinear0(array<texture2d<float>, MAXTILES> tiles, constant SrcInfo& s, constant float* lut, float2 pos, float2 f) {
+    inline float4 bilinear0(array<texture2d<float, access::read>, MAXTILES> tiles, constant SrcInfo& s, constant float* lut, float2 pos, float2 f) {
         float2 t = pos - 0.5f; int2 i = int2(floor(t));
         float4 a = fetch0(tiles, s, lut, i.x, i.y), b = fetch0(tiles, s, lut, i.x + 1, i.y);
         float4 c = fetch0(tiles, s, lut, i.x, i.y + 1), d = fetch0(tiles, s, lut, i.x + 1, i.y + 1);
@@ -290,7 +370,7 @@ enum Shaders {
                               texture2d<float> canvas [[texture(0)]],
                               texture2d<float> levelA [[texture(1)]],
                               texture2d<float> levelB [[texture(2)]],
-                              array<texture2d<float>, MAXTILES> tiles [[texture(3)]],
+                              array<texture2d<float, access::read>, MAXTILES> tiles [[texture(3)]],
                               constant PresentP& q [[buffer(0)]], constant SrcInfo& s [[buffer(1)]], constant float* lut [[buffer(2)]])
     {
         float2 frag = in.position.xy;
