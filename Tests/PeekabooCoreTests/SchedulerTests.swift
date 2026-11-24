@@ -156,7 +156,7 @@ final class SchedulerTests: XCTestCase {
 
     func testSweepRingOrderAndPausedWhileSkimming() {
         let (nav, now) = steady(100, intervalMs: 1000)
-        let plan = planPrefetch(nav, now: now + ms, tuning: PrefetchTuning(), context: context(sweepSlots: 10))
+        let plan = planPrefetch(nav, now: now + 30 * ms, tuning: PrefetchTuning(), context: context(sweepSlots: 10))
         let sweep = plan.jobs.filter { $0.kind == .sweep }
         XCTAssertEqual(sweep.count, 10)
         XCTAssertTrue(sweep.allSatisfy { $0.tier == .preview })
@@ -165,6 +165,46 @@ final class SchedulerTests: XCTestCase {
         let (fast, fastNow) = steady(100, steps: 20, intervalMs: 33, isRepeat: true)
         let skim = planPrefetch(fast, now: fastNow + ms, tuning: PrefetchTuning(), context: context(sweepSlots: 10))
         XCTAssertTrue(skim.jobs.allSatisfy { $0.kind != .sweep }, "sweep pauses while skimming")
+    }
+
+    /// The ring scan visits up to 2×1024 files; the pass that answers a key press leaves it out, a wake runs it.
+    func testSweepWaitsForThePassAfterTheNavigation() {
+        let (nav, now) = steady(100, intervalMs: 1000)
+        let tuning = PrefetchTuning()
+        let atKey = planPrefetch(nav, now: now + ms, tuning: tuning, context: context(sweepSlots: 10))
+        XCTAssertTrue(atKey.jobs.allSatisfy { $0.kind != .sweep }, "the key press waits for the sweep's ring scan")
+        XCTAssertFalse(atKey.sweepScanned)
+        XCTAssertEqual(atKey.wakeAfterMs ?? .infinity, tuning.sweepAfterNavMs - 1, accuracy: 0.5)
+        let later = planPrefetch(nav, now: now + UInt64(tuning.sweepAfterNavMs + 1) * ms, tuning: tuning,
+                                 context: context(sweepSlots: 10))
+        XCTAssertEqual(later.jobs.filter { $0.kind == .sweep }.count, 10)
+    }
+
+    /// In a large folder where almost no preview qualifies (expensive previews, no QuickLook), every pass used to walk
+    /// the whole ring again. A scan that reached its radius is reused: its jobs are planned without scanning.
+    func testExhaustedSweepScanIsReused() {
+        let (nav, now) = steady(5000, intervalMs: 1000, count: 10_000)
+        var examined = 0
+        var c = context(count: 10_000, sweepSlots: 24)
+        c.cheapPreview = { j in examined += 1; return j == 5300 || j == 4800 }
+        let first = planPrefetch(nav, now: now + 30 * ms, tuning: PrefetchTuning(), context: c)
+        let found = first.jobs.filter { $0.kind == .sweep }
+        XCTAssertEqual(Set(found.map(\.index)), [5300, 4800])
+        XCTAssertTrue(first.sweepScanned)
+        XCTAssertTrue(first.sweepExhausted, "two jobs for a batch of 24: the whole ring was scanned")
+        XCTAssertGreaterThan(examined, 2000)
+        examined = 0
+        c.sweepReuse = found
+        let again = planPrefetch(nav, now: now + 40 * ms, tuning: PrefetchTuning(), context: c)
+        XCTAssertEqual(again.jobs.filter { $0.kind == .sweep }.map(\.index), found.map(\.index))
+        XCTAssertFalse(again.sweepScanned)
+        XCTAssertLessThan(examined, 10, "the ring was scanned again")
+        // A job that got cached meanwhile is not planned again.
+        let cached = context(count: 10_000, cached: [5300], sweepSlots: 24)
+        var reuse = c
+        reuse.cached = cached.cached
+        XCTAssertEqual(planPrefetch(nav, now: now + 40 * ms, tuning: PrefetchTuning(), context: reuse).jobs
+                        .filter { $0.kind == .sweep }.map(\.index), [4800])
     }
 
     func testSpeculativeFullAfterDwellWhenCheap() {

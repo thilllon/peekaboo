@@ -35,6 +35,11 @@ public struct PrefetchTuning: Sendable, Equatable {
     public var sweepEnabled = true
     public var sweepBatch = 24
     public var sweepRadius = Int.max
+    /// The ring scan (up to 2×1024 files) is left out of the passes within this long after a navigation, so the key
+    /// press does not wait for it, and is not repeated within `sweepRescanMs` once a scan from the same cursor found
+    /// everything there was to add (its jobs are planned again instead).
+    public var sweepAfterNavMs = 20.0
+    public var sweepRescanMs = 250.0
     /// A preview counts as cheap (sweepable, worth decoding before the screen tier) when its estimate is at most
     /// this many ms or at most `cheapPreviewRatio` of the screen-tier estimate.
     public var cheapPreviewMs = 8.0
@@ -167,6 +172,10 @@ struct Plan: Sendable {
     /// Indices that entered the preview / screen windows (read-ahead hints).
     var previewWindow: [Int] = []
     var screenWindow: [Int] = []
+    /// The sweep's ring scan ran this pass, and it reached its radius before the batch filled (its jobs are then all
+    /// there is to add from this cursor).
+    var sweepScanned = false
+    var sweepExhausted = false
 
     mutating func wake(after ms: Double) {
         let ms = max(ms, 1)
@@ -197,6 +206,8 @@ struct PlanContext {
     var sweepPaused: Bool
     var decodeLanes: Int
     var reservedLanes: Int
+    /// Sweep jobs of an exhausted scan from this cursor moments ago: plan them again instead of scanning.
+    var sweepReuse: [PlannedJob]? = nil
 }
 
 /// The pure body of the P4 scheduler's replan (research a2 §4): what should be queued right now.
@@ -293,23 +304,33 @@ func planPrefetch(_ nav: NavModel, now: UInt64, tuning t: PrefetchTuning, contex
     // Folder-wide preview sweep on the utility lanes, ring order, cheap previews only.
     if t.sweepEnabled && !skim && !c.decodeBacklog && !c.sweepPaused && c.sweepSlots > 0 {
         let limit = min(t.sweepBatch, c.sweepSlots)
-        var added = 0, r = 1
         let planned = Set(plan.jobs.lazy.filter { $0.tier == .preview }.map(\.index))
-        // Bounded ring scan keeps the pass O(1) on huge folders (the preview budget is far smaller anyway).
-        let radius = min(t.sweepRadius, 1024)
-        while added < limit && r < c.count && r <= radius {
-            for j in [i + nav.direction * r, i - nav.direction * r] where inRange(j) && added < limit {
-                if planned.contains(j) || sharp(j) || c.cached(j, .preview) || c.busy(j, .preview) { continue }
-                if c.cheapPreview(j) {
-                    plan.jobs.append(PlannedJob(index: j, tier: .preview, prio: 1e6 + Double(r), kind: .sweep))
-                } else if c.quickLookSweep(j) {
-                    plan.jobs.append(PlannedJob(index: j, tier: .preview, prio: 1e6 + Double(r), kind: .sweep, quickLook: true))
-                } else {
-                    continue
+        let open = { (j: Int) in !planned.contains(j) && !sharp(j) && !c.cached(j, .preview) && !c.busy(j, .preview) }
+        if since < t.sweepAfterNavMs {
+            plan.wake(after: t.sweepAfterNavMs - since)
+        } else if let reuse = c.sweepReuse {
+            for job in reuse.prefix(limit) where inRange(job.index) && open(job.index) { plan.jobs.append(job) }
+        } else {
+            plan.sweepScanned = true
+            var added = 0, r = 1
+            // Bounded ring scan keeps the pass O(1) on huge folders (the preview budget is far smaller anyway).
+            let radius = min(t.sweepRadius, 1024)
+            while added < limit && r < c.count && r <= radius {
+                for j in [i + nav.direction * r, i - nav.direction * r] where inRange(j) && added < limit {
+                    guard open(j) else { continue }
+                    if c.cheapPreview(j) {
+                        plan.jobs.append(PlannedJob(index: j, tier: .preview, prio: 1e6 + Double(r), kind: .sweep))
+                    } else if c.quickLookSweep(j) {
+                        plan.jobs.append(PlannedJob(index: j, tier: .preview, prio: 1e6 + Double(r), kind: .sweep,
+                                                    quickLook: true))
+                    } else {
+                        continue
+                    }
+                    added += 1
                 }
-                added += 1
+                r += 1
             }
-            r += 1
+            plan.sweepExhausted = added < limit
         }
     }
     return plan

@@ -117,6 +117,8 @@ public final class ImagePipeline {
         /// When the pipeline itself last saw `files[i]`'s stamp on disk (`Trace.now()`; 0 = it comes from the listing).
         var stampedAt: UInt64 = 0
         var info: ImageInfo?
+        /// `CostModel.megapixels(info)`, kept apart so estimates do not copy `info`.
+        var megapixels: Double?
         var family: CostModel.Family?
         /// Tiers that failed (bit per tier): not retried while the file is unchanged.
         var failed: UInt8 = 0
@@ -174,6 +176,9 @@ public final class ImagePipeline {
     private static let statQueue = DispatchQueue(label: "peekaboo.recheck", qos: .userInitiated)
     /// Reaches the pipeline from other threads without keeping it alive.
     private let weakSelf = WeakPipeline()
+    /// The last sweep scan that reached its radius: cursor, direction, time and the jobs it found, planned again
+    /// without scanning (up to 2×1024 files) for `sweepRescanMs`.
+    private var sweepMemo: (cursor: Int, direction: Int, at: UInt64, jobs: [PlannedJob])?
 
     public convenience init(decoder: ImageDecoder, pool: PixelBufferPool, config: PipelineConfig = PipelineConfig()) {
         self.init(decoder: decoder, pool: pool, config: config, quickLook: DecodeScheduler.systemQuickLook)
@@ -217,6 +222,7 @@ public final class ImagePipeline {
         slots = [Slot](repeating: Slot(), count: files.count)
         cachedIndices.removeAll(keepingCapacity: true)
         tierBytes = [0, 0, 0]
+        sweepMemo = nil
         for i in oldSlots.indices where oldSlots[i].hasState {
             var slot = oldSlots[i]
             oldSlots[i] = Slot()
@@ -403,7 +409,7 @@ public final class ImagePipeline {
         let previewHeadroom = budget(.preview) - tierBytes[Tier.preview.rawValue]
         let windowReserve = tuning.previewMaxAhead + tuning.previewBehind
         let sweepSlots = config.sweepLanes > 0 ? max(0, previewHeadroom / max(averagePreviewBytes, 1) - windowReserve) : 0
-        let context = PlanContext(
+        var context = PlanContext(
             count: files.count, listingReady: true,
             cached: { [unowned self] j, tier in self.isCached(j, tier) },
             busy: { [unowned self] j, tier in
@@ -417,7 +423,14 @@ public final class ImagePipeline {
             runningWorkMs: snapshot.runningWorkMs, decodeBacklog: snapshot.decodeBacklog,
             sweepSlots: sweepSlots, sweepPaused: underPressure,
             decodeLanes: config.laneLimits.decodeLanes, reservedLanes: config.laneLimits.reservedLanes)
+        if let memo = sweepMemo, memo.cursor == index, memo.direction == navigation.direction,
+           Double(now &- memo.at) / 1e6 < tuning.sweepRescanMs {
+            context.sweepReuse = memo.jobs
+        }
         let plan = planPrefetch(navigation, now: now, tuning: tuning, context: context)
+        if plan.sweepScanned {
+            sweepMemo = plan.sweepExhausted ? (index, navigation.direction, now, plan.jobs.filter { $0.kind == .sweep }) : nil
+        }
 
         var jobs: [DecodeJob] = []
         jobs.reserveCapacity(plan.jobs.count)
@@ -539,6 +552,7 @@ public final class ImagePipeline {
         let file = files[i]
         if slots[i].info == nil, let info = outcome.info {
             slots[i].info = info
+            slots[i].megapixels = CostModel.megapixels(info)
             slots[i].lanes = [nil, nil, nil]  // lanes may depend on the metadata
         }
         switch outcome.result {
@@ -547,7 +561,7 @@ public final class ImagePipeline {
             if outcome.job.kind == .sweep { stats.sweepDecodes += 1 }
             // QuickLook's latency is not our decoder's cost: keep it out of the cost model.
             if !outcome.job.quickLook {
-                costs.record(family: family(i), megapixels: CostModel.megapixels(slots[i].info), tier: key.tier,
+                costs.record(family: family(i), megapixels: slots[i].megapixels, tier: key.tier,
                              ms: outcome.wallMs, concurrency: outcome.concurrency)
             }
             // A QuickLook preview that lands after a sharp tier is of no use, even for the image on screen.
@@ -707,11 +721,12 @@ public final class ImagePipeline {
 
     /// `.screen` is satisfied by a cached `.full`, and `.full` by a screen tier that is already full resolution.
     private func isCached(_ j: Int, _ tier: Tier) -> Bool {
-        let slot = slots[j]
+        // Field by field: copying the whole slot retains and releases every reference in it (the planner asks this
+        // thousands of times per pass on large folders).
         switch tier {
-        case .preview: return slot.preview != nil
-        case .screen: return slot.screen != nil || slot.full != nil
-        case .full: return slot.full != nil || slot.screen.map(Self.isFullResolution) == true
+        case .preview: return slots[j].preview != nil
+        case .screen: return slots[j].screen != nil || slots[j].full != nil
+        case .full: return slots[j].full != nil || slots[j].screen.map(Self.isFullResolution) == true
         }
     }
 
@@ -730,7 +745,7 @@ public final class ImagePipeline {
     }
 
     private func estimate(_ j: Int, _ tier: Tier) -> Double {
-        costs.estimate(family: family(j), megapixels: CostModel.megapixels(slots[j].info), tier: tier)
+        costs.estimate(family: family(j), megapixels: slots[j].megapixels, tier: tier)
     }
 
     private func isCheapPreview(_ j: Int) -> Bool {
