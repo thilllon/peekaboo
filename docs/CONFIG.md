@@ -346,8 +346,12 @@ one word, spaces and quotes included. You can write placeholders bare or inside 
 | `echo 'x {path}'` | `echo 'x '"${PEEKABOO_PATH}"''` |
 | `cp {path} ~/Desktop/{name}` | `cp "${PEEKABOO_PATH}" ~/Desktop/"${PEEKABOO_NAME}"` |
 | `echo "$(basename {path})"` | `echo "$(basename "${PEEKABOO_PATH}")"` |
+| `printf %s $'{name}\n'` | `printf %s $''"${PEEKABOO_NAME}"$'\n'` |
+| `echo $(({index} + 1))` | `echo $((${PEEKABOO_INDEX} + 1))` |
 
-`\{path}` and `${path}` are left as they are, and so is anything after a `#` comment. You can also use
+Inside `$((…))` quotes are a syntax error, so `{index}` and `{count}` (digits only) stand bare there;
+the other placeholders stay quoted and the shell refuses them, rather than evaluate a file name as
+arithmetic. `\{path}` and `${path}` are left as they are, and so is anything after a `#` comment. You can also use
 the variables directly (`"$PEEKABOO_PATH"`); quote them yourself then. `{name}`, `{stem}` and `{ext}`
 may start with `-`, so put `--` before them for commands that would read them as options; `{path}` and
 `{dir}` always start with `/`. Do not pass placeholders to `eval` or `sh -c`, which would parse the

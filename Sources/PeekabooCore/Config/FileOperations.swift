@@ -713,22 +713,46 @@ public final class FileOperations {
         ]
     }
 
+    /// The placeholders whose values are digits only, so they may stand bare in `$((…))`.
+    private static let numericExecVariables: Set<String> = ["PEEKABOO_INDEX", "PEEKABOO_COUNT"]
+
     /// The shell command for an `exec:` template: each placeholder becomes a reference to its environment
     /// variable, quoted for where it stands — `"${PEEKABOO_PATH}"` in plain text, `${PEEKABOO_PATH}` inside
-    /// `"…"`, `'"${PEEKABOO_PATH}"'` inside `'…'` — so a value is always exactly one word and is never parsed
-    /// as shell code. No file-derived text goes into the command: run it with `execEnvironment(…)`.
-    /// `\{path}` and `${path}` are left alone. The arguments are unused (kept for source compatibility).
+    /// `"…"`, `'"${PEEKABOO_PATH}"'` inside `'…'`, `'"${PEEKABOO_PATH}"$'` inside bash's `$'…'` — so a value is
+    /// always exactly one word and is never parsed as shell code. In `$((…))`, where quotes are a syntax error,
+    /// `{index}` and `{count}` (digits only) stand bare and the others stay quoted, so the shell refuses them
+    /// rather than evaluate file names as arithmetic. No file-derived text goes into the command: run it with
+    /// `execEnvironment(…)`. `\{path}` and `${path}` are left alone. The arguments are unused (kept for source
+    /// compatibility).
     public static func expand(_ template: String, file: URL, index: Int, count: Int) -> String {
         execCommand(template)
     }
 
     /// See `expand(_:file:index:count:)`.
     public static func execCommand(_ template: String) -> String {
-        enum Context: Equatable { case plain, single, double, backtick, command(depth: Int) }
+        enum Context: Equatable {
+            case plain, single, double, backtick, command(depth: Int)
+            /// bash's `$'…'`: `\` escapes the next character, `'` ends it.
+            case ansi
+            /// `$((…))`; `depth` counts the parentheses open inside it.
+            case arithmetic(depth: Int)
+        }
         let chars = Array(template)
         var stack: [Context] = [.plain]
         var out = ""
         var i = 0
+        /// At the "(" after a "$": `$((` opens an arithmetic expansion, `$(` a command substitution.
+        func openSubstitution() {
+            if i + 1 < chars.count, chars[i + 1] == "(" {
+                out += "(("
+                i += 2
+                stack.append(.arithmetic(depth: 0))
+            } else {
+                out.append("(")
+                i += 1
+                stack.append(.command(depth: 0))
+            }
+        }
         while i < chars.count {
             let c = chars[i]
             let context = stack[stack.count - 1]
@@ -737,7 +761,9 @@ public final class FileOperations {
                let variable = execVariables[String(chars[(i + 1)..<close])] {
                 switch context {
                 case .single: out += "'\"${\(variable)}\"'"
+                case .ansi: out += "'\"${\(variable)}\"$'"
                 case .double: out += "${\(variable)}"
+                case .arithmetic where numericExecVariables.contains(variable): out += "${\(variable)}"
                 default: out += "\"${\(variable)}\""
                 }
                 i = close + 1
@@ -748,6 +774,13 @@ public final class FileOperations {
             switch context {
             case .single:
                 if c == "'" { stack.removeLast() }
+            case .ansi:
+                if c == "\\", let next {
+                    out.append(next)
+                    i += 1
+                } else if c == "'" {
+                    stack.removeLast()
+                }
             case .double:
                 if c == "\\", let next {
                     out.append(next)
@@ -755,13 +788,11 @@ public final class FileOperations {
                 } else if c == "\"" {
                     stack.removeLast()
                 } else if c == "$", next == "(" {
-                    out.append("(")
-                    i += 1
-                    stack.append(.command(depth: 0))
+                    openSubstitution()
                 } else if c == "`" {
                     stack.append(.backtick)
                 }
-            case .plain, .backtick, .command:
+            case .plain, .backtick, .command, .arithmetic:
                 if c == "\\", let next {
                     out.append(next)
                     i += 1
@@ -769,16 +800,29 @@ public final class FileOperations {
                     stack.append(.single)
                 } else if c == "\"" {
                     stack.append(.double)
-                } else if c == "$", next == "(" {
-                    out.append("(")
+                } else if c == "$", next == "'" {
+                    out.append("'")
                     i += 1
-                    stack.append(.command(depth: 0))
+                    stack.append(.ansi)
+                } else if c == "$", next == "(" {
+                    openSubstitution()
                 } else if c == "`" {
                     if context == .backtick { stack.removeLast() } else { stack.append(.backtick) }
                 } else if case .command(let depth) = context, c == "(" || c == ")" {
                     stack.removeLast()
                     if c == "(" { stack.append(.command(depth: depth + 1)) }
                     else if depth > 0 { stack.append(.command(depth: depth - 1)) }
+                } else if case .arithmetic(let depth) = context {
+                    if c == "(" || c == ")" { stack.removeLast() }
+                    if c == "(" {
+                        stack.append(.arithmetic(depth: depth + 1))
+                    } else if c == ")", depth > 0 {
+                        stack.append(.arithmetic(depth: depth - 1))
+                    } else if c == ")", next == ")" {
+                        out.append(")")
+                        i += 1
+                    }
+                    // `#` is a digit separator here (16#ff), never a comment.
                 } else if c == "#", i == 1 || " \t\n;&|(".contains(chars[i - 2]) {
                     // A comment runs to the end of the line.
                     while i < chars.count, chars[i] != "\n" {

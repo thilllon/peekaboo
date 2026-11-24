@@ -81,6 +81,20 @@ final class FileOperationsSafetyTests: XCTestCase {
         XCTAssertFalse(fm.fileExists(atPath: fm.currentDirectoryPath + "/PWNED"))
     }
 
+    func testExecQuotesPlaceholdersInBashStringsAndArithmetic() throws {
+        let file = try make("shoot/IMG 1 * .jpg")
+        let out = root.appendingPathComponent("out")
+        // The \' in $'…' used to invert the quoting from there on: the name came out unquoted, split into
+        // words, and its * was expanded to the files in the folder.
+        try runExec(#"printf '<%s>' $'it\'s' "{name}" > out"#, file: file)
+        XCTAssertEqual(try String(contentsOf: out, encoding: .utf8), "<it's><IMG 1 * .jpg>")
+        try runExec(#"printf '<%s>' $'a{name}\tb' {stem} > out"#, file: file)
+        XCTAssertEqual(try String(contentsOf: out, encoding: .utf8), "<aIMG 1 * .jpg\tb><IMG 1 * >")
+        // {index} and {count} in arithmetic used to be a syntax error. The file is the 1st of 1.
+        try runExec("echo $(({index}+1)) \"$(( ({count} + {index}) * 2 ))\" > out", file: file)
+        XCTAssertEqual(try String(contentsOf: out, encoding: .utf8), "2 4\n")
+    }
+
     func testExecCommandsHoldNoFileText() {
         XCTAssertEqual(FileOperations.execCommand("open -R {path}"), #"open -R "${PEEKABOO_PATH}""#)
         XCTAssertEqual(FileOperations.execCommand(#"echo "x {path}" > out"#), #"echo "x ${PEEKABOO_PATH}" > out"#)
@@ -97,6 +111,22 @@ final class FileOperationsSafetyTests: XCTestCase {
         // Escaped braces, shell parameters and comments are left alone; `~/` still expands.
         XCTAssertEqual(FileOperations.execCommand(#"echo \{path} ${path} ~/Desktop/{name} # {name}'s"#),
                        #"echo \{path} ${path} ~/Desktop/"${PEEKABOO_NAME}" # {name}'s"#)
+        // In bash's $'…' strings \' is a quote, not the end: the reference is spliced between two such strings.
+        XCTAssertEqual(FileOperations.execCommand(#"printf '<%s>' $'it\'s' "{name}""#),
+                       #"printf '<%s>' $'it\'s' "${PEEKABOO_NAME}""#)
+        XCTAssertEqual(FileOperations.execCommand(#"printf %s $'a{name}\tb' {ext}"#),
+                       #"printf %s $'a'"${PEEKABOO_NAME}"$'\tb' "${PEEKABOO_EXT}""#)
+        XCTAssertEqual(FileOperations.execCommand(#"echo "$'{name}'" \$'{name}'"#), #"echo "$'${PEEKABOO_NAME}'" \$''"${PEEKABOO_NAME}"''"#)
+        // In $((…)) quotes are a syntax error: {index} and {count} (digits) stand bare, the others stay quoted.
+        XCTAssertEqual(FileOperations.execCommand("echo $(({index}+1)) \"$(( ({count} - {index}) * 2 ))\" {name}"),
+                       #"echo $((${PEEKABOO_INDEX}+1)) "$(( (${PEEKABOO_COUNT} - ${PEEKABOO_INDEX}) * 2 ))" "${PEEKABOO_NAME}""#)
+        XCTAssertEqual(FileOperations.execCommand("echo $(( {name} + 16#ff )) # {name}"),
+                       #"echo $(( "${PEEKABOO_NAME}" + 16#ff )) # {name}"#)
+        XCTAssertEqual(FileOperations.execCommand("echo $( (echo {index}) ) $(echo $(({count})))"),
+                       #"echo $( (echo "${PEEKABOO_INDEX}") ) $(echo $((${PEEKABOO_COUNT})))"#)
+        // The examples of docs/CONFIG.md.
+        XCTAssertEqual(FileOperations.execCommand(#"printf %s $'{name}\n'"#), #"printf %s $''"${PEEKABOO_NAME}"$'\n'"#)
+        XCTAssertEqual(FileOperations.execCommand("echo $(({index} + 1))"), "echo $((${PEEKABOO_INDEX} + 1))")
         // The deprecated entry point gives the same command whatever the file.
         XCTAssertEqual(FileOperations.expand("cp {path} x", file: URL(fileURLWithPath: "/a/$(rm -rf ~).jpg"), index: 0, count: 1),
                        #"cp "${PEEKABOO_PATH}" x"#)
