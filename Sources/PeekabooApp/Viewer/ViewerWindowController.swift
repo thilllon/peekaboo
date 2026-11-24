@@ -376,7 +376,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         Trace.log("opened \(pipeline.currentFile?.name ?? "?") within the browsed folder")
     }
 
-    /// Replace the whole browsing set. The pixels it drops are freed off the main thread, after the new set is shown.
+    /// Replace the whole browsing set. The pixels it drops are freed off the main thread, 250 ms later (after the new
+    /// set's first frames).
     private func replaceFiles(_ files: [ImageFile], index: Int) {
         let dropped = DeferredRelease(cachedImages())
         pipeline.setFiles(files, index: index)
