@@ -24,6 +24,8 @@ final class FakeDecoder: ImageDecoder, @unchecked Sendable {
     var latencyMs: [Tier: Double]
     var lanes: [Tier: DecodeLane]
     var failing: Set<String> = []
+    /// Time a metadata probe takes (a slow volume, a RAW file).
+    var probeDelayMs: Double = 0
     /// Pixel size per tier (the pool rounds every buffer up to 1 MB, so each cached tier costs 1 MB).
     let fullWidth: Int, fullHeight: Int
 
@@ -44,6 +46,7 @@ final class FakeDecoder: ImageDecoder, @unchecked Sendable {
 
     func probe(_ url: URL) throws -> ImageInfo {
         lock.lock(); _probes.append(url); lock.unlock()
+        if probeDelayMs > 0 { usleep(useconds_t(probeDelayMs * 1000)) }
         return ImageInfo(pixelWidth: fullWidth, pixelHeight: fullHeight, orientation: .up, typeIdentifier: "public.jpeg",
                          hasAlpha: false, hasGainMap: false, frameCount: 1, colorProfileName: nil, exif: [:])
     }
@@ -94,7 +97,7 @@ class PipelineTestCase: XCTestCase {
         }
     }
 
-    func makePipeline(_ decoder: FakeDecoder, configure: (inout PipelineConfig) -> Void = { _ in }) -> ImagePipeline {
+    func makePipeline(_ decoder: ImageDecoder, configure: (inout PipelineConfig) -> Void = { _ in }) -> ImagePipeline {
         var config = PipelineConfig(screenLongSide: 1024, previewLongSide: 256, memoryBudget: 1 << 30)
         config.readAhead = false
         config.monitorsMemoryPressure = false

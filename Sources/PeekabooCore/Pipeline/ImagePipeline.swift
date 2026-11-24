@@ -143,7 +143,6 @@ public final class ImagePipeline {
     private var position: [URL: Int] = [:]
     private var fullRequested: URL?
     private var costs = CostModel()
-    private let infos = InfoStore()
     private var scheduler: DecodeScheduler!
     private var wakeTimer: DispatchSourceTimer?
     private var pressureSource: DispatchSourceMemoryPressure?
@@ -163,7 +162,7 @@ public final class ImagePipeline {
         costs.alpha = config.tuning.alpha
         let box = WeakPipeline()
         let inbox = self.inbox
-        scheduler = DecodeScheduler(decoder: decoder, pool: pool, infos: infos, limits: config.laneLimits) { outcome in
+        scheduler = DecodeScheduler(decoder: decoder, pool: pool, limits: config.laneLimits) { outcome in
             inbox.push(outcome)
             DispatchQueue.main.async { box.pipeline?.drainInbox() }
         }
@@ -201,7 +200,6 @@ public final class ImagePipeline {
                 if let cached = slot.version, cached != version {
                     release(slot)
                     slot = Slot()  // changed on disk: decode again
-                    infos.remove(files[j].url)
                 }
                 slot.version = version
             }
@@ -278,10 +276,10 @@ public final class ImagePipeline {
         return slots[i].full ?? slots[i].screen ?? slots[i].preview
     }
 
-    /// Metadata of `file`, probed alongside its first decode (nil until then).
+    /// Metadata of `file`, probed with its first decode (nil until that decode is delivered).
     public func info(for file: ImageFile) -> ImageInfo? {
-        if let i = slotIndex(of: file), let info = slots[i].info { return info }
-        return infos.get(file.url)
+        guard let i = slotIndex(of: file) else { return nil }
+        return slots[i].info
     }
 
     public func updateConfig(_ config: PipelineConfig) {
@@ -405,7 +403,7 @@ public final class ImagePipeline {
             jobs.append(DecodeJob(
                 key: JobKey(url: file.url, tier: planned.tier), file: file, prio: planned.prio, kind: planned.kind,
                 lane: planned.quickLook ? .general : lane(j, planned.tier), targetLongSide: target,
-                estimateMs: estimate(j, planned.tier), quickLook: planned.quickLook))
+                estimateMs: estimate(j, planned.tier), quickLook: planned.quickLook, info: slots[j].info))
         }
         scheduler.submit(jobs, visible: visible)
         armWake(afterMs: plan.wakeAfterMs)
@@ -477,7 +475,7 @@ public final class ImagePipeline {
             stats.wasted += 1
             return
         }
-        if slots[i].info == nil, let info = outcome.info ?? infos.get(key.url) {
+        if slots[i].info == nil, let info = outcome.info {
             slots[i].info = info
             slots[i].lanes = [nil, nil, nil]  // lanes may depend on the metadata
         }
