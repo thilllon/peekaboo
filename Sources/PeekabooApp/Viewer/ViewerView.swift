@@ -26,7 +26,6 @@ final class PresentationTrackingLayer: CAMetalLayer {
     var onPresented: ((Int, CFTimeInterval) -> Void)?
     /// Tag for the next drawable (set by the controller right before `render()`).
     var nextTag = 0
-    private(set) var vendedTags: [Int] = []
 
     override init() { super.init() }
     override init(layer: Any) { super.init(layer: layer) }

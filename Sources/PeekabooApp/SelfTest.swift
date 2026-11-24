@@ -63,7 +63,6 @@ final class SelfTest {
     private var phase = "launch"
     private var steps: [Step] = []
     private var results: [String: Any] = [:]
-    private var listingReady = false
 
     init(folder: URL, viewer: ViewerWindowController) {
         self.folder = folder
