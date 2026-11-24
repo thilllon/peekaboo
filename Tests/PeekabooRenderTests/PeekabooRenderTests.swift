@@ -65,9 +65,10 @@ final class PeekabooRenderTests: XCTestCase {
                             orientation: orientation, isHDR: false, decodeNanos: 0)
     }
 
+    /// Memory pressure on the test machine must not trim mid-test.
     private func makeRenderer(width: Int, height: Int) -> Renderer {
         let layer = CAMetalLayer()
-        let r = Renderer(layer: layer)
+        let r = Renderer(layer: layer, monitorsMemoryPressure: false)
         r.setViewSize(CGSize(width: width, height: height), backingScale: 1)
         return r
     }
@@ -521,6 +522,103 @@ final class PeekabooRenderTests: XCTestCase {
         XCTAssertEqual(r.lastPath, "canvas")
         XCTAssertTrue(r.lastFrameRasterised, "a resize invalidates prepared canvases")
         XCTAssertEqual(resized.width, 320)
+    }
+
+    // MARK: Memory
+
+    /// Spin the main run loop until `condition` holds (GPU completion handlers and pyramid jobs release on their own).
+    private func waitUntil(timeout: TimeInterval = 5, _ condition: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.002)) }
+        return condition()
+    }
+
+    /// `trim` (memory pressure, window closed) lets go of every image but the shown one: the prepared neighbours'
+    /// pixels (pooled or freed once the pipeline evicted them too), pyramids and fit canvases. The shown view stays
+    /// present-only, and preparing and showing a neighbour afterwards (scratch textures rebuilt lazily) still matches
+    /// a fresh rasterisation.
+    func testTrimReleasesPreparedNeighbours() {
+        let r = makeRenderer(width: 300, height: 200)
+        let shown = makeImage(width: 900, height: 600, fill: pattern)
+        r.setImage(shown, key: "shown")
+        waitForPyramid(r, shown)
+        let before = render(r)
+        // Three neighbours (the app's ±1 and next-but-one; with the shown image the renderer's LRU of 4), held only by
+        // the renderer: the test keeps weak references. The last one is trimmed while its pyramid still builds.
+        var neighbours: [() -> PixelBuffer?] = []
+        for i in 0..<3 {
+            let n = i < 2 ? makeImage(width: 1000 + 40 * i, height: 700) { x, y in self.pattern(y, x) }
+                          : makeImage(width: 2000, height: 1400, fill: pattern)
+            r.prepare(n)
+            if i < 2 { waitForPyramid(r, n) }
+            weak var pixels = n.pixels
+            neighbours.append { pixels }
+        }
+        XCTAssertEqual(neighbours.filter { $0() != nil }.count, 3, "prepared neighbours are held by the renderer")
+
+        r.trim(critical: false)
+        XCTAssertTrue(waitUntil { neighbours.allSatisfy { $0() == nil } }, "trim releases the prepared neighbours")
+        XCTAssertTrue(r.isPyramidComplete(for: shown), "a non-critical trim keeps the shown image's pyramid")
+        let after = render(r)
+        XCTAssertEqual(r.lastPath, "canvas")
+        XCTAssertFalse(r.lastFrameRasterised, "the shown view keeps its canvas")
+        XCTAssertEqual(after.px, before.px)
+
+        let next = makeImage(width: 1000, height: 700) { x, y in self.pattern(y, x) }
+        r.prepare(next)
+        waitForPyramid(r, next)
+        r.setImage(next, key: "next")
+        let prepared = render(r)
+        XCTAssertFalse(r.lastFrameRasterised, "a neighbour prepared after a trim is present-only again")
+        r.discardCanvas()
+        let fresh = render(r)
+        XCTAssertTrue(r.lastFrameRasterised)
+        var maxDiff = 0.0
+        for i in 0..<fresh.px.count { maxDiff = max(maxDiff, abs(fresh.px[i].x - prepared.px[i].x), abs(fresh.px[i].z - prepared.px[i].z)) }
+        XCTAssertLessThan(maxDiff, 1e-3, "prepared and fresh canvases match after a trim")
+    }
+
+    /// A critical trim also frees the shown image's pyramid levels its view does not read (all of them at 1:1, the
+    /// coarser ones at fit). They stay freed while no view needs them, and a view that does rebuilds them with
+    /// the same pixels. Memory-pressure events map `.warning` to a normal and `.critical` to a critical trim.
+    func testCriticalTrimFreesPyramidLevelsTheViewDoesNotRead() {
+        let r = makeRenderer(width: 200, height: 150)
+        let image = makeImage(width: 1600, height: 1200, fill: pattern)
+        r.setImage(image, key: "big")
+        waitForPyramid(r, image)
+        let fit = render(r)                 // f = 8: level 3
+        r.setZoom(.scale(1))
+        let actual = render(r)              // exact copy of level 0
+        r.handleMemoryPressure(.warning)
+        XCTAssertTrue(r.isPyramidComplete(for: image), "a warning keeps the shown image's pyramid")
+        r.handleMemoryPressure(.critical)
+        XCTAssertFalse(r.isPyramidComplete(for: image), "critical frees the levels the 1:1 view does not read")
+        XCTAssertEqual(render(r).px, actual.px)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        XCTAssertFalse(r.isPyramidComplete(for: image), "nothing rebuilds them while no view reads them")
+
+        r.setZoom(.fit)
+        _ = render(r)                       // reads level 3: rebuilds the pyramid
+        waitForPyramid(r, image)
+        let rebuilt = render(r)
+        XCTAssertEqual(r.lastPath, "canvas")
+        XCTAssertEqual(rebuilt.px, fit.px, "rebuilt levels render the same pixels")
+
+        // At fit level 3 is read: a critical trim frees levels 4... only, and the fit view needs no rebuild.
+        r.trim(critical: true)
+        XCTAssertFalse(r.isPyramidComplete(for: image))
+        r.discardCanvas()
+        XCTAssertEqual(render(r).px, fit.px, "the level the view reads survives a critical trim")
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        XCTAssertFalse(r.isPyramidComplete(for: image), "levels 4... are rebuilt only when a view reads them")
+        r.setZoom(.scale(1.0 / 32))         // level 5: rebuilt from the kept level 3
+        _ = render(r)
+        waitForPyramid(r, image)
+        let reference = makeRenderer(width: 200, height: 150)
+        reference.setImage(image, key: "big")
+        waitForPyramid(reference, image)
+        reference.setZoom(.scale(1.0 / 32))
+        XCTAssertEqual(render(r).px, render(reference).px, "a partial rebuild matches a pyramid built from scratch")
     }
 
     // MARK: Colour management off the main thread

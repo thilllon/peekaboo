@@ -225,13 +225,37 @@ final class GPUImage {
         return min(wanted, readyLevel)
     }
 
-    /// Start building the pyramid on the background queue (idempotent).
+    /// The level the HQ pass reads at reduction `f` (full-resolution stored pixels per device pixel), if built.
+    func wantedLevel(f: Double) -> Int {
+        let fT = f * max(scaleX, scaleY)
+        return fT > 1 + 1e-9 ? min(Int(floor(log2(fT) + 1e-9)), maxLevel) : 0
+    }
+
+    /// Start building the pyramid on the background queue (idempotent). After `dropLevels` it continues from the
+    /// highest level kept.
     func startPyramid(context: RenderContext) {
-        guard !buildStarted, isUsable, maxLevel >= firstLevel else { return }
+        guard !buildStarted, isUsable, maxLevel >= firstLevel, readyLevel < maxLevel else { return }
         guard colorReady else { pendingPyramid = context; return }
         buildStarted = true
-        let job = PyramidJob(image: self, context: context)
+        let start = readyLevel >= firstLevel ? readyLevel + 1 : firstLevel
+        let job = PyramidJob(image: self, context: context, start: start, source: start > firstLevel ? levels[start - 1] : nil)
         PyramidJob.queue.async { job.run() }
+    }
+
+    /// Main thread: free the levels above `keep` (memory pressure); `startPyramid` rebuilds them. Only a finished
+    /// build is trimmed, so no running job publishes into the gap.
+    func dropLevels(above keep: Int) {
+        guard maxLevel >= firstLevel, readyLevel >= maxLevel, keep < maxLevel else { return }
+        let kept = keep >= firstLevel ? keep : 0
+        for L in (kept + 1)...maxLevel { levels[L] = nil }
+        readyLevel = kept
+        buildStarted = false
+    }
+
+    /// Main thread: rebuild levels `dropLevels` freed once a view at reduction `f` reads one of them again.
+    func rebuildLevels(for f: Double, context: RenderContext) {
+        let wanted = wantedLevel(f: f)
+        if wanted >= firstLevel, wanted > readyLevel { startPyramid(context: context) }
     }
 }
 
@@ -263,14 +287,22 @@ private final class PyramidJob: @unchecked Sendable {
 
     let image: GPUImage
     let context: RenderContext
-    init(image: GPUImage, context: RenderContext) { self.image = image; self.context = context }
+    /// First level to build, and the built level below it that it decimates (nil: `firstLevel`, from level 0).
+    let first: Int
+    let source: MTLTexture?
+    init(image: GPUImage, context: RenderContext, start: Int, source: MTLTexture?) {
+        self.image = image
+        self.context = context
+        first = start
+        self.source = source
+    }
 
     func run() {
         let start = Trace.now()
         let device = context.device
         let img = image
-        var previous: MTLTexture?
-        let (w2, _) = img.levelSize(img.firstLevel)
+        var previous = source
+        let (w2, _) = img.levelSize(first)
         let maxBandTmpRows = 2 * 256 * (1 << (img.firstLevel - 1)) + 64 * (1 << img.firstLevel)
         let tmpDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: max(1, w2),
                                                                height: maxBandTmpRows, mipmapped: false)
@@ -295,7 +327,7 @@ private final class PyramidJob: @unchecked Sendable {
             }
             cb = nil; pending = 0
         }
-        for L in img.firstLevel...img.maxLevel {
+        for L in first...img.maxLevel {
             if img.isCancelled { flush(); return }
             let factor = L == img.firstLevel ? (1 << img.firstLevel) : 2
             let (sw, sh) = L == img.firstLevel ? (img.width, img.height) : img.levelSize(L - 1)
@@ -353,7 +385,7 @@ private final class PyramidJob: @unchecked Sendable {
         let ms = Trace.ms(since: start)
         let gpuMs = gpuSeconds * 1000
         DispatchQueue.main.async { img.pyramidStats = (ms, gpuMs) }
-        Trace.log("pyramid \(img.width)x\(img.height) levels \(img.firstLevel)...\(img.maxLevel): \(chunks) chunks, "
+        Trace.log("pyramid \(img.width)x\(img.height) levels \(first)...\(img.maxLevel): \(chunks) chunks, "
                   + "GPU \(String(format: "%.2f", gpuMs)) ms, wall \(String(format: "%.2f", ms)) ms")
     }
 }
