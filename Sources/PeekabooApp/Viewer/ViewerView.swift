@@ -4,15 +4,15 @@ import QuartzCore
 /// Receives pointer gestures from the viewer view (view points, origin top-left).
 protocol ViewerViewDelegate: AnyObject {
     func viewerViewDidResize(_ view: ViewerView)
-    func viewer(_ view: ViewerView, magnifyBy factor: Double, at point: CGPoint, phase: NSEvent.Phase)
-    func viewer(_ view: ViewerView, scrollBy delta: CGVector, at point: CGPoint, precise: Bool, modifiers: NSEvent.ModifierFlags, phase: NSEvent.Phase)
-    func viewer(_ view: ViewerView, dragBy delta: CGVector, phase: NSEvent.Phase)
-    func viewer(_ view: ViewerView, doubleClickAt point: CGPoint)
-    func viewerSmartMagnify(_ view: ViewerView, at point: CGPoint)
+    func viewer(_: ViewerView, magnifyBy factor: Double, at point: CGPoint, phase: NSEvent.Phase)
+    func viewer(_: ViewerView, scrollBy delta: CGVector, at point: CGPoint, precise: Bool, modifiers: NSEvent.ModifierFlags, phase: NSEvent.Phase)
+    func viewer(_: ViewerView, dragBy delta: CGVector, phase: NSEvent.Phase)
+    func viewer(_: ViewerView, doubleClickAt point: CGPoint)
+    func viewerSmartMagnify(_: ViewerView, at point: CGPoint)
     /// Files or folders were dropped on the window. Return false to reject the drop.
-    func viewer(_ view: NSView, didDrop urls: [URL]) -> Bool
+    func viewer(_: NSView, didDrop urls: [URL]) -> Bool
     /// The pointer moved inside the window (cursor / traffic-light auto-hide).
-    func viewerPointerMoved(_ view: NSView)
+    func viewerPointerMoved(_: NSView)
 }
 
 /// `CAMetalLayer` that can report when each drawable it vends reaches the glass.

@@ -10,7 +10,6 @@ final class ViewerWindow: NSWindow {
 
 /// One rendered frame, for tracing and the self-test.
 struct FrameRecord {
-    let tag: Int
     /// File whose pixels the frame shows (nil = background only).
     let file: ImageFile?
     let tier: Tier?
@@ -474,6 +473,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         shownVersion = Self.knownVersion(file)
     }
 
+    // Both fields are read by the synthesized Hashable conformance (periphery reports them as assign-only).
     private struct RenderKey: Hashable {
         let url: URL
         let revision: Int
@@ -783,7 +783,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         let tag = frameCounter
         viewerView.metalLayer.nextTag = tag
         renderer.render()
-        let record = FrameRecord(tag: tag, file: renderer.image == nil ? nil : shownFile, tier: shownTier, committed: Trace.now())
+        let record = FrameRecord(file: renderer.image == nil ? nil : shownFile, tier: shownTier, committed: Trace.now())
         frames[tag] = record
         lastCommittedFrame = record
         if frames.count > 512 { frames = frames.filter { $0.key > tag - 256 } }
@@ -1168,7 +1168,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
 
     // MARK: Cursor & chrome auto-hide
 
-    func viewerPointerMoved(_ view: NSView) {
+    func viewerPointerMoved(_: NSView) {
         lastPointerMove = Trace.now()
         if chromeHidden { showChrome() }
         scheduleIdleCheck()
@@ -1374,7 +1374,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         updateHUD()
     }
 
-    func viewer(_ view: ViewerView, magnifyBy factor: Double, at point: CGPoint, phase: NSEvent.Phase) {
+    func viewer(_: ViewerView, magnifyBy factor: Double, at point: CGPoint, phase: NSEvent.Phase) {
         if phase.contains(.began) || !magnifying {
             if !magnifying { magnifying = true; gate.acquire() }
             motion.stopMomentum()
@@ -1388,7 +1388,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         }
     }
 
-    func viewer(_ view: ViewerView, scrollBy delta: CGVector, at point: CGPoint, precise: Bool,
+    func viewer(_: ViewerView, scrollBy delta: CGVector, at point: CGPoint, precise: Bool,
                 modifiers: NSEvent.ModifierFlags, phase: NSEvent.Phase) {
         gate.touch()
         if modifiers.contains(.command) || !precise {
@@ -1403,7 +1403,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         }
     }
 
-    func viewer(_ view: ViewerView, dragBy delta: CGVector, phase: NSEvent.Phase) {
+    func viewer(_: ViewerView, dragBy delta: CGVector, phase: NSEvent.Phase) {
         let now = Trace.now()
         switch phase {
         case .began:
@@ -1427,15 +1427,15 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         }
     }
 
-    func viewer(_ view: ViewerView, doubleClickAt point: CGPoint) {
+    func viewer(_: ViewerView, doubleClickAt point: CGPoint) {
         zoom(renderer.zoomMode == .fit ? .scale(1) : .fit, anchor: point)
     }
 
-    func viewerSmartMagnify(_ view: ViewerView, at point: CGPoint) {
+    func viewerSmartMagnify(_: ViewerView, at point: CGPoint) {
         zoom(renderer.zoomMode == .fit ? .scale(1) : .fit, anchor: point)
     }
 
-    func viewer(_ view: NSView, didDrop urls: [URL]) -> Bool {
+    func viewer(_: NSView, didDrop urls: [URL]) -> Bool {
         guard !urls.isEmpty else { return false }
         if let onOpenURLs { onOpenURLs(urls) } else { open(urls) }
         return true
