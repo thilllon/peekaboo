@@ -136,7 +136,8 @@ private struct ConfigReader {
 
     private mutating func buildKeymap(_ entries: [(entry: TOMLEntry, context: KeyContext, chord: String)],
                                       defaults: Bool, vim: Bool, autoAdvance: Bool) -> Keymap {
-        var keymap = Keymap.build(defaults: defaults, vim: vim, autoAdvance: autoAdvance)
+        var keymap = defaults && !vim && !autoAdvance ? Keymap.default
+            : Keymap.build(defaults: defaults, vim: vim, autoAdvance: autoAdvance)
         var lineOf: [KeyContext: [[KeyChord]: Int]] = [:]
         for (entry, context, spec) in entries {
             // Two spellings: "chord" = action(s), or "action" = chord(s) to give one action several keys.
