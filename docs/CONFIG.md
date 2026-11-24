@@ -262,7 +262,8 @@ Ids are `namespace.verb`, optionally followed by `:argument`.
 `file.trash` moves the file to the Trash at once (a rename on the same volume) and shows the next image.
 ⌘Z puts it back where it was, for the whole session. Finder's "Put Back" may not know about files
 trashed by apps, so use ⌘Z. A volume without a Trash reports an error; nothing is deleted silently.
-If the Trash was emptied meanwhile, undo says so (`IMG_0042.jpg is no longer in the Trash`).
+If the Trash was emptied meanwhile, undo says so (`IMG_0042.jpg is no longer in the Trash`), and
+the next ⌘Z goes on to the change before it.
 
 ### Move and copy
 
@@ -283,6 +284,9 @@ Safety rules:
   suggests copying instead.
 - Undo and redo leave a file alone if it was replaced or edited since the action (`IMG_0042.jpg was
   replaced or edited since it was copied: left as it is`). Renames and tag changes do not count as edits.
+  A change that can never be undone (its file was replaced, edited or removed) is dropped after that
+  message, so the next ⌘Z undoes the change before it. A failure that may pass, such as a read-only
+  folder, keeps the change for another try.
 - A read-only source or destination folder fails with a message such as `Cannot move IMG_0042.jpg:
   Permission denied`; nothing is moved or recorded. Messages name files and folders, not full paths.
 

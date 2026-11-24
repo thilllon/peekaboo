@@ -180,7 +180,7 @@ final class FileOperationsSafetyTests: XCTestCase {
             XCTAssertEqual("\(error)", "d.jpg was replaced or edited since it was moved: left as it is")
         }
         XCTAssertFalse(exists(photo))
-        XCTAssertEqual(ops.undoStack.count, 1, "the change stays")
+        XCTAssertEqual(ops.undoStack.count, 0, "a change that can never be undone is dropped")
 
         // A copy edited since: undo leaves it alone instead of deleting the edit.
         let other = try make("shoot/e.jpg", "e")
@@ -206,7 +206,7 @@ final class FileOperationsSafetyTests: XCTestCase {
             XCTAssertEqual("\(error)", "f.jpg was replaced or edited since it was moved back: left as it is")
         }
         XCTAssertTrue(exists(f))
-        XCTAssertEqual(ops2.redoStack.count, 1)
+        XCTAssertEqual(ops2.redoStack.count, 0)
 
         // Renames and tag changes are not edits: undo still works.
         let g = try make("shoot/g.jpg", "g")
@@ -221,7 +221,9 @@ final class FileOperationsSafetyTests: XCTestCase {
     func testUndoTrashAfterTheTrashWasEmptied() throws {
         let name = "emptied-\(UUID().uuidString.prefix(8)).jpg"
         let photo = try make("shoot/\(name)")
+        let earlier = try make("shoot/earlier.jpg")
         let ops = FileOperations()
+        try ops.move(earlier, toFolder: root.appendingPathComponent("keep"))
         let change: FileOperations.Change
         do {
             change = try ops.trash(photo)
@@ -234,7 +236,63 @@ final class FileOperationsSafetyTests: XCTestCase {
             XCTAssertEqual("\(error)", "\(name) is no longer in the Trash")
         }
         XCTAssertFalse(exists(photo))
+        // The trash can never be undone now: the next undo reaches the move before it.
         XCTAssertEqual(ops.undoStack.count, 1)
+        _ = try ops.undo()
+        XCTAssertTrue(exists(earlier))
+    }
+
+    func testUndoDropsChangesThatCanNeverBeUndoneAndKeepsOnesThatMaySucceedLater() throws {
+        let ops = FileOperations()
+        ops.trashesUndoneCopies = false
+        let keep = root.appendingPathComponent("keep")
+        var moved: [URL] = []
+        for n in 1...3 {
+            moved.append(try make("shoot/m\(n).jpg"))
+            try ops.move(moved[n - 1], toFolder: keep)
+        }
+        // Moved, then deleted in Finder; a tag change on a file deleted since; a copy edited since.
+        try ops.move(try make("shoot/gone.jpg"), toFolder: keep)
+        try fm.removeItem(at: keep.appendingPathComponent("gone.jpg"))
+        let tagged = try make("shoot/tagged.jpg")
+        try ops.setTags(FileOperations.Tags(names: ["Pick"]), of: tagged)
+        try fm.removeItem(at: tagged)
+        let copied = try make("shoot/copied.jpg")
+        try ops.copy(copied, toFolder: keep)
+        try Data("edited".utf8).write(to: keep.appendingPathComponent("copied.jpg"))
+        XCTAssertEqual(ops.undoStack.count, 6)
+
+        // Each failure is reported once; then undo goes on to the older changes instead of failing forever.
+        for message in ["copied.jpg was replaced or edited since it was copied: left as it is",
+                        "tagged.jpg is no longer there", "gone.jpg is no longer in keep"] {
+            XCTAssertThrowsError(try ops.undo()) { error in XCTAssertEqual("\(error)", message) }
+        }
+        XCTAssertEqual(ops.undoStack.count, 3)
+        XCTAssertEqual(try String(contentsOf: keep.appendingPathComponent("copied.jpg"), encoding: .utf8), "edited")
+
+        // A failure that may pass later (a read-only folder) keeps the change for another try.
+        guard getuid() != 0 else { throw XCTSkip("root ignores permissions") }
+        let shoot = root.appendingPathComponent("shoot")
+        try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: shoot.path)
+        XCTAssertThrowsError(try ops.undo()) { error in
+            XCTAssertEqual("\(error)", "Cannot restore m3.jpg: Permission denied")
+        }
+        XCTAssertEqual(ops.undoStack.count, 3)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shoot.path)
+        for photo in moved.reversed() {
+            _ = try ops.undo()
+            XCTAssertTrue(exists(photo))
+        }
+        XCTAssertEqual(ops.undoStack.count, 0)
+
+        // Redo drops what can never be redone in the same way.
+        XCTAssertEqual(ops.redoStack.count, 3)
+        try fm.removeItem(at: moved[0])
+        XCTAssertThrowsError(try ops.redo()) { error in XCTAssertEqual("\(error)", "m1.jpg is no longer there") }
+        XCTAssertEqual(ops.redoStack.count, 2)
+        _ = try ops.redo()
+        XCTAssertFalse(exists(moved[1]))
+        XCTAssertTrue(exists(keep.appendingPathComponent("m2.jpg")))
     }
 
     // MARK: Read-only folders and volumes

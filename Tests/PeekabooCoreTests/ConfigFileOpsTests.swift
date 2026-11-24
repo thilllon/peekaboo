@@ -101,13 +101,13 @@ final class ConfigFileOpsTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("shoot/a 2.jpg"), encoding: .utf8), "first")
     }
 
-    func testUndoKeepsTheChangeWhenItFails() throws {
+    func testUndoDropsTheChangeWhenItsFileIsGone() throws {
         let photo = try make("shoot/b.jpg")
         let ops = FileOperations()
         try ops.move(photo, toFolder: root.appendingPathComponent("out"))
         try fm.removeItem(at: root.appendingPathComponent("out/b.jpg"))
         XCTAssertThrowsError(try ops.undo())
-        XCTAssertEqual(ops.undoStack.count, 1)
+        XCTAssertEqual(ops.undoStack.count, 0)
     }
 
     func testDestinationsSlotsAndRelativePaths() throws {

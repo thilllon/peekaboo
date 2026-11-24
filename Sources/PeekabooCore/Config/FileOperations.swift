@@ -37,7 +37,13 @@ public final class FileOperations {
 
     public struct Failure: Error, Equatable, CustomStringConvertible {
         public let message: String
-        public init(_ message: String) { self.message = message }
+        /// Trying again cannot succeed (the file is gone, or was replaced or edited): undo and redo drop the change.
+        let permanent: Bool
+        public init(_ message: String) { self.init(message, permanent: false) }
+        init(_ message: String, permanent: Bool) {
+            self.message = message
+            self.permanent = permanent
+        }
         public var description: String { message }
     }
 
@@ -99,8 +105,9 @@ public final class FileOperations {
 
     /// Undo the most recent change. Returns the change as it now sits on the redo stack, with the
     /// restored location (a "name 2.ext" if the old name was taken meanwhile); nil when there is nothing
-    /// to undo. Throws, keeping the change, when the item is gone (e.g. the Trash was emptied) or was
-    /// replaced or edited since the action.
+    /// to undo. Throws when it cannot: a change whose item is gone (e.g. the Trash was emptied) or was
+    /// replaced or edited since the action is dropped, so that the next undo reaches the older changes;
+    /// any other failure (a read-only folder, a full disk) keeps it for another try.
     public func undo() throws -> Change? {
         guard let entry = undoEntries.popLast() else { return nil }
         do {
@@ -120,19 +127,22 @@ public final class FileOperations {
                 try removeCopy(to, stamp: entry.stamp)
                 redo = .copied(from: from, to: to)
             case .tagged(let url, let before, let after):
+                try Self.requireItem(url)
                 try Self.write(before, to: url)
                 redo = .tagged(url, before: before, after: after)
             }
             redoEntries.append(Entry(change: redo, stamp: Self.stamp(redoing: redo)))
             return redo
+        } catch let failure as Failure where failure.permanent {
+            throw failure
         } catch {
             undoEntries.append(entry)
             throw error
         }
     }
 
-    /// Redo the most recently undone change; returns the change as redone. Throws, keeping the change,
-    /// when the file was replaced or edited since it was put back.
+    /// Redo the most recently undone change; returns the change as redone. Throws when it cannot, dropping
+    /// the change when its file is gone or was replaced or edited since it was put back (as `undo()` does).
     public func redo() throws -> Change? {
         guard let entry = redoEntries.popLast() else { return nil }
         do {
@@ -147,11 +157,14 @@ public final class FileOperations {
             case .copied(let from, let to):
                 redone = try Self.transfer(from, toFolder: to.deletingLastPathComponent(), copy: true)
             case .tagged(let url, let before, let after):
+                try Self.requireItem(url)
                 try Self.write(after, to: url)
                 redone = .tagged(url, before: before, after: after)
             }
             undoEntries.append(Entry(change: redone, stamp: Self.stamp(undoing: redone)))
             return redone
+        } catch let failure as Failure where failure.permanent {
+            throw failure
         } catch {
             redoEntries.append(entry)
             throw error
@@ -166,7 +179,7 @@ public final class FileOperations {
     }
 
     private func performTrash(_ url: URL) throws -> Change {
-        guard Self.itemExists(url) else { throw Failure("\(url.lastPathComponent) is no longer there") }
+        try Self.requireItem(url)
         var resulting: NSURL?
         do {
             // Moves the directory entry itself: a symbolic link goes to the Trash, its target stays.
@@ -197,7 +210,7 @@ public final class FileOperations {
         let verb = copy ? "copy" : "move"
         let name = url.lastPathComponent
         let folder = folder.standardizedFileURL
-        guard itemExists(url) else { throw Failure("\(name) is no longer there") }
+        try requireItem(url)
         if !copy, isSameDirectory(folder, url.deletingLastPathComponent()) {
             throw Failure("\(name) is already in \(folder.lastPathComponent)")
         }
@@ -374,11 +387,19 @@ public final class FileOperations {
     }
 
     /// Throws unless the item at `url` is the one `stamp` describes. Messages say `name`, never a path.
+    /// The failures are permanent: that item cannot come back.
     private static func check(_ stamp: Stamp?, at url: URL, name: String? = nil, missing: String, since verb: String) throws {
         guard let stamp else { return }
         let name = name ?? url.lastPathComponent
-        guard let now = Stamp(url) else { throw Failure("\(name) \(missing)") }
-        if now != stamp { throw Failure("\(name) was replaced or edited since it was \(verb): left as it is") }
+        guard let now = Stamp(url) else { throw Failure("\(name) \(missing)", permanent: true) }
+        if now != stamp {
+            throw Failure("\(name) was replaced or edited since it was \(verb): left as it is", permanent: true)
+        }
+    }
+
+    /// Throws (permanently) when nothing has the name `url` any more, e.g. before tagging it.
+    private static func requireItem(_ url: URL) throws {
+        guard itemExists(url) else { throw Failure("\(url.lastPathComponent) is no longer there", permanent: true) }
     }
 
     // MARK: Destinations
