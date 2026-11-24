@@ -302,6 +302,28 @@ final class PipelineTests: PipelineTestCase {
         XCTAssertTrue(spin { self.has(pipeline, changed, .screen) })
     }
 
+    /// Files are indexed by name (unique within a folder); a set opened from several folders may repeat a name, and
+    /// each file still keeps its own tiers.
+    func testFilesWithTheSameNameInDifferentFoldersStayApart() {
+        let decoder = FakeDecoder()
+        let pipeline = makePipeline(decoder)
+        let files = ["a", "b", "c"].enumerated().map { i, folder in
+            ImageFile(url: URL(fileURLWithPath: "/peekaboo-test/\(folder)/x.jpg"), name: "x.jpg", byteSize: 1000,
+                      modified: 1, fileID: UInt64(i + 1))
+        }
+        pipeline.setFiles(files, index: 1)
+        XCTAssertTrue(spin { files.allSatisfy { self.has(pipeline, $0, .screen) } })
+        spin(for: 0.1)
+        for file in files {
+            XCTAssertEqual(decoder.calls(.screen).filter { $0.url == file.url }.count, 1, file.url.path)
+        }
+        pipeline.setFiles([files[0], files[2]], index: 1)
+        XCTAssertTrue(has(pipeline, files[0], .screen))
+        XCTAssertTrue(has(pipeline, files[2], .screen))
+        XCTAssertTrue(pipeline.cachedTiers(for: files[1]).isEmpty, "a removed file's tiers are dropped")
+        XCTAssertEqual(pipeline.currentFile?.url, files[2].url)
+    }
+
     func testOpenedFileSurvivesFolderListing() {
         let decoder = FakeDecoder(latencyMs: [.preview: 5, .screen: 80, .full: 100])
         let pipeline = makePipeline(decoder)

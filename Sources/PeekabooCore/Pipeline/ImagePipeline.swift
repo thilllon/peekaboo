@@ -154,7 +154,11 @@ public final class ImagePipeline {
     /// Indices whose slot holds pixels (eviction and pressure scan only these).
     private var cachedIndices: Set<Int> = []
     private var tierBytes = [0, 0, 0]
-    private var position: [URL: Int] = [:]
+    /// Index of each file by name, checked against its URL on lookup: names are unique within a folder, and hashing
+    /// them costs a fifth of hashing URLs (a trash or an undo rebuilds this for every file: 50k files, 6 → 1.2 ms).
+    /// A name that occurs again (a set opened from several folders) is indexed by URL in `positionByURL`.
+    private var positionByName: [String: Int] = [:]
+    private var positionByURL: [URL: Int] = [:]
     private var fullRequested: URL?
     private var costs = CostModel()
     private var scheduler: DecodeScheduler!
@@ -214,11 +218,11 @@ public final class ImagePipeline {
     /// Cached tiers, metadata and running decodes of files that survive are kept.
     public func setFiles(_ files: [ImageFile], index: Int) {
         let previous = currentFile
-        let oldFiles = self.files
+        var oldFiles = self.files
         var oldSlots = self.slots
         self.files = files
         listedAt = Trace.now()
-        position = Dictionary(files.enumerated().map { ($1.url, $0) }, uniquingKeysWith: { first, _ in first })
+        rebuildPosition()
         slots = [Slot](repeating: Slot(), count: files.count)
         cachedIndices.removeAll(keepingCapacity: true)
         tierBytes = [0, 0, 0]
@@ -226,7 +230,7 @@ public final class ImagePipeline {
         for i in oldSlots.indices where oldSlots[i].hasState {
             var slot = oldSlots[i]
             oldSlots[i] = Slot()
-            guard let j = position[oldFiles[i].url] else {  // removed: pixels are released
+            guard let j = position(of: oldFiles[i].url, name: oldFiles[i].name) else {  // removed: pixels are released
                 release(slot)
                 continue
             }
@@ -245,8 +249,13 @@ public final class ImagePipeline {
                 for tier in Tier.allCases { if let image = slot[tier] { tierBytes[tier.rawValue] += image.pixels.allocatedBytes } }
             }
         }
-        if let url = fullRequested, position[url] == nil { fullRequested = nil }
+        if let url = fullRequested, position(of: url, name: url.lastPathComponent) == nil { fullRequested = nil }
         recountBytes()
+        // The replaced arrays go with the batch: for a large folder freeing them is a millisecond of main-thread work.
+        releaser.retire(oldSlots)
+        releaser.retire(oldFiles)
+        oldSlots = []
+        oldFiles = []
         defer { flushReleases() }
         guard !files.isEmpty else {
             self.index = 0
@@ -384,7 +393,25 @@ public final class ImagePipeline {
 
     private func slotIndex(of file: ImageFile) -> Int? {
         if files.indices.contains(index), files[index].url == file.url { return index }
-        return position[file.url]
+        return position(of: file.url, name: file.name)
+    }
+
+    /// Index of the file at `url` in the browsing set; `name` is its last path component (`ImageFile.name`).
+    private func position(of url: URL, name: String) -> Int? {
+        if let i = positionByName[name], files[i].url == url { return i }
+        return positionByURL.isEmpty ? nil : positionByURL[url]
+    }
+
+    private func rebuildPosition() {
+        var byName = [String: Int](minimumCapacity: files.count)
+        var byURL: [URL: Int] = [:]
+        for (i, file) in files.enumerated() {
+            guard let first = byName.updateValue(i, forKey: file.name) else { continue }
+            byName[file.name] = first  // the first file of that name keeps it; later ones are found by URL
+            if byURL[file.url] == nil { byURL[file.url] = i }
+        }
+        positionByName = byName
+        positionByURL = byURL
     }
 
     private func scheduleReplan() {
@@ -404,7 +431,9 @@ public final class ImagePipeline {
         let snapshot = scheduler.snapshot()
         // Running / undelivered keys as index → tier bits (a handful of URL lookups per pass).
         var busyBits: [Int: UInt8] = [:]
-        for key in snapshot.busy { if let i = position[key.url] { busyBits[i, default: 0] |= 1 << key.tier.rawValue } }
+        for key in snapshot.busy {
+            if let i = position(of: key.url, name: key.url.lastPathComponent) { busyBits[i, default: 0] |= 1 << key.tier.rawValue }
+        }
         let underPressure = now < pressureUntil
         let previewHeadroom = budget(.preview) - tierBytes[Tier.preview.rawValue]
         let windowReserve = tuning.previewMaxAhead + tuning.previewBehind
@@ -516,7 +545,7 @@ public final class ImagePipeline {
         let key = outcome.job.key
         scheduler.acknowledge(key)
         defer { scheduleReplan() }
-        guard let i = position[key.url] else { stats.wasted += 1; return }
+        guard let i = position(of: key.url, name: outcome.job.file.name) else { stats.wasted += 1; return }
         let tuning = config.tuning
         let bit: UInt8 = 1 << key.tier.rawValue
         // Written while it was decoded: the pixels match no version of the file. Decode again once it is quiet.
@@ -652,7 +681,7 @@ public final class ImagePipeline {
     /// dropped once nothing has been written for `quietMs` (until then they stay on screen); deferred tiers are
     /// planned again then. Returns true when the plan changes.
     private func revalidate(_ url: URL, observed: FileStamp?, observedAt: UInt64, wall: Double) -> Bool {
-        guard let i = position[url] else { return false }
+        guard let i = position(of: url, name: url.lastPathComponent) else { return false }
         guard observedAt >= max(listedAt, slots[i].stampedAt) else {
             // Seen before a newer listing or decode arrived: look again rather than act on it.
             if slots[i].unsettled || slots[i].deferred != 0 { scheduleRecheck(url, afterMs: 0) }
@@ -842,7 +871,8 @@ private final class Releaser: @unchecked Sendable {
     private final class Batch: @unchecked Sendable {
         var images: [DecodedImage] = []
         var outcomes: [DecodeOutcome] = []
-        var isEmpty: Bool { images.isEmpty && outcomes.isEmpty }
+        var retired: [Any] = []
+        var isEmpty: Bool { images.isEmpty && outcomes.isEmpty && retired.isEmpty }
     }
 
     private let queue = DispatchQueue(label: "peekaboo.release", qos: .utility)
@@ -851,6 +881,8 @@ private final class Releaser: @unchecked Sendable {
 
     func add(_ image: DecodedImage?) { if let image { batch.images.append(image) } }
     func add(_ outcomes: [DecodeOutcome]) { batch.outcomes.append(contentsOf: outcomes) }
+    /// Any other value whose last release is expensive (a large array the pipeline replaced).
+    func retire(_ value: Any) { batch.retired.append(value) }
 
     /// Release what was collected, then empty `pool` if its free buffers no longer fit `poolLimit` (the memory budget
     /// the cache leaves unused) or `drainPool` is set. The batch is emptied on the queue, so its pixels are freed
@@ -862,6 +894,7 @@ private final class Releaser: @unchecked Sendable {
         queue.async {
             full.images.removeAll()
             full.outcomes.removeAll()
+            full.retired.removeAll()
             // Released `.metal` buffers went back to the pool just now: the free list counts against the budget too.
             if drainPool || pool.pooledBytes > poolLimit { pool.drain() }
         }
