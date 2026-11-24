@@ -53,6 +53,8 @@ public final class FileOperations {
     public var redoStack: [Change] { redoEntries.map(\.change) }
     /// Undoing a copy moves the copy to the Trash, as Finder does; false deletes it (tests).
     public var trashesUndoneCopies = true
+    /// How undo puts a copy in the Trash (tests stand in a volume without one).
+    var trashCopy: (URL) throws -> Void = { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) }
     private let fm = FileManager.default
 
     /// A change plus the identity of the item that its undo (or redo) acts on, so that neither touches a
@@ -244,11 +246,15 @@ public final class FileOperations {
         guard Self.itemExists(url) else { return }
         // Never trash or delete a file that replaced the copy, or the copy after it was edited.
         try Self.check(stamp, at: url, missing: "is no longer there", since: "copied")
-        do {
-            guard trashesUndoneCopies else { throw Failure("delete") }
-            try fm.trashItem(at: url, resultingItemURL: nil)
-        } catch {
+        guard trashesUndoneCopies else {
             do { try fm.removeItem(at: url) } catch { throw Failure("Cannot remove the copy: \(Self.reason(error))") }
+            return
+        }
+        do {
+            try trashCopy(url)
+        } catch {
+            // Never delete it instead (a network share has no Trash): by now the copy may be the only one left.
+            throw Failure("Cannot move the copy to the Trash: \(Self.reason(error))")
         }
     }
 

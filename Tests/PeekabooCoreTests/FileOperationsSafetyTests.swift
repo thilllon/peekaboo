@@ -295,6 +295,30 @@ final class FileOperationsSafetyTests: XCTestCase {
         XCTAssertTrue(exists(keep.appendingPathComponent("m2.jpg")))
     }
 
+    func testUndoNeverDeletesACopyWhenTheTrashIsUnavailable() throws {
+        let photo = try make("shoot/backup.jpg", "only copy")
+        let share = root.appendingPathComponent("share")
+        let ops = FileOperations()
+        // A network share without a Trash.
+        ops.trashCopy = { _ in throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOTSUP)) }
+        try ops.copy(photo, toFolder: share)
+        try fm.removeItem(at: photo) // the card is formatted: the copy is the only one left
+        XCTAssertThrowsError(try ops.undo()) { error in
+            XCTAssertEqual("\(error)", "Cannot move the copy to the Trash: Operation not supported")
+        }
+        XCTAssertEqual(try String(contentsOf: share.appendingPathComponent("backup.jpg"), encoding: .utf8), "only copy")
+        XCTAssertEqual(ops.undoStack.count, 1, "the change stays for another try")
+        // Once the Trash can take it, undo goes ahead.
+        var trashed: [String] = []
+        ops.trashCopy = { url in
+            trashed.append(url.lastPathComponent)
+            try FileManager.default.removeItem(at: url)
+        }
+        _ = try ops.undo()
+        XCTAssertEqual(trashed, ["backup.jpg"])
+        XCTAssertEqual(try listing("share"), [])
+    }
+
     // MARK: Read-only folders and volumes
 
     func testReadOnlyFoldersFailCleanlyWithoutPathsInMessages() throws {

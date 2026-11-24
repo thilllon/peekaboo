@@ -293,7 +293,8 @@ Safety rules:
 `file.move:ask` (`m`) and `file.copy:ask` (`c`) open a menu of your slots. A slot whose name is one
 character (`1`…`9`, `k`, …) is chosen with that key. Return picks the previous destination, and `o`
 ("Other Folder…") chooses any folder. `file.move:last` repeats the previous destination without asking.
-Undoing a copy moves the copy to the Trash, as Finder does.
+Undoing a copy moves the copy to the Trash, as Finder does. Where there is no Trash (some network
+shares), undo says so and leaves the copy alone; it never deletes the copy instead.
 
 ### Ratings, labels and flags
 
