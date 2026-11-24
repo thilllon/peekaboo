@@ -25,10 +25,6 @@ struct ColorTransform {
                                SIMD3<Float>(0.0331941, 0.9668058, 0.0000000),
                                SIMD3<Float>(0.0170827, 0.0723974, 0.9105199))
 
-    var isIdentityMatrix: Bool {
-        rows.0 == SIMD3(1, 0, 0) && rows.1 == SIMD3(0, 1, 0) && rows.2 == SIMD3(0, 0, 1)
-    }
-
     private static let lock = NSLock()
     nonisolated(unsafe) private static var cache: [AnyHashable: ColorTransform] = [:]
     /// Probes of uncommon profiles run here, never on the main thread (1–3 ms each).

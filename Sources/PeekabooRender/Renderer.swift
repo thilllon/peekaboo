@@ -177,7 +177,6 @@ struct Perm: Equatable {
         Perm(a: l.a * r.a + l.b * r.c, b: l.a * r.b + l.b * r.d, c: l.c * r.a + l.d * r.c, d: l.c * r.b + l.d * r.d)
     }
     var transposed: Perm { Perm(a: a, b: c, c: b, d: d) }
-    var swapsAxes: Bool { a == 0 }
     func apply(_ v: SIMD2<Double>) -> SIMD2<Double> { SIMD2(Double(a) * v.x + Double(b) * v.y, Double(c) * v.x + Double(d) * v.y) }
     func apply(_ v: SIMD2<Int>) -> SIMD2<Int> { SIMD2(a * v.x + b * v.y, c * v.x + d * v.y) }
 
@@ -211,7 +210,8 @@ struct HQCanvas {
     let drawable: SIMD2<Double>
 }
 
-// MSL mirrors.
+// MSL mirrors: Swift only writes them and passes them with setBytes; the shaders read every field, padding
+// included (periphery reports them as assign-only).
 struct RP {
     var ox: Float = 0, oy: Float = 0, sx: Float = 1, sy: Float = 1, kx: Float = 1, ky: Float = 1
     var radius: Float = 3, antiring: Float = 0, B: Float = 0, C: Float = 0
@@ -689,7 +689,7 @@ public final class Renderer {
         var q = PresentP()
         q.encode = isFloat ? 0 : 1
         q.ditherAmp = isFloat ? 0 : 1.0 / 255.0
-        applyBackground(&q, linearOutput: isFloat)
+        applyBackground(&q)
         let D = SIMD2(Double(target.width), Double(target.height))
         var canvasTex: MTLTexture?
         var levelA: MTLTexture?, levelB: MTLTexture?
@@ -861,7 +861,7 @@ public final class Renderer {
         }
     }
 
-    private func applyBackground(_ q: inout PresentP, linearOutput: Bool) {
+    private func applyBackground(_ q: inout PresentP) {
         func lin(_ v: Float) -> Float { v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4) }
         switch settings.background {
         case .black: q.bg0 = SIMD4(0, 0, 0, 1)
