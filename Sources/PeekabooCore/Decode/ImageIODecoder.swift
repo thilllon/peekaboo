@@ -26,7 +26,7 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
 
     /// Decode gain-map images (`hasGainMap`) to HDR (`kCGImageSourceDecodeToHDR`, extended-linear
     /// Display P3 `.rgba16f`, `isHDR = true`) for `.screen`/`.full`. Off by default: the HDR rendition
-    /// costs 8–12× the SDR decode (gain-map application plus a converting draw; see
+    /// costs 10–15× the SDR decode (1.4 vs 21 ms on a 384×512 Apple gain-map JPEG: gain-map application plus a converting draw; see
     /// `peekaboo-bench decode`), above the 2× budget. Enable with `PEEKABOO_HDR=1` or by setting it.
     nonisolated(unsafe) public static var decodeHDR = ProcessInfo.processInfo.environment["PEEKABOO_HDR"] != nil
 
