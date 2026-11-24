@@ -87,6 +87,9 @@ final class HUD {
     /// 0 until the first layout, so the text layers always receive the real backing scale.
     private var scale: CGFloat = 0
     private var content = HUDContent()
+    /// Rows the details box was last laid out with: re-measuring multi-line text is the HUD's costliest step, and
+    /// a zoom gesture changes only the info line (its zoom %), at every event.
+    private var laidOutDetails: [HUDContent.Row]?
     private var toastGeneration = 0
     private var messageText: String?
     private var helpSections: [(title: String, lines: [(keys: String, title: String)])]?
@@ -141,7 +144,7 @@ final class HUD {
             layoutToast()
         }
         // Re-measure so the info line truncates to the new width (and re-rasterises at a new scale).
-        if widthChanged || scaleChanged { refreshInfo() }
+        if widthChanged || scaleChanged { refreshInfo(relayout: true) }
         if helpSections != nil { renderHelp() }
     }
 
@@ -172,7 +175,9 @@ final class HUD {
         refreshInfo()
     }
 
-    private func refreshInfo() {
+    /// `relayout`: the size or scale changed, so the details are measured again even if their rows did not change.
+    private func refreshInfo(relayout: Bool = false) {
+        if relayout { laidOutDetails = nil }
         transaction {
             let showLine = !hidesAll && mode != .off && !content.line.isEmpty
             info.box.isHidden = !showLine
@@ -183,7 +188,8 @@ final class HUD {
             }
             let showDetails = showLine && mode == .full && !content.details.isEmpty
             details.box.isHidden = !showDetails
-            if showDetails {
+            if showDetails, laidOutDetails != content.details {
+                laidOutDetails = content.details
                 let width = content.details.map(\.label.count).max() ?? 0
                 let text = NSMutableAttributedString()
                 for (i, row) in content.details.enumerated() {
