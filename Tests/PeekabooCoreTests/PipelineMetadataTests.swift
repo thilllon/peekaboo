@@ -82,7 +82,8 @@ final class PipelineMetadataTests: PipelineTestCase {
             if infoAtFirstDelivery[file.name] == nil { infoAtFirstDelivery[file.name] = pipeline.info(for: file) != nil }
         }
         pipeline.setFiles(files, index: 0)
-        XCTAssertTrue(spin { self.has(pipeline, files[2], .screen) })
+        // The neighbours' decodes run side by side and land in any order: wait for all three.
+        XCTAssertTrue(spin(timeout: 5) { files.prefix(3).allSatisfy { self.has(pipeline, $0, .screen) } })
         XCTAssertGreaterThanOrEqual(infoAtFirstDelivery.count, 3)
         XCTAssertEqual(infoAtFirstDelivery.filter { !$0.value }.keys.sorted(), [], "delivered without metadata")
     }
