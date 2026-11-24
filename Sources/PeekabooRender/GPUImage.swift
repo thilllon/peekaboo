@@ -5,7 +5,8 @@ import Metal
 import PeekabooCore
 import simd
 
-// Swift mirrors of the MSL structs (all members 4-byte scalars or SIMD4 → identical layout).
+// Swift mirrors of the MSL structs (all members 4-byte scalars or SIMD4 → identical layout). Swift only writes
+// them and passes them with setBytes; the shaders read every field (periphery reports them as assign-only).
 struct SrcInfo {
     var m0 = SIMD4<Float>(1, 0, 0, 0), m1 = SIMD4<Float>(0, 1, 0, 0), m2 = SIMD4<Float>(0, 0, 1, 0)
     var width: Int32 = 1, height: Int32 = 1
@@ -31,7 +32,6 @@ final class GPUImage {
     let image: DecodedImage
     let width: Int, height: Int
     private(set) var tiles: [MTLTexture]
-    let tileCols: Int
     var src: SrcInfo
     private(set) var lut: MTLBuffer
     /// False while an uncommon ICC profile is probed off the main thread: frames use the sRGB / Display P3
@@ -56,7 +56,6 @@ final class GPUImage {
     let maxLevel: Int
     /// Stage-0 linear float copy (previews only), for the hardware-bilinear B-spline.
     var linearPreview: MTLTexture?
-    var linearPreviewPending = false
     var onLevelReady: ((Int) -> Void)?
     /// Wall and summed GPU time of the finished pyramid build (main thread; nil until done).
     var pyramidStats: (wallMs: Double, gpuMs: Double)?
@@ -64,7 +63,7 @@ final class GPUImage {
     private var cancelledFlag = false
     private var buildStarted = false
     private var pendingPyramid: RenderContext?
-    /// Keeps a bytesNoCopy wrapper of an IOSurface alive for tiled surfaces.
+    /// Retains the bytesNoCopy wrapper of an IOSurface that the tiles of a tiled surface view (never read).
     private var surfaceBuffer: MTLBuffer?
 
     var isUsable: Bool { !tiles.isEmpty }
@@ -102,7 +101,6 @@ final class GPUImage {
         // Level-0 tiles: views into the decoder's memory, no copies.
         let cols = (width + Self.maxTextureSide - 1) / Self.maxTextureSide
         let rows = (height + Self.maxTextureSide - 1) / Self.maxTextureSide
-        tileCols = cols
         info.tileCols = Int32(cols)
         info.tileCount = Int32(cols * rows)
         info.tileShift = Int32(Self.tileShift)

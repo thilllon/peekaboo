@@ -3,14 +3,14 @@ import Foundation
 
 /// Asynchronous page-cache warm-up with `F_RDADVISE` (no copy, near-zero CPU): the SSD reads overlap decoding.
 /// Calls are batched onto a utility queue so the main thread never touches the file system.
-public enum ReadAhead {
+enum ReadAhead {
     /// Bytes advised for files entering the preview window: header, EXIF/MPF thumbnail, preview directory.
-    public static let headBytes = 256 << 10
+    static let headBytes = 256 << 10
 
     private static let queue = DispatchQueue(label: "peekaboo.readahead", qos: .utility)
 
     /// Advise the kernel to read `length` bytes (nil = whole file) of each URL soon.
-    public static func advise(_ requests: [(url: URL, length: Int?)]) {
+    static func advise(_ requests: [(url: URL, length: Int?)]) {
         guard !requests.isEmpty else { return }
         queue.async {
             for request in requests { adviseNow(request.url, length: request.length) }
@@ -19,7 +19,7 @@ public enum ReadAhead {
 
     /// Synchronous variant (call off the main thread).
     @discardableResult
-    public static func adviseNow(_ url: URL, length: Int?) -> Bool {
+    static func adviseNow(_ url: URL, length: Int?) -> Bool {
         let fd = url.withUnsafeFileSystemRepresentation { path in path.map { open($0, O_RDONLY | O_CLOEXEC) } ?? -1 }
         guard fd >= 0 else { return false }
         defer { close(fd) }

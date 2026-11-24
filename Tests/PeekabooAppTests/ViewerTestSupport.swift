@@ -155,10 +155,6 @@ class ViewerTestCase: XCTestCase {
         }
         return nil
     }
-
-    func index(of name: String, in viewer: ViewerWindowController) -> Int? {
-        viewer.pipeline.files.firstIndex { $0.name == name }
-    }
 }
 
 extension ViewerWindowController {

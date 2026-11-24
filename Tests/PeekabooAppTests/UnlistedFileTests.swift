@@ -13,8 +13,10 @@ final class UnlistedFileTests: ViewerTestCase {
         let viewer = try makeViewer()
         writeImage(folder.appendingPathComponent("a1.jpg"), width: 900, height: 600, gray: 0.3)
         writeImage(folder.appendingPathComponent("a2.jpg"), width: 900, height: 600, gray: 0.6)
+        // Bytes no decoder (ImageIO or QuickLook) can read: a valid SVG would get a QuickLook preview, so the error
+        // path would depend on the machine's QuickLook generators.
         let svg = folder.appendingPathComponent("logo.svg")
-        try Data(#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>"#.utf8).write(to: svg)
+        try Data([0x00, 0xFF, 0x13, 0x37, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03]).write(to: svg)
 
         viewer.open([svg])
         XCTAssertTrue(spin(5) { !viewer.isListingPendingForTests && self.hudMessage(viewer) != nil })

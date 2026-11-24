@@ -2,7 +2,6 @@ import AppKit
 import XCTest
 @testable import PeekabooApp
 @testable import PeekabooCore
-@testable import PeekabooRender
 
 /// The app delegate's launch and open-documents handling.
 final class AppDelegateTests: ViewerTestCase {

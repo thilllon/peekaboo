@@ -4,6 +4,7 @@ import Foundation
 /// pipeline's `probe` and the following `decode` calls of every tier parse metadata once.
 /// A changed file has a new key; entries are small (~1 KB), the cache is bounded.
 final class DecodeProbeCache: @unchecked Sendable {
+    // Every field is read by the synthesized Hashable conformance (periphery reports them as assign-only).
     struct Key: Hashable {
         let path: String
         let size: Int64

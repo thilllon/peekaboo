@@ -1,26 +1,26 @@
 import Foundation
 
 /// Every problem found in a config file, each with its line. The file is applied only when this is empty.
-public struct ConfigError: Error, Equatable, Sendable, CustomStringConvertible {
-    public let fileName: String
-    public let errors: [TOMLError]
+struct ConfigError: Error, Equatable, Sendable, CustomStringConvertible {
+    let fileName: String
+    let errors: [TOMLError]
 
-    public init(fileName: String, errors: [TOMLError]) {
+    init(fileName: String, errors: [TOMLError]) {
         self.fileName = fileName
         self.errors = errors.sorted { ($0.line, $0.column) < ($1.line, $1.column) }
     }
 
     /// One line per problem: `config.toml:17: unknown action "nav.nxt"`.
-    public var messages: [String] { errors.map { "\(fileName):\($0.line): \($0.message)" } }
+    var messages: [String] { errors.map { "\(fileName):\($0.line): \($0.message)" } }
 
     /// The first problem, plus how many more there are (fits a toast).
-    public var description: String {
+    var description: String {
         guard let first = messages.first else { return "\(fileName): invalid" }
         return Self.summary(messages) ?? first
     }
 
     /// The first message plus how many more there are, e.g. `config.toml:3: … (+2 more)`; nil when empty.
-    public static func summary(_ messages: [String]) -> String? {
+    static func summary(_ messages: [String]) -> String? {
         guard let first = messages.first else { return nil }
         return messages.count > 1 ? "\(first) (+\(messages.count - 1) more)" : first
     }
@@ -134,9 +134,9 @@ private struct ConfigReader {
                 if case .string(let s) = entry.value, s.count == 1 { config.starCharacter = s } else {
                     fail(entry, "rating.star must be a single character, e.g. \"★\"")
                 }
-            case "rating.auto_advance": if let v = bool(entry) { autoAdvance = v; config.autoAdvance = v }
-            case "keymap.defaults": if let v = bool(entry) { keymapDefaults = v; config.keymapDefaults = v }
-            case "keymap.vim": if let v = bool(entry) { vim = v; config.vimKeys = v }
+            case "rating.auto_advance": if let v = bool(entry) { autoAdvance = v }
+            case "keymap.defaults": if let v = bool(entry) { keymapDefaults = v }
+            case "keymap.vim": if let v = bool(entry) { vim = v }
             default:
                 skip(entry, "unknown key \"\(name)\"\(Self.keyHint(path))")
             }

@@ -2,7 +2,6 @@ import AppKit
 import XCTest
 @testable import PeekabooApp
 @testable import PeekabooCore
-@testable import PeekabooRender
 
 /// The browsed folder changes on disk while it is shown (folder watcher → rescan).
 final class FolderRescanTests: ViewerTestCase {

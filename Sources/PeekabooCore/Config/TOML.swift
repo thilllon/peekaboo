@@ -1,7 +1,7 @@
 import Foundation
 
 /// A value of the TOML subset the config uses: strings, integers, floats, booleans and arrays.
-public enum TOMLValue: Equatable, Sendable {
+enum TOMLValue: Equatable, Sendable {
     case string(String)
     case integer(Int)
     case float(Double)
@@ -9,7 +9,7 @@ public enum TOMLValue: Equatable, Sendable {
     case array([TOMLValue])
 
     /// Type name for error messages ("string", "integer", …).
-    public var typeName: String {
+    var typeName: String {
         switch self {
         case .string: return "string"
         case .integer: return "integer"
@@ -21,32 +21,32 @@ public enum TOMLValue: Equatable, Sendable {
 }
 
 /// A parse or validation error at a 1-based line and column.
-public struct TOMLError: Error, Equatable, Sendable, CustomStringConvertible {
-    public let line: Int
-    public let column: Int
-    public let message: String
+struct TOMLError: Error, Equatable, Sendable, CustomStringConvertible {
+    let line: Int
+    let column: Int
+    let message: String
 
-    public init(line: Int, column: Int, message: String) {
+    init(line: Int, column: Int, message: String) {
         self.line = line
         self.column = column
         self.message = message
     }
 
-    public var description: String { "\(line):\(column): \(message)" }
+    var description: String { "\(line):\(column): \(message)" }
 }
 
 /// One `key = value` pair: the full key path (table header + dotted key) and where it was written.
-public struct TOMLEntry: Equatable, Sendable {
-    public let path: [String]
-    public let value: TOMLValue
-    public let line: Int
-    public let column: Int
+struct TOMLEntry: Equatable, Sendable {
+    let path: [String]
+    let value: TOMLValue
+    let line: Int
+    let column: Int
 }
 
 /// A `[table]` header and where it was written.
-public struct TOMLTable: Equatable, Sendable {
-    public let path: [String]
-    public let line: Int
+struct TOMLTable: Equatable, Sendable {
+    let path: [String]
+    let line: Int
 }
 
 /// Parsed document: entries in file order.
@@ -56,11 +56,11 @@ public struct TOMLTable: Equatable, Sendable {
 /// integers (`_` separators, `0x`/`0o`/`0b`), floats (`inf`, `nan`), booleans and arrays (may span lines,
 /// trailing comma, comments inside, nested up to 32 deep). Duplicate keys and tables are errors. Not
 /// supported (reported as errors): multi-line strings, inline tables, arrays of tables and dates.
-public struct TOMLDocument: Equatable, Sendable {
-    public let entries: [TOMLEntry]
-    public let tables: [TOMLTable]
+struct TOMLDocument: Equatable, Sendable {
+    let entries: [TOMLEntry]
+    let tables: [TOMLTable]
 
-    public init(parsing text: String) throws {
+    init(parsing text: String) throws {
         var parser = TOMLParser(Array(text.utf8))
         try parser.parseDocument()
         entries = parser.entries
@@ -68,7 +68,7 @@ public struct TOMLDocument: Equatable, Sendable {
     }
 
     /// The value at a dotted path, e.g. `value(["hud", "mode"])`.
-    public func value(_ path: [String]) -> TOMLValue? {
+    func value(_ path: [String]) -> TOMLValue? {
         entries.first { $0.path == path }?.value
     }
 }

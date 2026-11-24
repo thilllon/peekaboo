@@ -2,7 +2,6 @@ import AppKit
 import XCTest
 @testable import PeekabooApp
 @testable import PeekabooCore
-@testable import PeekabooRender
 
 /// Closing the window (the app stays resident) and opening again.
 final class WindowLifecycleTests: ViewerTestCase {

@@ -1,5 +1,4 @@
 import Foundation
-import PeekabooCore
 
 // peekaboo-bench <suite> [options]
 // Each workstream owns one suite file in this directory and registers it here.

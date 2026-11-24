@@ -18,8 +18,6 @@ final class InteractionGate {
         self.end = end
     }
 
-    var isInteracting: Bool { holds > 0 }
-
     func acquire() {
         holds += 1
         if holds == 1 { begin() }
@@ -90,8 +88,6 @@ final class MotionDriver: NSObject {
         self.view = view
         super.init()
     }
-
-    var hasHeldKeys: Bool { !held.isEmpty }
 
     func isHolding(keyCode: UInt16) -> Bool { held[keyCode] != nil }
 

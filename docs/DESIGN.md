@@ -106,7 +106,7 @@ viewers score 21–26 dB and alias 10–25× more.
   never on the CPU. SDR: `bgra8Unorm` drawable tagged Display P3, sRGB-curve encode + TPDF ±1 LSB dither in the present
   pass. HDR/EDR: `rgba16Float` + `extendedLinearDisplayP3`, macOS 26 `preferredDynamicRange`.
 - **Tiling** above 16384 px (Apple9 limit, verified): level-0 tiles with an 8 px apron, visible tiles first.
-- **Pacing**: event-driven immediate render for discrete actions; `CAMetalDisplayLink` only while animating;
+- **Pacing**: event-driven immediate render for discrete actions; a `CADisplayLink` only while animating;
   one drawable per refresh.
 - **Present latency**: measured present → glass on the built-in 120 Hz panel (random key timing): 13.6 ms median with
   `displaySyncEnabled = true`, 12.5 ms with 2 drawables, **5.9 ms with `displaySyncEnabled = false`**, 23.3 ms with

@@ -3,10 +3,10 @@
 ///
 /// Shifted symbols resolve through a static US-ANSI table, with `shift` as a modifier; `KeyboardLayout`
 /// turns key presses on any layout into the same spelling.
-public struct KeySpecError: Error, Equatable, Sendable, CustomStringConvertible {
-    public let message: String
-    public init(_ message: String) { self.message = message }
-    public var description: String { message }
+struct KeySpecError: Error, Equatable, Sendable, CustomStringConvertible {
+    let message: String
+    init(_ message: String) { self.message = message }
+    var description: String { message }
 }
 
 extension KeyChord {
