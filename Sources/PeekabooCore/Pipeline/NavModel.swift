@@ -22,9 +22,13 @@ public struct PrefetchTuning: Sendable, Equatable {
     /// Extra ETA of images behind the direction of travel (reversal cost); behind images use I ≥ 300 ms.
     public var reversalMs = 600.0
     public var behindMinIntervalMs = 300.0
-    /// Speculative full resolution for the current image after this dwell, if estimated ≤ `fullMaxCostMs`.
+    /// Speculative full resolution for the current image after this dwell, if estimated ≤ `fullMaxCostMs`. While the
+    /// user steps at a steady rhythm the dwell is `fullDwellRhythm`·EMA instead (at most `fullDwellMaxMs`): it must
+    /// mean "stays longer than usual", or every image's full tier is decoded just before the user leaves it.
     public var fullDwellMs = 400.0
     public var fullMaxCostMs = 150.0
+    public var fullDwellRhythm = 1.5
+    public var fullDwellMaxMs = 1500.0
     /// Processor-sharing slowdown per extra concurrent decode (measured).
     public var alpha = 0.12
     /// Folder-wide background preview sweep (E-cores), in ring order around the cursor.
@@ -50,6 +54,14 @@ public struct PrefetchTuning: Sendable, Equatable {
 
     /// Adaptive dwell for an interval EMA.
     public func dwellMs(ema: Double) -> Double { min(max(dwellK * ema, dwellMinMs), dwellMaxMs) }
+
+    /// Dwell on the current image before its speculative full decode. Relative to the rhythm while the user steps
+    /// through the folder; `fullDwellMs` after a jump (no rhythm yet) and while toggling A/B (both full tiers stay
+    /// pinned, so they are never wasted).
+    public func fullDwellMs(for nav: NavModel) -> Double {
+        guard !nav.history.isEmpty, !nav.isAB else { return fullDwellMs }
+        return min(max(fullDwellMs, fullDwellRhythm * nav.emaIntervalMs), max(fullDwellMs, fullDwellMaxMs))
+    }
 }
 
 /// Navigation model: cursor, direction, EMA of the inter-navigation interval and A/B toggle detection.
@@ -226,9 +238,10 @@ func planPrefetch(_ nav: NavModel, now: UInt64, tuning t: PrefetchTuning, contex
     }
     guard c.listingReady else { return plan }
 
-    // Speculative full resolution for cheap formats once the user dwells.
+    // Speculative full resolution for cheap formats once the user dwells (longer than their rhythm).
+    let fullDwell = t.fullDwellMs(for: nav)
     if !skim && !c.fullRequested && c.estimate(i, .full) <= t.fullMaxCostMs {
-        if since >= t.fullDwellMs {
+        if since >= fullDwell {
             if !c.cached(i, .full) && !c.busy(i, .full) {
                 plan.jobs.append(PlannedJob(index: i, tier: .full, prio: t.fullDwellMs, kind: .prefetch))
             }
@@ -237,7 +250,7 @@ func planPrefetch(_ nav: NavModel, now: UInt64, tuning t: PrefetchTuning, contex
                 plan.jobs.append(PlannedJob(index: p, tier: .full, prio: t.fullDwellMs + 50, kind: .prefetch))
             }
         } else if since.isFinite {
-            plan.wake(after: t.fullDwellMs - since)
+            plan.wake(after: fullDwell - since)
         }
     }
 
