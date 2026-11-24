@@ -99,23 +99,41 @@ public final class ImagePipeline {
     /// Decoding `file` failed (main thread).
     public var onFailed: ((ImageFile, Error) -> Void)?
 
-    private struct Entry {
-        var tiers: [DecodedImage?] = [nil, nil, nil]
+    /// Per-file state, parallel to `files` (index-based so planning never hashes URLs).
+    private struct Slot {
+        var preview: DecodedImage?
+        var screen: DecodedImage?
+        var full: DecodedImage?
         /// `ImageFile.version` the pixels were decoded from (nil = unknown, e.g. opened before the folder listing).
         var version: String?
+        var info: ImageInfo?
+        var family: CostModel.Family?
+        /// Tiers that failed (bit per tier): never retried.
+        var failed: UInt8 = 0
+        /// Read-ahead issued: 1 = head, 2 = whole file.
+        var advised: UInt8 = 0
+        var lanes: [DecodeLane?] = [nil, nil, nil]
 
         subscript(tier: Tier) -> DecodedImage? {
-            get { tiers[tier.rawValue] }
-            set { tiers[tier.rawValue] = newValue }
+            get { tier == .preview ? preview : tier == .screen ? screen : full }
+            set {
+                switch tier {
+                case .preview: preview = newValue
+                case .screen: screen = newValue
+                case .full: full = newValue
+                }
+            }
         }
 
-        var isEmpty: Bool { tiers.allSatisfy { $0 == nil } }
+        var hasPixels: Bool { preview != nil || screen != nil || full != nil }
+        var hasState: Bool { hasPixels || info != nil || failed != 0 || advised != 0 }
     }
 
-    private var cache: [URL: Entry] = [:]
+    private var slots: [Slot] = []
+    /// Indices whose slot holds pixels (eviction and pressure scan only these).
+    private var cachedIndices: Set<Int> = []
     private var tierBytes = [0, 0, 0]
     private var position: [URL: Int] = [:]
-    private var failed: Set<JobKey> = []
     private var fullRequested: URL?
     private var costs = CostModel()
     private let infos = InfoStore()
@@ -124,8 +142,6 @@ public final class ImagePipeline {
     private var pressureSource: DispatchSourceMemoryPressure?
     /// Budgets are halved and the sweep paused until this time (`Trace.now()` nanos).
     private var pressureUntil: UInt64 = 0
-    /// Read-ahead already issued per file: 1 = head, 2 = whole file.
-    private var advised: [URL: UInt8] = [:]
     private var replanQueued = false
     private var averagePreviewBytes = 1 << 20
 
@@ -151,24 +167,34 @@ public final class ImagePipeline {
     public var currentFile: ImageFile? { files.indices.contains(index) ? files[index] : nil }
 
     /// Replace the browsing set (e.g. after the folder scan, a sort change or a deletion).
-    /// Cached tiers and running decodes of files that survive are kept.
+    /// Cached tiers, metadata and running decodes of files that survive are kept.
     public func setFiles(_ files: [ImageFile], index: Int) {
         let previous = currentFile
+        let oldFiles = self.files
+        var oldSlots = self.slots
         self.files = files
         position = Dictionary(files.enumerated().map { ($1.url, $0) }, uniquingKeysWith: { first, _ in first })
-        for (url, entry) in cache {
-            guard let i = position[url] else { remove(url); continue }
-            let version = Self.knownVersion(files[i])
-            if let version, let cached = entry.version, version != cached {
-                remove(url)  // changed on disk
-                infos.remove(url)
-            } else if entry.version == nil, let version {
-                cache[url]?.version = version
+        slots = [Slot](repeating: Slot(), count: files.count)
+        cachedIndices.removeAll(keepingCapacity: true)
+        tierBytes = [0, 0, 0]
+        for i in oldSlots.indices where oldSlots[i].hasState {
+            guard let j = position[oldFiles[i].url] else { continue }  // removed: pixels are released
+            var slot = oldSlots[i]
+            oldSlots[i] = Slot()
+            if let version = Self.knownVersion(files[j]) {
+                if let cached = slot.version, cached != version {
+                    slot = Slot()  // changed on disk: decode again
+                    infos.remove(files[j].url)
+                }
+                slot.version = version
+            }
+            slots[j] = slot
+            if slot.hasPixels {
+                cachedIndices.insert(j)
+                for tier in Tier.allCases { if let image = slot[tier] { tierBytes[tier.rawValue] += image.pixels.allocatedBytes } }
             }
         }
-        failed = failed.filter { position[$0.url] != nil }
-        advised = advised.filter { position[$0.key] != nil }
-        if fullRequested.map({ position[$0] == nil }) ?? false { fullRequested = nil }
+        if let url = fullRequested, position[url] == nil { fullRequested = nil }
         recountBytes()
         guard !files.isEmpty else {
             self.index = 0
@@ -190,34 +216,36 @@ public final class ImagePipeline {
         guard !files.isEmpty else { return }
         let target = min(max(index, 0), files.count - 1)
         let now = Trace.now()
-        let file = files[target]
-        if file.url != currentFile?.url { fullRequested = nil }
+        if files[target].url != currentFile?.url { fullRequested = nil }
         navigation.navigate(to: target, now: now, count: files.count, isRepeat: isRepeat)
         self.index = target
-        if isCached(file.url, .screen) {
+        if isCached(target, .screen) {
             stats.hits += 1
         } else {
             stats.misses += 1
-            if isCached(file.url, .preview) { stats.previewHits += 1 }
+            if isCached(target, .preview) { stats.previewHits += 1 }
         }
         replan()
     }
 
     /// The view needs more than the screen tier (zoom beyond fit) for the current image.
     public func requestFullResolution() {
-        guard let file = currentFile, !isCached(file.url, .full), fullRequested != file.url else { return }
+        guard let file = currentFile, !isCached(index, .full), fullRequested != file.url else { return }
         fullRequested = file.url
         replan()
     }
 
     /// Best tier decoded so far for `file`.
     public func best(for file: ImageFile) -> DecodedImage? {
-        guard let entry = cache[file.url] else { return nil }
-        return entry[.full] ?? entry[.screen] ?? entry[.preview]
+        guard let i = slotIndex(of: file) else { return nil }
+        return slots[i].full ?? slots[i].screen ?? slots[i].preview
     }
 
     /// Metadata of `file`, probed alongside its first decode (nil until then).
-    public func info(for file: ImageFile) -> ImageInfo? { infos.get(file.url) }
+    public func info(for file: ImageFile) -> ImageInfo? {
+        if let i = slotIndex(of: file), let info = slots[i].info { return info }
+        return infos.get(file.url)
+    }
 
     public func updateConfig(_ config: PipelineConfig) {
         self.config = config
@@ -229,20 +257,19 @@ public final class ImagePipeline {
     /// within ±128, pause the sweep and halve the budgets for 60 s. `.critical`: keep only the current image's
     /// sharp tiers and previews within ±32.
     public func handleMemoryPressure(critical: Bool) {
-        let current = currentFile?.url
-        let partner = navigation.abPartner.flatMap { files.indices.contains($0) ? files[$0].url : nil }
-        for (url, entry) in cache {
-            let distance = position[url].map { abs($0 - index) } ?? .max
-            for tier in Tier.allCases where entry[tier] != nil {
+        let partner = navigation.abPartner
+        for i in Array(cachedIndices) {
+            let distance = abs(i - index)
+            for tier in Tier.allCases where slots[i][tier] != nil {
                 let keep: Bool
                 switch (critical, tier) {
                 case (true, .preview): keep = distance <= 32
-                case (true, _): keep = url == current
+                case (true, _): keep = i == index
                 case (false, .preview): keep = distance <= 128
-                case (false, .screen): keep = distance <= 4 || url == partner
-                case (false, .full): keep = url == current
+                case (false, .screen): keep = distance <= 4 || i == partner
+                case (false, .full): keep = i == index
                 }
-                if !keep { evict(url, tier) }
+                if !keep { evict(i, tier) }
             }
         }
         pressureUntil = Trace.now() + 60_000_000_000
@@ -256,8 +283,8 @@ public final class ImagePipeline {
 
     /// Tiers of `file` currently cached.
     public func cachedTiers(for file: ImageFile) -> [Tier] {
-        guard let entry = cache[file.url] else { return [] }
-        return Tier.allCases.filter { entry[$0] != nil }
+        guard let i = slotIndex(of: file) else { return [] }
+        return Tier.allCases.filter { slots[i][$0] != nil }
     }
 
     /// Bytes cached per tier.
@@ -269,6 +296,8 @@ public final class ImagePipeline {
     /// Decodes queued but not started.
     public var queuedDecodes: Int { scheduler.queuedCount }
 
+    var schedulerState: String { scheduler.debugState }
+
     /// Files whose cache entries are never evicted by budget: the current image and its A/B partner.
     public var pinnedFiles: [ImageFile] {
         var result: [ImageFile] = []
@@ -278,6 +307,11 @@ public final class ImagePipeline {
     }
 
     // MARK: Planning
+
+    private func slotIndex(of file: ImageFile) -> Int? {
+        if files.indices.contains(index), files[index].url == file.url { return index }
+        return position[file.url]
+    }
 
     private func scheduleReplan() {
         guard !replanQueued else { return }
@@ -294,22 +328,22 @@ public final class ImagePipeline {
         let now = Trace.now()
         let tuning = config.tuning
         let snapshot = scheduler.snapshot()
+        // Running / undelivered keys as index → tier bits (a handful of URL lookups per pass).
+        var busyBits: [Int: UInt8] = [:]
+        for key in snapshot.busy { if let i = position[key.url] { busyBits[i, default: 0] |= 1 << key.tier.rawValue } }
         let underPressure = now < pressureUntil
         let previewHeadroom = budget(.preview) - tierBytes[Tier.preview.rawValue]
         let windowReserve = tuning.previewMaxAhead + tuning.previewBehind
         let sweepSlots = config.sweepLanes > 0 ? max(0, previewHeadroom / max(averagePreviewBytes, 1) - windowReserve) : 0
-        let files = self.files
-        let failed = self.failed
-        let busy: (Int, Tier) -> Bool = { j, tier in
-            let key = JobKey(url: files[j].url, tier: tier)
-            return snapshot.busy.contains(key) || failed.contains(key)
-        }
         let context = PlanContext(
             count: files.count, listingReady: true,
-            cached: { [unowned self] j, tier in self.isCached(files[j].url, tier) },
-            busy: busy,
-            estimate: { [unowned self] j, tier in self.estimate(files[j], tier) },
-            cheapPreview: { [unowned self] j in self.isCheapPreview(files[j]) },
+            cached: { [unowned self] j, tier in self.isCached(j, tier) },
+            busy: { [unowned self] j, tier in
+                let bit: UInt8 = 1 << tier.rawValue
+                return (busyBits[j] ?? 0) & bit != 0 || self.slots[j].failed & bit != 0
+            },
+            estimate: { [unowned self] j, tier in self.estimate(j, tier) },
+            cheapPreview: { [unowned self] j in self.isCheapPreview(j) },
             fullRequested: fullRequested == files[index].url,
             runningWorkMs: snapshot.runningWorkMs, decodeBacklog: snapshot.decodeBacklog,
             sweepSlots: sweepSlots, sweepPaused: underPressure,
@@ -318,41 +352,48 @@ public final class ImagePipeline {
 
         var jobs: [DecodeJob] = []
         jobs.reserveCapacity(plan.jobs.count)
-        var visible: Set<JobKey> = []
         let current = files[index].url
-        for tier in [Tier.preview, .screen] { visible.insert(JobKey(url: current, tier: tier)) }
+        var visible: Set<JobKey> = [JobKey(url: current, tier: .preview), JobKey(url: current, tier: .screen)]
         if fullRequested == current { visible.insert(JobKey(url: current, tier: .full)) }
         for planned in plan.jobs {
-            let file = files[planned.index]
-            let info = infos.get(file.url)
+            let j = planned.index
+            let file = files[j]
             let target: Int
             switch planned.tier {
             case .preview: target = config.previewLongSide
             case .screen: target = config.screenLongSide
-            case .full: target = info.map { max($0.pixelWidth, $0.pixelHeight) } ?? config.screenLongSide
+            case .full: target = slots[j].info.map { max($0.pixelWidth, $0.pixelHeight) } ?? config.screenLongSide
             }
             jobs.append(DecodeJob(
                 key: JobKey(url: file.url, tier: planned.tier), file: file, prio: planned.prio, kind: planned.kind,
-                lane: decoder.lane(for: file.url, info: info, tier: planned.tier), targetLongSide: target,
-                estimateMs: estimate(file, planned.tier)))
+                lane: lane(j, planned.tier), targetLongSide: target, estimateMs: estimate(j, planned.tier)))
         }
         scheduler.submit(jobs, visible: visible)
         armWake(afterMs: plan.wakeAfterMs)
         if config.readAhead { issueReadAhead(plan) }
-        Trace.log("plan cursor=\(index) skim=\(navigation.isSkimming(now: now, tuning: tuning)) jobs=\(jobs.count) "
-                  + "visible=\(plan.jobs.filter { $0.kind == .visible }.map { $0.tier.rawValue }) "
-                  + "ms=\(String(format: "%.3f", Trace.ms(since: now)))")
+        if Trace.enabled {
+            Trace.log("plan cursor=\(index) skim=\(navigation.isSkimming(now: now, tuning: tuning)) jobs=\(jobs.count) "
+                      + "visible=\(plan.jobs.filter { $0.kind == .visible }.map { $0.tier.rawValue }) "
+                      + "ms=\(String(format: "%.3f", Trace.ms(since: now)))")
+        }
+    }
+
+    private func lane(_ j: Int, _ tier: Tier) -> DecodeLane {
+        if let lane = slots[j].lanes[tier.rawValue] { return lane }
+        let lane = decoder.lane(for: files[j].url, info: slots[j].info, tier: tier)
+        if slots[j].info != nil { slots[j].lanes[tier.rawValue] = lane }  // stable once metadata is known
+        return lane
     }
 
     private func issueReadAhead(_ plan: Plan) {
         var requests: [(url: URL, length: Int?)] = []
-        for j in plan.screenWindow {
-            let url = files[j].url
-            if advised[url, default: 0] < 2 { advised[url] = 2; requests.append((url, nil)) }
+        for j in plan.screenWindow where slots[j].advised < 2 {
+            slots[j].advised = 2
+            requests.append((files[j].url, nil))
         }
-        for j in plan.previewWindow {
-            let url = files[j].url
-            if advised[url, default: 0] < 1 { advised[url] = 1; requests.append((url, ReadAhead.headBytes)) }
+        for j in plan.previewWindow where slots[j].advised < 1 {
+            slots[j].advised = 1
+            requests.append((files[j].url, ReadAhead.headBytes))
         }
         ReadAhead.advise(requests)
     }
@@ -381,19 +422,23 @@ public final class ImagePipeline {
             stats.wasted += 1
             return
         }
+        if let info = outcome.info ?? (slots[i].info == nil ? infos.get(key.url) : nil) {
+            slots[i].info = info
+            slots[i].lanes = [nil, nil, nil]
+        }
         switch outcome.result {
         case .success(let image):
             stats.decodes += 1
             if outcome.job.kind == .sweep { stats.sweepDecodes += 1 }
-            costs.record(url: key.url, info: infos.get(key.url), tier: key.tier, ms: outcome.wallMs,
-                         concurrency: outcome.concurrency)
-            guard keep(i, key.tier, image) else { stats.wasted += 1; return }
-            insert(image, for: file, tier: key.tier)
+            costs.record(family: family(i), megapixels: CostModel.megapixels(slots[i].info), tier: key.tier,
+                         ms: outcome.wallMs, concurrency: outcome.concurrency)
+            guard keep(i, key.tier) else { stats.wasted += 1; return }
+            insert(image, at: i, tier: key.tier)
             onDecoded?(file, image)
         case .failure(let error):
             stats.failures += 1
-            failed.insert(key)
-            if key.tier == .screen { failed.insert(JobKey(url: key.url, tier: .full)) }
+            slots[i].failed |= 1 << key.tier.rawValue
+            if key.tier == .screen { slots[i].failed |= 1 << Tier.full.rawValue }
             Trace.log("decode failed \(file.name) tier=\(key.tier): \(error)")
             // A failed preview is silent: the screen tier may still succeed.
             if key.tier != .preview { onFailed?(file, error) }
@@ -401,12 +446,11 @@ public final class ImagePipeline {
     }
 
     /// Late results are cached only if still useful (research a2 §4 `keep`).
-    private func keep(_ j: Int, _ tier: Tier, _ image: DecodedImage) -> Bool {
-        let url = files[j].url
-        let pinned = isPinned(url)
+    private func keep(_ j: Int, _ tier: Tier) -> Bool {
+        let pinned = isPinned(j)
         switch tier {
         case .preview:
-            return !isCached(url, .screen) || pinned
+            return !isCached(j, .screen) || pinned
         case .screen:
             if pinned || abs(j - index) <= 3 { return true }
             return navigation.eta(j, now: Trace.now(), tuning: config.tuning) <= 2 * config.tuning.screenHorizonMs
@@ -426,59 +470,56 @@ public final class ImagePipeline {
     }
 
     /// `.screen` is satisfied by a cached `.full`, and `.full` by a screen tier that is already full resolution.
-    private func isCached(_ url: URL, _ tier: Tier) -> Bool {
-        guard let entry = cache[url] else { return false }
+    private func isCached(_ j: Int, _ tier: Tier) -> Bool {
+        let slot = slots[j]
         switch tier {
-        case .preview: return entry[.preview] != nil
-        case .screen: return entry[.screen] != nil || entry[.full] != nil
-        case .full: return entry[.full] != nil || entry[.screen].map(Self.isFullResolution) == true
+        case .preview: return slot.preview != nil
+        case .screen: return slot.screen != nil || slot.full != nil
+        case .full: return slot.full != nil || slot.screen.map(Self.isFullResolution) == true
         }
     }
 
-    private func isPinned(_ url: URL) -> Bool {
-        if url == currentFile?.url { return true }
-        if let p = navigation.abPartner, files.indices.contains(p), files[p].url == url { return true }
-        return false
-    }
+    private func isPinned(_ j: Int) -> Bool { j == index || j == navigation.abPartner }
 
     private func budget(_ tier: Tier) -> Int {
         let base = config.budget(for: tier)
         return Trace.now() < pressureUntil ? base / 2 : base
     }
 
-    private func estimate(_ file: ImageFile, _ tier: Tier) -> Double {
-        costs.estimate(url: file.url, info: infos.get(file.url), tier: tier)
+    private func family(_ j: Int) -> CostModel.Family {
+        if let family = slots[j].family { return family }
+        let family = CostModel.family(of: files[j].url)
+        slots[j].family = family
+        return family
     }
 
-    private func isCheapPreview(_ file: ImageFile) -> Bool {
-        let preview = estimate(file, .preview)
+    private func estimate(_ j: Int, _ tier: Tier) -> Double {
+        costs.estimate(family: family(j), megapixels: CostModel.megapixels(slots[j].info), tier: tier)
+    }
+
+    private func isCheapPreview(_ j: Int) -> Bool {
         let tuning = config.tuning
-        return preview <= max(tuning.cheapPreviewMs, tuning.cheapPreviewRatio * estimate(file, .screen))
+        return estimate(j, .preview) <= max(tuning.cheapPreviewMs, tuning.cheapPreviewRatio * estimate(j, .screen))
     }
 
-    private func insert(_ image: DecodedImage, for file: ImageFile, tier: Tier) {
-        var entry = cache[file.url] ?? Entry(version: Self.knownVersion(file))
-        if let old = entry[tier] { tierBytes[tier.rawValue] -= old.pixels.allocatedBytes }
-        entry[tier] = image
+    private func insert(_ image: DecodedImage, at j: Int, tier: Tier) {
+        if slots[j].version == nil { slots[j].version = Self.knownVersion(files[j]) }
+        if let old = slots[j][tier] { tierBytes[tier.rawValue] -= old.pixels.allocatedBytes }
+        slots[j][tier] = image
+        cachedIndices.insert(j)
         let bytes = image.pixels.allocatedBytes
         tierBytes[tier.rawValue] += bytes
-        cache[file.url] = entry
         if tier == .preview { averagePreviewBytes = (averagePreviewBytes * 7 + bytes) / 8 }
         enforceBudgets()
     }
 
-    private func evict(_ url: URL, _ tier: Tier) {
-        guard var entry = cache[url], let image = entry[tier] else { return }
+    private func evict(_ j: Int, _ tier: Tier) {
+        guard let image = slots[j][tier] else { return }
         tierBytes[tier.rawValue] -= image.pixels.allocatedBytes
-        entry[tier] = nil
-        cache[url] = entry.isEmpty ? nil : entry
+        slots[j][tier] = nil
+        if !slots[j].hasPixels { cachedIndices.remove(j) }
         stats.evictions += 1
         recountBytes()
-    }
-
-    private func remove(_ url: URL) {
-        guard let entry = cache.removeValue(forKey: url) else { return }
-        for tier in Tier.allCases { if let image = entry[tier] { tierBytes[tier.rawValue] -= image.pixels.allocatedBytes } }
     }
 
     private func recountBytes() { stats.cachedBytes = tierBytes.reduce(0, +) }
@@ -487,25 +528,24 @@ public final class ImagePipeline {
     private func enforceBudgets() {
         let now = Trace.now()
         let tuning = config.tuning
-        let current = currentFile?.url
-        let partner = navigation.abPartner.flatMap { files.indices.contains($0) ? files[$0].url : nil }
-        func victim(_ tier: Tier?) -> (URL, Tier)? {
-            var best: (url: URL, tier: Tier, eta: Double)?
-            for (url, entry) in cache where url != current && url != partner {
-                let eta = position[url].map { navigation.eta($0, now: now, tuning: tuning) } ?? .infinity
-                for t in Tier.allCases where (tier == nil || tier == t) && entry[t] != nil {
+        let partner = navigation.abPartner
+        func victim(_ tier: Tier?) -> (Int, Tier)? {
+            var best: (j: Int, tier: Tier, eta: Double)?
+            for j in cachedIndices where j != index && j != partner {
+                let eta = navigation.eta(j, now: now, tuning: tuning)
+                for t in Tier.allCases where (tier == nil || tier == t) && slots[j][t] != nil {
                     // Among equal ETAs drop the most expensive tier first.
-                    if best == nil || eta > best!.eta || (eta == best!.eta && t > best!.tier) { best = (url, t, eta) }
+                    if best == nil || eta > best!.eta || (eta == best!.eta && t > best!.tier) { best = (j, t, eta) }
                 }
             }
-            return best.map { ($0.url, $0.tier) }
+            return best.map { ($0.j, $0.tier) }
         }
         for tier in Tier.allCases {
             let limit = budget(tier)
-            while tierBytes[tier.rawValue] > limit, let (url, t) = victim(tier) { evict(url, t) }
+            while tierBytes[tier.rawValue] > limit, let (j, t) = victim(tier) { evict(j, t) }
         }
         let total = Trace.now() < pressureUntil ? config.memoryBudget / 2 : config.memoryBudget
-        while tierBytes.reduce(0, +) > total, let (url, t) = victim(nil) { evict(url, t) }
+        while tierBytes.reduce(0, +) > total, let (j, t) = victim(nil) { evict(j, t) }
         recountBytes()
     }
 

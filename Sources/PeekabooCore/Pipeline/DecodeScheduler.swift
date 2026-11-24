@@ -78,7 +78,10 @@ final class DecodeScheduler: @unchecked Sendable {
     private var queued: [JobKey: DecodeJob] = [:]
     private var active: [JobKey: Active] = [:]
     private var visibleKeys: Set<JobKey> = []
+    /// Jobs per resource on the decode lanes, and on the sweep lanes (counted apart so a starved utility thread
+    /// never holds capacity the visible image's neighbours need).
     private var runningByLane: [DecodeLane: Int] = [:]
+    private var sweepByLane: [DecodeLane: Int] = [:]
     private var runningPrefetch = 0
     private var runningSweep = 0
     private var runningTotal = 0
@@ -161,6 +164,12 @@ final class DecodeScheduler: @unchecked Sendable {
 
     var queuedCount: Int { condition.lock(); defer { condition.unlock() }; return queued.count }
 
+    var debugState: String {
+        condition.lock(); defer { condition.unlock() }
+        let q = queued.values.map { "\($0.key.url.lastPathComponent):\($0.key.tier.rawValue):\($0.kind):\($0.lane)" }
+        return "queued=\(q) active=\(active.count) running=\(runningTotal) lanes=\(runningByLane) sweepLanes=\(sweepByLane) prefetch=\(runningPrefetch) sweep=\(runningSweep)"
+    }
+
     // MARK: Workers
 
     private func spawn(name: String, qos: QualityOfService, sweep: Bool) {
@@ -183,7 +192,7 @@ final class DecodeScheduler: @unchecked Sendable {
             guard !stopped, let job = picked else { condition.unlock(); return }
             queued[job.key] = nil
             active[job.key] = Active(job: job, running: true)
-            runningByLane[job.lane, default: 0] += 1
+            if job.kind == .sweep { sweepByLane[job.lane, default: 0] += 1 } else { runningByLane[job.lane, default: 0] += 1 }
             runningTotal += 1
             if job.kind == .prefetch { runningPrefetch += 1 }
             if job.kind == .sweep { runningSweep += 1 }
@@ -194,7 +203,7 @@ final class DecodeScheduler: @unchecked Sendable {
 
             condition.lock()
             active[job.key]?.running = false
-            runningByLane[job.lane, default: 1] -= 1
+            if job.kind == .sweep { sweepByLane[job.lane, default: 1] -= 1 } else { runningByLane[job.lane, default: 1] -= 1 }
             runningTotal -= 1
             if job.kind == .prefetch { runningPrefetch -= 1 }
             if job.kind == .sweep { runningSweep -= 1 }
@@ -261,7 +270,9 @@ final class DecodeScheduler: @unchecked Sendable {
         var best: DecodeJob?
         for job in queued.values {
             if job.kind != .sweep { return nil }  // decode-lane work first
-            guard runningByLane[job.lane, default: 0] < limits.cap(job.lane) else { continue }
+            // At most one sweep job on the hardware engines: they belong to the visible image and its neighbours.
+            let cap = job.lane == .hardware ? 1 : limits.sweepLanes
+            guard sweepByLane[job.lane, default: 0] < cap else { continue }
             if better(job, than: best) { best = job }
         }
         if best != nil, foregroundBusyLocked { return nil }

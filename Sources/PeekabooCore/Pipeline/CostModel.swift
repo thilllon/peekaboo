@@ -37,17 +37,18 @@ struct CostModel {
         }
     }
 
-    /// Seed costs (ms) for a 24 MP image: preview, screen, full.
+    /// Seed costs (ms) for a 24 MP image: preview, screen, full (docs/DESIGN.md §2 measurements; previews assume an
+    /// embedded thumbnail and are corrected by the first measurement).
     private static func seed(_ family: Family) -> (Double, Double, Double) {
         switch family {
-        case .jpeg: return (4, 30, 60)
-        case .heic: return (6, 40, 110)
-        case .avif: return (20, 60, 70)
-        case .png: return (250, 270, 280)
-        case .webp: return (250, 290, 290)
-        case .tiff: return (30, 100, 150)
+        case .jpeg: return (4, 45, 50)
+        case .heic: return (3, 35, 50)
+        case .avif: return (48, 60, 70)
+        case .png: return (277, 270, 280)
+        case .webp: return (303, 290, 290)
+        case .tiff: return (23, 100, 150)
         case .gif: return (10, 20, 20)
-        case .raw: return (15, 60, 800)
+        case .raw: return (25, 80, 500)
         case .other: return (50, 100, 200)
         }
     }
@@ -69,8 +70,10 @@ struct CostModel {
     }
 
     func estimate(url: URL, info: ImageInfo?, tier: Tier) -> Double {
-        let family = Self.family(of: url)
-        let mp = Self.megapixels(info)
+        estimate(family: Self.family(of: url), megapixels: Self.megapixels(info), tier: tier)
+    }
+
+    func estimate(family: Family, megapixels mp: Double?, tier: Tier) -> Double {
         if let value = ewma[Key(family: family, bucket: Self.bucket(megapixels: mp), tier: tier)] { return value }
         if let value = familyEWMA[Key(family: family, bucket: -1, tier: tier)] { return value }
         let seed = Self.seed(family)
@@ -82,9 +85,12 @@ struct CostModel {
 
     /// Record a measured decode. `concurrency` = decodes running when it started (including itself).
     mutating func record(url: URL, info: ImageInfo?, tier: Tier, ms: Double, concurrency: Int) {
+        record(family: Self.family(of: url), megapixels: Self.megapixels(info), tier: tier, ms: ms, concurrency: concurrency)
+    }
+
+    mutating func record(family: Family, megapixels: Double?, tier: Tier, ms: Double, concurrency: Int) {
         let normalised = ms / (1 + alpha * Double(max(0, concurrency - 1)))
-        let family = Self.family(of: url)
-        let key = Key(family: family, bucket: Self.bucket(megapixels: Self.megapixels(info)), tier: tier)
+        let key = Key(family: family, bucket: Self.bucket(megapixels: megapixels), tier: tier)
         ewma[key] = ewma[key].map { 0.7 * $0 + 0.3 * normalised } ?? normalised
         let fkey = Key(family: family, bucket: -1, tier: tier)
         familyEWMA[fkey] = familyEWMA[fkey].map { 0.7 * $0 + 0.3 * normalised } ?? normalised

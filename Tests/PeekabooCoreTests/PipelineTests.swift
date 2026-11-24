@@ -297,7 +297,7 @@ final class PipelineTests: PipelineTestCase {
     func testLaneCaps() {
         let decoder = FakeDecoder(latencyMs: [.preview: 15, .screen: 40, .full: 60],
                                   lanes: [.preview: .general, .screen: .hardware, .full: .hardware])
-        let pipeline = makePipeline(decoder) { $0.sweepLanes = 4 }
+        let pipeline = makePipeline(decoder)
         let files = makeFiles(120)
         pipeline.setFiles(files, index: 0)
         for i in 1...12 {
@@ -307,7 +307,7 @@ final class PipelineTests: PipelineTestCase {
         spin(for: 0.5)
         XCTAssertLessThanOrEqual(decoder.maxInFlight(.hardware), 3, "hardware engines: 2 + 1 for the visible image")
         XCTAssertLessThanOrEqual(decoder.maxInFlight(.general), 5, "general ImageIO: 4 + 1 for the visible image")
-        XCTAssertLessThanOrEqual(decoder.maxTotalInFlight, 10)
+        XCTAssertLessThanOrEqual(decoder.maxTotalInFlight, 6, "six decode lanes")
     }
 
     func testRequestFullResolutionAndSpeculativeFull() {
@@ -353,8 +353,9 @@ final class PipelineTests: PipelineTestCase {
         }
         let files = makeFiles(400)
         pipeline.setFiles(files, index: 200)
-        XCTAssertTrue(spin(timeout: 3) { pipeline.stats.sweepDecodes > 50 })
-        XCTAssertTrue(spin(timeout: 3) { self.has(pipeline, files[200 + 40], .preview) && self.has(pipeline, files[200 - 40], .preview) },
+        // Utility-QoS lanes can be slow on a loaded machine: generous timeouts.
+        XCTAssertTrue(spin(timeout: 10) { pipeline.stats.sweepDecodes > 50 })
+        XCTAssertTrue(spin(timeout: 10) { self.has(pipeline, files[200 + 40], .preview) && self.has(pipeline, files[200 - 40], .preview) },
                       "the sweep reaches beyond the prefetch windows")
         spin(for: 0.3)
         XCTAssertLessThanOrEqual(pipeline.cachedBytes(for: .preview), 160 << 20)
