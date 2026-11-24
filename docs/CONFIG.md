@@ -282,6 +282,11 @@ Safety rules:
 - A move to another volume copies first and removes the original only once the copy is complete. If
   the original cannot be removed (a read-only folder or card), the copy is removed again and the toast
   suggests copying instead.
+- That move removes the original only if it is still the file that was copied. If another app saved
+  a new version over it meanwhile (or renamed or removed it), the move ends as a copy and the original
+  is left as it is (`IMG_0042.jpg changed during the move: copied to Card, original left as it is`).
+  If the file was written to during the copy, the copy may be torn: it is removed again and nothing
+  moves. Undo and redo of a move across volumes follow the same rule.
 - Undo and redo leave a file alone if it was replaced or edited since the action (`IMG_0042.jpg was
   replaced or edited since it was copied: left as it is`). Renames and tag changes do not count as edits.
   A change that can never be undone (its file was replaced, edited or removed) is dropped after that

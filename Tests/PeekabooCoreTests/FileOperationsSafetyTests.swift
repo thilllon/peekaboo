@@ -13,6 +13,8 @@ final class FileOperationsSafetyTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
+        FileOperations.afterCopyingForMove = nil
+        FileOperations.movesByCopying = false
         // Read-only folders left by a failed test would stop the removal.
         if let walker = fm.enumerator(atPath: root.path) {
             for case let relative as String in walker {
@@ -380,6 +382,90 @@ final class FileOperationsSafetyTests: XCTestCase {
         _ = try ops.undo()
         XCTAssertEqual(try String(contentsOf: photo, encoding: .utf8), "h")
         XCTAssertEqual(try listing("card"), ["h.jpg"])
+    }
+
+    /// What another app does when it saves a new version of `url`: write a temporary file, rename it over.
+    private func saveNewVersion(_ contents: String, over url: URL) {
+        let saved = url.deletingLastPathComponent().appendingPathComponent(".\(url.lastPathComponent).sb-save")
+        XCTAssertNoThrow(try Data(contents.utf8).write(to: saved))
+        XCTAssertEqual(rename(saved.path, url.path), 0)
+    }
+
+    func testMoveAcrossVolumesNeverRemovesAnOriginalThatChangedDuringTheCopy() throws {
+        let card = root.appendingPathComponent("card")
+        // Replaced by a new version while it was copied: the new version stays, the copy holds the old one.
+        let photo = try make("shoot/a.jpg", "version 1")
+        FileOperations.afterCopyingForMove = { source in
+            if source == photo { self.saveNewVersion("version 2", over: source) }
+        }
+        let change = try FileOperations.transfer(photo, toFolder: card, mode: .moveByCopying)
+        XCTAssertEqual(change, .copied(from: photo, to: card.appendingPathComponent("a.jpg")), "it ends as a copy")
+        XCTAssertEqual(try String(contentsOf: photo, encoding: .utf8), "version 2")
+        XCTAssertEqual(try String(contentsOf: card.appendingPathComponent("a.jpg"), encoding: .utf8), "version 1")
+        // Its undo removes the copy only.
+        let ops = FileOperations()
+        ops.trashesUndoneCopies = false
+        ops.record(change)
+        _ = try ops.undo()
+        XCTAssertEqual(try listing("card"), [])
+        XCTAssertEqual(try String(contentsOf: photo, encoding: .utf8), "version 2")
+
+        // Written to while it was copied: the copy may be torn, so it goes again and nothing moves.
+        let edited = try make("shoot/b.jpg", "b")
+        FileOperations.afterCopyingForMove = { source in
+            guard source == edited, let handle = try? FileHandle(forWritingTo: source) else { return }
+            handle.seekToEndOfFile()
+            handle.write(Data(" more".utf8))
+            try? handle.close()
+        }
+        XCTAssertThrowsError(try FileOperations.transfer(edited, toFolder: card, mode: .moveByCopying)) { error in
+            XCTAssertEqual("\(error)", "Cannot move b.jpg: it changed while it was being copied (left as it is)")
+        }
+        XCTAssertEqual(try String(contentsOf: edited, encoding: .utf8), "b more")
+        XCTAssertEqual(try listing("card"), [], "no copy and no temporary file")
+
+        // Removed meanwhile: the copy stays, as it may now be the only one.
+        let removed = try make("shoot/c.jpg", "c")
+        FileOperations.afterCopyingForMove = { source in
+            if source == removed { try? FileManager.default.removeItem(at: source) }
+        }
+        XCTAssertEqual(try FileOperations.transfer(removed, toFolder: card, mode: .moveByCopying),
+                       .copied(from: removed, to: card.appendingPathComponent("c.jpg")))
+        XCTAssertEqual(try String(contentsOf: card.appendingPathComponent("c.jpg"), encoding: .utf8), "c")
+    }
+
+    func testUndoAndRedoAcrossVolumesNeverRemoveAFileThatChangedDuringTheCopy() throws {
+        FileOperations.movesByCopying = true
+        let card = root.appendingPathComponent("card")
+        let ops = FileOperations()
+        ops.trashesUndoneCopies = false
+        // Undo copies the file back from the card; a version saved on the card meanwhile stays there.
+        let photo = try make("shoot/d.jpg", "d1")
+        try ops.move(photo, toFolder: card)
+        let onCard = card.appendingPathComponent("d.jpg")
+        FileOperations.afterCopyingForMove = { source in
+            if source == onCard { self.saveNewVersion("d2", over: source) }
+        }
+        XCTAssertThrowsError(try ops.undo()) { error in
+            XCTAssertEqual("\(error)", "d.jpg changed while it was being moved back: both versions kept")
+        }
+        XCTAssertEqual(try String(contentsOf: photo, encoding: .utf8), "d1")
+        XCTAssertEqual(try String(contentsOf: onCard, encoding: .utf8), "d2")
+        XCTAssertEqual(ops.undoStack.count, 0, "it cannot be undone any more")
+
+        // Redo copies it to the card again; a version saved in the shoot folder meanwhile stays there.
+        let other = try make("shoot/e.jpg", "e1")
+        FileOperations.afterCopyingForMove = nil
+        try ops.move(other, toFolder: card)
+        _ = try ops.undo()
+        XCTAssertEqual(try String(contentsOf: other, encoding: .utf8), "e1")
+        FileOperations.afterCopyingForMove = { source in
+            if source == other { self.saveNewVersion("e2", over: source) }
+        }
+        XCTAssertEqual(try ops.redo(), .copied(from: other, to: card.appendingPathComponent("e.jpg")))
+        XCTAssertEqual(try String(contentsOf: other, encoding: .utf8), "e2")
+        XCTAssertEqual(try String(contentsOf: card.appendingPathComponent("e.jpg"), encoding: .utf8), "e1")
+        XCTAssertEqual(try listing("card"), ["d.jpg", "e.jpg"])
     }
 
     func testMissingSourcesAndSameFolderMoves() throws {

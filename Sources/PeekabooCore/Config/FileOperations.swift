@@ -55,6 +55,11 @@ public final class FileOperations {
     public var trashesUndoneCopies = true
     /// How undo puts a copy in the Trash (tests stand in a volume without one).
     var trashCopy: (URL) throws -> Void = { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) }
+    /// Tests: runs right after a move across volumes copied `source`, before the original is checked and
+    /// removed (stands in for another app saving the file meanwhile).
+    nonisolated(unsafe) static var afterCopyingForMove: ((_ source: URL) -> Void)?
+    /// Tests: every move, undo and redo included, copies and then deletes, as across volumes.
+    nonisolated(unsafe) static var movesByCopying = false
     private let fm = FileManager.default
 
     /// A change plus the identity of the item that its undo (or redo) acts on, so that neither touches a
@@ -197,6 +202,11 @@ public final class FileOperations {
     /// Never replaces an existing item (a taken name becomes "name 2.ext"), never follows a symbolic link
     /// (a link is moved or copied as a link), and a move to another volume removes the original only
     /// once the copy is complete, putting things back as they were when it cannot.
+    ///
+    /// A move to another volume removes the original only if it is still the file that was copied. When
+    /// another app replaced it meanwhile (saved a new version over it) or it was renamed or removed, the
+    /// result is `.copied`: the copy holds the version that was copied and the original is left as it is.
+    /// When it was edited in place, the copy may be torn: it is removed again, and the move fails.
     public static func transfer(_ url: URL, toFolder folder: URL, copy: Bool) throws -> Change {
         try transfer(url, toFolder: folder, mode: copy ? .copy : .move)
     }
@@ -222,23 +232,33 @@ public final class FileOperations {
             throw Failure("Cannot \(verb) \(name): cannot create the folder \(folder.lastPathComponent) (\(reason(error)))")
         }
         do {
-            let target = try place(url, as: name, in: folder, mode: mode)
-            return copy ? .copied(from: url, to: target) : .moved(from: url, to: target)
+            switch try place(url, as: name, in: folder, mode: mode) {
+            case .moved(let target): return .moved(from: url, to: target)
+            case .copied(let target): return .copied(from: url, to: target)
+            }
         } catch let failure as PlaceFailure {
-            throw Failure("Cannot \(verb) \(name): \(failure.reason)")
+            throw Failure("Cannot \(verb) \(name): \(failure.reason)", permanent: failure.changed)
         }
     }
 
     /// Put `url` back at `original` (or "name 2.ext" next to it if that name was taken meanwhile).
     private static func restore(_ url: URL, to original: URL) throws -> URL {
         let folder = original.deletingLastPathComponent()
+        let name = original.lastPathComponent
+        let placed: Placed
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            return try place(url, as: original.lastPathComponent, in: folder, mode: .move)
+            placed = try place(url, as: name, in: folder, mode: .move)
         } catch let failure as PlaceFailure {
-            throw Failure("Cannot restore \(original.lastPathComponent): \(failure.reason)")
+            throw Failure("Cannot restore \(name): \(failure.reason)", permanent: failure.changed)
         } catch {
-            throw Failure("Cannot restore \(original.lastPathComponent): \(reason(error))")
+            throw Failure("Cannot restore \(name): \(reason(error))")
+        }
+        switch placed {
+        case .moved(let back): return back
+        case .copied:
+            // Changed by another app while it was copied back across volumes: both versions are kept.
+            throw Failure("\(name) changed while it was being moved back: both versions kept", permanent: true)
         }
     }
 
@@ -271,19 +291,33 @@ public final class FileOperations {
 
     private struct PlaceFailure: Error {
         let reason: String
+        /// The item changed while it was being moved: trying again cannot move the version that was meant.
+        var changed = false
         init(_ code: Int32, hint: String = "") { reason = String(cString: strerror(code)) + hint }
+        init(changed reason: String) {
+            self.reason = reason
+            changed = true
+        }
+    }
+
+    /// Where `place` put the item.
+    private enum Placed {
+        case moved(URL)
+        /// Copied (a copy, or a move across volumes whose original changed meanwhile and was left as it is).
+        case copied(URL)
     }
 
     /// Move or copy `source` to `folder/name`, or to the first free "stem N.ext". Exclusive: an existing item
     /// (a dangling symbolic link included) is never replaced, not even one that appears while this runs.
-    private static func place(_ source: URL, as name: String, in folder: URL, mode: Mode) throws -> URL {
+    private static func place(_ source: URL, as name: String, in folder: URL, mode requested: Mode) throws -> Placed {
+        let mode = requested == .move && movesByCopying ? .moveByCopying : requested
         if mode == .move {
             var n = 1
             while true {
                 let target = numberedURL(name, n, in: folder)
                 n += 1
                 if itemExists(target) { continue }
-                if renamex_np(source.path, target.path, UInt32(RENAME_EXCL)) == 0 { return target }
+                if renamex_np(source.path, target.path, UInt32(RENAME_EXCL)) == 0 { return .moved(target) }
                 let code = errno
                 switch code {
                 case EEXIST: continue
@@ -291,12 +325,14 @@ public final class FileOperations {
                 case ENOTSUP, EINVAL:
                     // A file system without exclusive renames (some network volumes): check, then rename.
                     if itemExists(target) { continue }
-                    if rename(source.path, target.path) == 0 { return target }
+                    if rename(source.path, target.path) == 0 { return .moved(target) }
                     throw PlaceFailure(errno)
                 default: throw PlaceFailure(code)
                 }
             }
         }
+        // What a move must find again after the copy before it may remove the original.
+        let original = mode == .moveByCopying ? Snapshot(source) : nil
         // Copy to a private name in the destination folder, then rename that exclusively into place: a failed
         // copy leaves nothing behind, and no existing file is ever written to.
         let temporary = folder.appendingPathComponent(".peekaboo-\(UUID().uuidString).tmp")
@@ -307,6 +343,7 @@ public final class FileOperations {
             unlink(temporary.path)
             throw PlaceFailure(code)
         }
+        if mode == .moveByCopying { afterCopyingForMove?(source) }
         var n = 1
         var target: URL
         while true {
@@ -320,15 +357,25 @@ public final class FileOperations {
             unlink(temporary.path)
             throw PlaceFailure(code)
         }
-        guard mode == .moveByCopying else { return target }
-        // The copy is complete: remove the original (`unlink` removes a link, never its target).
-        if unlink(source.path) != 0 {
+        guard mode == .moveByCopying else { return .copied(target) }
+        // The copy is complete. Remove the original only if it is still the item that was copied, unchanged:
+        // another app may have saved a new version meanwhile (a temporary file renamed over it), and removing
+        // that would lose it. (`unlink` removes a link, never its target.)
+        let now = Snapshot(source)
+        if let original, now == original {
+            if unlink(source.path) == 0 { return .moved(target) }
             let code = errno
             unlink(target.path)
             let readOnly = code == EACCES || code == EPERM || code == EROFS
             throw PlaceFailure(code, hint: readOnly ? " (its folder is read-only: copy it instead)" : "")
         }
-        return target
+        if let original, let now, now.isSameItem(as: original) {
+            // Written to while it was copied: the copy may hold parts of two versions. Keep only the original.
+            unlink(target.path)
+            throw PlaceFailure(changed: "it changed while it was being copied (left as it is)")
+        }
+        // Replaced, renamed or removed meanwhile: the copy holds the version that was copied; leave the rest alone.
+        return .copied(target)
     }
 
     /// `folder/name` for n = 1, else "stem n.ext".
@@ -366,11 +413,36 @@ public final class FileOperations {
         init?(_ url: URL) {
             var st = stat()
             guard lstat(url.path, &st) == 0 else { return nil }
+            self.init(st)
+        }
+
+        init(_ st: stat) {
             device = Int64(st.st_dev)
             inode = UInt64(st.st_ino)
             size = Int64(st.st_size)
             seconds = st.st_mtimespec.tv_sec
             nanoseconds = st.st_mtimespec.tv_nsec
+        }
+    }
+
+    /// The item at a path exactly as it is: its `Stamp` plus the status-change time, which also moves on a
+    /// write that keeps the size and modification time, and on tag, permission and lock changes.
+    private struct Snapshot: Equatable {
+        let stamp: Stamp
+        let changeSeconds: Int
+        let changeNanoseconds: Int
+
+        init?(_ url: URL) {
+            var st = stat()
+            guard lstat(url.path, &st) == 0 else { return nil }
+            stamp = Stamp(st)
+            changeSeconds = st.st_ctimespec.tv_sec
+            changeNanoseconds = st.st_ctimespec.tv_nsec
+        }
+
+        /// The same file (volume and inode), whether or not it changed.
+        func isSameItem(as other: Snapshot) -> Bool {
+            stamp.device == other.stamp.device && stamp.inode == other.stamp.inode
         }
     }
 
