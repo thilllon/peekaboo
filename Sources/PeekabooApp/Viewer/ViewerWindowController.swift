@@ -81,16 +81,25 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// Navigation keys are auto-repeating (skimming) until the next key-up.
     private var skimming = false
     private var keyMonitor: Any?
-    /// File currently on screen and the tier shown for it.
+    /// File currently on screen and the tier shown for it (nil with a file: its error is shown).
     private var shownFile: ImageFile?
     private var shownTier: Tier?
+    /// Version of the shown file's contents (nil = not known: opened before its folder was listed).
+    private var shownVersion: String?
+    /// Bumped when the shown file's contents change on disk, so the renderer treats the new version as another image.
+    private var contentRevision = 0
 
     // Browsing
     private var browseSource = BrowseSource.none
     private var openGeneration = 0
     private var listingPending = false
     private var lastListing: UInt64 = 0
-    private var failures: [URL: String] = [:]
+    /// Files without pixels whose decode failed (the pipeline never retries them), for the version that failed.
+    private var failures: [URL: Failure] = [:]
+    private struct Failure {
+        let version: String?
+        let reason: String
+    }
     private var tags: [URL: FileTags] = [:]
     private var tagSummaries: [URL: String] = [:]
     private var loadingWork: DispatchWorkItem?
@@ -278,6 +287,14 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         }
         let previous = pipeline.currentFile
         pipeline.setFiles(listing.files, index: listing.index)
+        if let file = pipeline.currentFile, let version = Self.knownVersion(file) {
+            // The opened file was shown (or failed) before its version was known; the pipeline keeps its tiers as
+            // that version, and so does the view.
+            if shownFile == file, shownVersion == nil { shownVersion = version }
+            if let failure = failures[file.url], failure.version == nil {
+                failures[file.url] = Failure(version: version, reason: failure.reason)
+            }
+        }
         if pipeline.currentFile != previous { beginNavigation() }
         presentCurrent()
         updateHUD()
@@ -291,7 +308,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         let start = Trace.now()
         // `onDecoded` → `show` → `renderFrame` runs inside the wait.
         let ready = pipeline.waitForCurrent(timeout: 0.25)
-        if ready, shownFile != file { presentCurrent() }
+        if ready, !isShowing(file) { presentCurrent() }
         CATransaction.flush()
         Trace.log(String(format: "launch: first tier %@ after a %.1f ms main-thread wait",
                          ready ? "presented" : "not ready", Trace.ms(since: start)))
@@ -302,6 +319,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         pipeline.setFiles([], index: 0)
         shownFile = nil
         shownTier = nil
+        shownVersion = nil
         renderer.setImage(nil, key: nil)
         setLoading(false)
         renderFrame()
@@ -324,16 +342,47 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     // MARK: Pipeline → screen
 
     private func decoded(_ image: DecodedImage, for file: ImageFile) {
+        // Pixels arrived (another tier, or a new version of the file): it is no longer a failure.
+        let hadFailed = failures.removeValue(forKey: file.url) != nil
         guard file == pipeline.currentFile else {
             prepareIfNeighbour(image, for: file)
             return
         }
-        if failures.removeValue(forKey: file.url) != nil { hud.setMessage(nil) }
-        if shownFile == file, let shownTier, shownTier >= image.tier {
+        if hadFailed { hud.setMessage(nil) }
+        if isShowing(file), let shownTier, shownTier >= image.tier {
             updateHUD()
             return
         }
         show(image, for: file)
+    }
+
+    /// Version of `file`'s contents; nil when not known (a file opened before its folder was listed).
+    private static func knownVersion(_ file: ImageFile) -> String? {
+        file.byteSize == 0 && file.modified == 0 ? nil : file.version
+    }
+
+    /// The screen shows `file` as it is now: that file (its pixels, or its error), and no other version of its
+    /// contents was listed since (an edit saved in another app replaces the file under the same URL).
+    private func isShowing(_ file: ImageFile) -> Bool {
+        guard shownFile == file else { return false }
+        guard let shownVersion, let version = Self.knownVersion(file) else { return true }
+        return shownVersion == version
+    }
+
+    /// Put `image` (nil: nothing, for an error) of `file` on the renderer and record it as shown.
+    private func setShown(_ file: ImageFile, _ image: DecodedImage?) {
+        // A new version of the file on screen is another image to the renderer: it must not keep the old version's
+        // geometry, texture or canvas while the new one's pyramid builds.
+        if shownFile == file, !isShowing(file) { contentRevision &+= 1 }
+        renderer.setImage(image, key: RenderKey(url: file.url, revision: contentRevision))
+        shownFile = file
+        shownTier = image?.tier
+        shownVersion = Self.knownVersion(file)
+    }
+
+    private struct RenderKey: Hashable {
+        let url: URL
+        let revision: Int
     }
 
     /// Neighbours whose GPU resources (texture, colour transform, pyramid) are built ahead of navigation: ±1 and the
@@ -347,7 +396,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// Neighbours are prepared only once the current image shows a sharp tier: until then the renderer's LRU still
     /// holds the current preview, which it draws while the screen tier's pyramid builds.
     private var currentIsSharp: Bool {
-        guard let file = pipeline.currentFile, shownFile == file, let tier = shownTier else { return false }
+        guard let file = pipeline.currentFile, isShowing(file), let tier = shownTier else { return false }
         return tier >= .screen
     }
 
@@ -377,36 +426,52 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
 
     private func failed(_ file: ImageFile, _ error: Error) {
         Trace.log("decode failed \(file.name): \(error)")
-        guard file == pipeline.currentFile, shownFile != file, pipeline.best(for: file) == nil else { return }
-        let reason: String
+        // Another tier (a preview) is still worth showing; only a file without any pixels has failed.
+        guard pipeline.best(for: file) == nil else { return }
+        // Recorded for every file, current or prefetched: the pipeline never retries it (and never reports it again),
+        // so reaching it later must show this error.
+        let reason = Self.failureReason(error, file: file)
+        failures[file.url] = Failure(version: Self.knownVersion(file), reason: reason)
+        guard file == pipeline.currentFile else { return }
+        showFailure(file, reason: reason)
+    }
+
+    private static func failureReason(_ error: Error, file: ImageFile) -> String {
         func detail(_ s: String, _ generic: String) -> String {
             s.isEmpty || s == file.name || s == file.url.path ? generic : "\(generic) (\(s))"
         }
         switch error as? DecodeError {
-        case .unsupported(let s)?: reason = detail(s, "Unsupported format")
-        case .unreadable(let s)?: reason = detail(s, "Damaged file or not an image")
-        case .outOfMemory?: reason = "Not enough memory to decode it"
-        case nil: reason = error.localizedDescription
+        case .unsupported(let s)?: return detail(s, "Unsupported format")
+        case .unreadable(let s)?: return detail(s, "Damaged file or not an image")
+        case .outOfMemory?: return "Not enough memory to decode it"
+        case nil: return error.localizedDescription
         }
-        failures[file.url] = reason
-        // Do not leave the previous image under the new name.
-        shownFile = file
-        shownTier = nil
-        renderer.setImage(nil, key: file.url)
-        setLoading(false)
-        renderFrame()
+    }
+
+    /// Why `file` (as it is now) cannot be shown, if its decode failed.
+    private func failureReason(for file: ImageFile) -> String? {
+        guard let failure = failures[file.url] else { return nil }
+        if let failed = failure.version, let version = Self.knownVersion(file), failed != version { return nil }
+        return failure.reason
+    }
+
+    /// `file` has no pixels and cannot be decoded: show its error, and never the previous image under its name.
+    private func showFailure(_ file: ImageFile, reason: String) {
+        if !isShowing(file) || shownTier != nil {
+            setShown(file, nil)
+            setLoading(false)
+            renderFrame()
+        }
         hud.setMessage("Cannot open “\(file.name)”\n\(reason)")
         updateHUD()
     }
 
     private func show(_ image: DecodedImage, for file: ImageFile) {
-        let wasNewFile = shownFile != file
+        let wasNewFile = !isShowing(file)
         let t0 = Trace.now()
-        renderer.setImage(image, key: file.url)
-        shownFile = file
-        shownTier = image.tier
+        setShown(file, image)
         setLoading(false)
-        if failures[file.url] == nil { hud.setMessage(nil) }
+        if failureReason(for: file) == nil { hud.setMessage(nil) }
         let t1 = Trace.now()
         renderFrame()
         let t2 = Trace.now()
@@ -420,12 +485,14 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         }
     }
 
-    /// Show the best tier of the current file now, or keep the previous image and arm the progress line.
+    /// Show the best tier of the current file now (or its error), or keep the previous image and arm the progress line.
     private func presentCurrent() {
         guard let file = pipeline.currentFile else { return }
         if let best = pipeline.best(for: file) {
-            if shownFile != file || (shownTier ?? .preview) < best.tier || shownTier == nil { show(best, for: file) }
-        } else if shownFile != file {
+            if !isShowing(file) || (shownTier ?? .preview) < best.tier || shownTier == nil { show(best, for: file) }
+        } else if let reason = failureReason(for: file) {
+            showFailure(file, reason: reason)
+        } else if !isShowing(file) {
             armLoadingIndicator(for: file)
         }
         loadTags(for: file)
@@ -458,7 +525,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private func armLoadingIndicator(for file: ImageFile) {
         loadingWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.pipeline.currentFile == file, self.shownFile != file else { return }
+            guard let self, self.pipeline.currentFile == file, !self.isShowing(file) else { return }
             self.hud.setLoading(true)
             Trace.log("progress line: \(file.name) has no pixels 150 ms after navigation")
         }
@@ -483,7 +550,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         let count = listingPending ? "…" : "\(pipeline.files.count)"
         var parts = [file.name, "\(index)/\(count)"]
         let info = pipeline.info(for: file)
-        let onScreen = shownFile == file ? renderer.image : nil
+        let onScreen = isShowing(file) ? renderer.image : nil
         if let info {
             parts.append("\(info.orientedWidth)×\(info.orientedHeight)")
         } else if let onScreen {
@@ -491,7 +558,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         }
         if onScreen != nil { parts.append("\(Int((renderer.effectiveScale * 100).rounded())) %") }
         if let summary = tagSummaries[file.url], !summary.isEmpty { parts.append(summary) }
-        if failures[file.url] != nil { parts.append("cannot open") }
+        if failureReason(for: file) != nil { parts.append("cannot open") }
         var content = HUDContent(line: parts.joined(separator: "  ·  "))
         if hud.mode == .full { content.details = detailRows(file, info, onScreen) }
         hud.setContent(content)
@@ -1073,17 +1140,14 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
                 let index = current.flatMap { files.firstIndex(of: $0) } ?? min(self.pipeline.index, files.count - 1)
                 self.pipeline.setFiles(files, index: index)
                 if self.pipeline.currentFile != current { self.beginNavigation() }
-                self.hud.setMessage(self.failures[self.pipeline.currentFile?.url ?? folder] == nil ? nil : self.hudMessageForFailure())
+                // The message was about the previous state (an empty folder, a removed file's error); `presentCurrent`
+                // shows the current file's error again if it still has one.
+                self.hud.setMessage(nil)
                 self.presentCurrent()
                 self.updateHUD()
                 Trace.log("folder rescanned: \(files.count) files")
             }
         }
-    }
-
-    private func hudMessageForFailure() -> String? {
-        guard let file = pipeline.currentFile, let reason = failures[file.url] else { return nil }
-        return "Cannot open “\(file.name)”\n\(reason)"
     }
 
     // MARK: System events
