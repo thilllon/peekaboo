@@ -207,6 +207,28 @@ final class DecodePreviewTests: XCTestCase {
         XCTAssertTrue(JPEGScan.mpfLargeThumbnails(Array("MPF\0".utf8), base: 0).isEmpty)
     }
 
+    // MARK: Progressive screen tier
+
+    func testProgressiveScreenCoverageKnob() throws {
+        let props: [CFString: Any] = [kCGImagePropertyJFIFDictionary: [kCGImagePropertyJFIFIsProgressive: true]]
+        let url = dir.appendingPathComponent("progressive.jpg")
+        try jpeg(try quadrants(1600, 1200, rgbw), properties: props).write(to: url)
+        let decoder = ImageIODecoder()
+        XCTAssertEqual(ImageIODecoder.progressiveScreenCoverage, 1, "covering screen tier by default")
+        let covering = try decoder.decode(url, tier: .screen, targetLongSide: 900, pool: pool)
+        XCTAssertEqual(covering.pixels.width, 1600, "1/2 (800 px) does not cover 900 px")
+        let saved = ImageIODecoder.progressiveScreenCoverage
+        defer { ImageIODecoder.progressiveScreenCoverage = saved }
+        ImageIODecoder.progressiveScreenCoverage = 0.85
+        let relaxed = try decoder.decode(url, tier: .screen, targetLongSide: 900, pool: pool)
+        XCTAssertEqual(relaxed.pixels.width, 800, "1/2 covers 89 % of 900 px")
+        XCTAssertEqual(relaxed.pixels.height, 600)
+        let tooSmall = try decoder.decode(url, tier: .screen, targetLongSide: 1000, pool: pool)
+        XCTAssertEqual(tooSmall.pixels.width, 1600, "1/2 covers only 80 % of 1000 px")
+        let full = try decoder.decode(url, tier: .full, targetLongSide: 0, pool: pool)
+        XCTAssertEqual(full.pixels.width, 1600, "the knob never touches .full")
+    }
+
     // MARK: Corpus
 
     private func corpus() throws -> URL {

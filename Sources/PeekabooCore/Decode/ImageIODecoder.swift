@@ -37,6 +37,16 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     /// libjpeg-turbo. (Progressive JPEGs are never hardware-decoded, whatever their size.)
     public static let hardwareJPEGMaxPixels = 102_000_000
 
+    /// Fraction of the `.screen` target a progressive JPEG's libjpeg-turbo DCT scale must cover. At 1 (default)
+    /// the screen tier covers the target (24 MP on a 3456 px screen: full size, 273 ms). At 0.85 it may stop at
+    /// 1/2 (2974 px, 86 %: 255 ms, a quarter of the memory; 101 MP: 1/4, 616 vs 617 ms). That only pays off once
+    /// the renderer accepts such a tier at fit: `Renderer.wantsFullResolution` asks for `.full` above 1.01×,
+    /// which would decode the whole image again. Set with `PEEKABOO_PROGRESSIVE_COVERAGE=0.85` or directly.
+    nonisolated(unsafe) public static var progressiveScreenCoverage: Double = {
+        let value = ProcessInfo.processInfo.environment["PEEKABOO_PROGRESSIVE_COVERAGE"].flatMap(Double.init) ?? 1
+        return min(1, max(0.5, value))
+    }()
+
     /// Embedded previews whose aspect ratio differs from the image by more than this are ignored
     /// (cropped or letterboxed camera thumbnails would shift the picture when the next tier lands).
     static let previewAspectTolerance = 0.01
@@ -177,7 +187,8 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
                 let factor = scan.coding == .progressive ? 8 : baselineFactor
                 if let output = try? surfaceOrPublic(probe, subsample: factor, pool: pool) { return output }
             }
-            // `.screen` of a progressive JPEG stays a covering libjpeg-turbo decode. Measured alternatives
+            // `.screen` of a progressive JPEG is a covering libjpeg-turbo decode unless `progressiveScreenCoverage`
+            // relaxes it (DCT scales are 1/2, 1/4, 1/8 only; see `TurboJPEG.coveringScale`). Measured alternatives
             // (24 MP 5947×3964, 3456 px screen, M4 Pro, macOS 26.6): ImageIO /2 305.6 ms (IOSurface SPI) /
             // 307.9 ms (CGImage), /4 301.1 / 311.7 ms — every AC scan is still entropy-decoded; only /8 is
             // DC-only (31 ms) but covers 21 % of the screen. libjpeg-turbo full 273 ms, 1/2 (2974 px, 86 % of
@@ -185,7 +196,8 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
             // sub-covering screen tier saves ≤ 7 % yet looks softer, and the renderer then asks for `.full`
             // at fit (it wants a tier ≥ 1.01× the displayed size), which costs the whole decode again.
             do {
-                let pixels = try turbo(url: url, data: data, target: target, pool: pool)
+                let coverage = tier == .screen && scan.coding == .progressive ? Self.progressiveScreenCoverage : 1
+                let pixels = try turbo(url: url, data: data, target: Int((Double(target) * coverage).rounded(.up)), pool: pool)
                 return Output(pixels: pixels, orientation: probe.info.orientation, path: "libjpeg-turbo")
             } catch TurboJPEG.Failure.memory {
                 throw DecodeError.outOfMemory
