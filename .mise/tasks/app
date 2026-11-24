@@ -20,9 +20,7 @@ cp Resources/Info.plist "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 # CLI launcher ships inside the bundle; `mise run install` links it onto PATH.
 cp Resources/peekaboo "$APP/Contents/Resources/peekaboo"
-if [[ -f Resources/AppIcon.icns ]]; then
-  cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
-fi
+cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 # Ad-hoc signature: no signing identity is required to run locally.
 codesign --force --sign - --timestamp=none "$APP"
 echo "$APP"
