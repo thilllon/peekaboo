@@ -262,7 +262,8 @@ public final class Renderer {
             requestDisplay()
         }
     }
-    /// Keep zoom and pan when switching to another image.
+    /// Keep zoom and pan when switching to another image: the zoom mode stays, and the same point of the picture
+    /// relative to its size (the same pixel for images of the same size) stays at the view centre.
     public var keepZoom = false
     /// Asks the host to call `render()` soon (e.g. a refinement became available).
     public var onNeedsDisplay: (() -> Void)?
@@ -294,6 +295,9 @@ public final class Renderer {
     private var backingScale: CGFloat = 2
     /// Image-space point (display orientation, full-resolution pixels) at the view centre.
     private var center = SIMD2<Double>(0, 0)
+    /// `center` as a fraction of the last image's display size: the pan `keepZoom` carries to the next file (also
+    /// across an image-less file, e.g. one that failed to decode).
+    private var relativeCenter = SIMD2<Double>(0.5, 0.5)
 
     private typealias Canvas = HQCanvas
     private var canvas: Canvas?
@@ -341,6 +345,7 @@ public final class Renderer {
     /// the same key with a better tier swaps pixels in place without moving anything.
     public func setImage(_ image: DecodedImage?, key: AnyHashable?) {
         let isNewFile = key != imageKey
+        if self.image != nil { relativeCenter = center / displaySize }
         self.image = image
         imageKey = key
         let previous = gpu
@@ -360,8 +365,12 @@ public final class Renderer {
             quarterTurns = 0
             flippedHorizontally = false
             flippedVertically = false
-            if !keepZoom { zoomMode = .fit }
-            center = displaySize / 2
+            if keepZoom {
+                center = relativeCenter * displaySize
+            } else {
+                zoomMode = .fit
+                center = displaySize / 2
+            }
         }
         configureDynamicRange(hdr: image?.isHDR ?? false)
         clampCenter()

@@ -264,6 +264,50 @@ final class PeekabooRenderTests: XCTestCase {
         XCTAssertEqual(r.zoomMode, .fit)
     }
 
+    /// Display P3 (no matrix), so a 1:1 copy returns the bytes: R, G = low bytes of x, y; B = their high nibbles.
+    private func coordinateImage(width: Int, height: Int) -> DecodedImage {
+        makeImage(width: width, height: height, space: CGColorSpace(name: CGColorSpace.displayP3)!) { x, y in
+            SIMD4(UInt8(x & 255), UInt8(y & 255), UInt8((x >> 8) << 4 | (y >> 8)), 255)
+        }
+    }
+
+    /// The source pixel of a `coordinateImage` drawn at view pixel (x, y).
+    private func sourcePixel(_ img: Img, x: Int, y: Int) -> SIMD2<Int> {
+        let c = img[x: x, y: y]
+        let b = SIMD3((0..<3).map { Int((linearToSRGB(c[$0]) * 255).rounded()) })
+        return SIMD2(b.x + (b.z >> 4) << 8, b.y + (b.z & 15) << 8)
+    }
+
+    /// `keepZoom` keeps the pan as well as the zoom: the next image opens with the same point of the picture (relative
+    /// to its size) at the view centre, also across a file that failed to decode; off, a new file opens at fit.
+    func testKeepZoomKeepsThePan() {
+        let r = makeRenderer(width: 200, height: 150)
+        let centre = (x: 100, y: 75)
+        r.setImage(coordinateImage(width: 800, height: 600), key: "a")
+        r.setZoom(.scale(1))
+        r.pan(by: CGVector(dx: 1e6, dy: 1e6))       // top-left corner: image point (100, 75) at the centre
+        r.pan(by: CGVector(dx: -150, dy: -100))     // then 150 px right, 100 px down
+        XCTAssertEqual(sourcePixel(render(r), x: centre.x, y: centre.y), SIMD2(250, 175))
+        XCTAssertEqual(r.lastPath, "exact")
+
+        r.keepZoom = true
+        r.setImage(coordinateImage(width: 800, height: 600), key: "b")       // a burst frame of the same size
+        XCTAssertEqual(r.zoomMode, .scale(1))
+        XCTAssertEqual(sourcePixel(render(r), x: centre.x, y: centre.y), SIMD2(250, 175), "same size: same pixel")
+
+        r.setImage(coordinateImage(width: 1600, height: 1200), key: "c")     // twice the size: same relative point
+        XCTAssertEqual(sourcePixel(render(r), x: centre.x, y: centre.y), SIMD2(500, 350))
+
+        r.setImage(nil, key: "broken")                                        // a file that failed to decode
+        _ = render(r)
+        r.setImage(coordinateImage(width: 800, height: 600), key: "d")
+        XCTAssertEqual(sourcePixel(render(r), x: centre.x, y: centre.y), SIMD2(250, 175), "kept across a failed file")
+
+        r.keepZoom = false
+        r.setImage(coordinateImage(width: 800, height: 600), key: "e")
+        XCTAssertEqual(r.zoomMode, .fit)
+    }
+
     // MARK: Alpha
 
     func testAlphaCompositingOverBackground() {
