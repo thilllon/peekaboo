@@ -918,7 +918,7 @@ public final class FileOperations {
                         out.append(")")
                         i += 1
                     }
-                    // `#` is a digit separator here (16#ff), never a comment.
+                    // Here `#` separates a base from its digits (16#ff); it never starts a comment.
                 } else if c == "#", i == 1 || " \t\n;&|(".contains(chars[i - 2]) {
                     // A comment runs to the end of the line.
                     while i < chars.count, chars[i] != "\n" {
