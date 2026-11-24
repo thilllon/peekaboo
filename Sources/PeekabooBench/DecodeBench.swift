@@ -4,12 +4,16 @@ import ImageIO
 import Metal
 import PeekabooCore
 
-/// `peekaboo-bench decode [--corpus DIR] [--iters N] [--screen PX] [--preview PX] [--threads N] [--skeleton]`
+/// `peekaboo-bench decode [--corpus DIR] [--iters N] [--screen PX] [--preview PX] [--threads N] [--skeleton]
+///                        [--filter TEXT] [--dump DIR] [--mpf] [--variants]`
 ///
 /// Per corpus file: median wall time of probe / `.preview` / `.screen` / `.full`, the output size and layout,
 /// then the parallel throughput of `.screen` decodes over `nav/` (or the whole corpus) with N threads
 /// (default 6, the scheduler's lane count) and with 1. `--skeleton` measures the walking-skeleton decoder
-/// (CPU thumbnail resampling + BGRA conversion) for before/after comparisons.
+/// (CPU thumbnail resampling + BGRA conversion) for before/after comparisons. `--mpf` adds camera-style
+/// copies of the corpus JPEGs carrying a 1620 px MPF large thumbnail (the corpus has none). `--variants`
+/// times the rejected alternatives for progressive `.screen` and HEIF/AVIF `.preview` (ImageIO subsample
+/// factors, resampled thumbnails, a sub-covering libjpeg-turbo scale).
 /// The corpus defaults to `$PEEKABOO_CORPUS`.
 func runDecodeBench(_ args: ArraySlice<String>) throws {
     var corpus = ProcessInfo.processInfo.environment["PEEKABOO_CORPUS"]
@@ -20,6 +24,8 @@ func runDecodeBench(_ args: ArraySlice<String>) throws {
     var skeleton = false
     var filter: String?
     var dump: URL?
+    var mpf = false
+    var variants = false
     var it = args.makeIterator()
     while let arg = it.next() {
         switch arg {
@@ -31,6 +37,8 @@ func runDecodeBench(_ args: ArraySlice<String>) throws {
         case "--filter": filter = it.next()
         case "--skeleton": skeleton = true
         case "--dump": dump = it.next().map { URL(fileURLWithPath: $0) }
+        case "--mpf": mpf = true
+        case "--variants": variants = true
         default: throw BenchError.usage("unknown option \(arg)")
         }
     }
@@ -42,6 +50,13 @@ func runDecodeBench(_ args: ArraySlice<String>) throws {
     var files = imageFiles(in: root, skipping: "nav")
     if let filter { files = files.filter { $0.path.contains(filter) } }
     guard !files.isEmpty else { throw BenchError.usage("no images under \(corpus)") }
+    let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("peekaboo-bench-\(getpid())")
+    defer { try? FileManager.default.removeItem(at: scratch) }
+    if mpf { files += try mpfCopies(of: files, in: scratch) }
+    if variants {
+        try runVariants(files, decoder: decoder, pool: pool, iters: iters, screen: screen)
+        return
+    }
 
     print("decoder: \(skeleton ? "skeleton" : "ImageIODecoder")  iters: \(iters)  preview: \(preview) px  screen: \(screen) px")
     func pad(_ s: String, _ n: Int) -> String { s.count >= n ? s : s + String(repeating: " ", count: n - s.count) }
@@ -238,5 +253,126 @@ private final class SkeletonDecoder: ImageDecoder, @unchecked Sendable {
         context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
         return DecodedImage(pixels: pixels, tier: tier, fullWidth: info.orientedWidth, fullHeight: info.orientedHeight,
                             orientation: .up, isHDR: false, decodeNanos: Trace.now() - start)
+    }
+}
+
+// MARK: - --mpf
+
+/// Camera-style copies of the JPEGs in `files`: an APP2 MPF index (CIPA DC-007) after APP0/APP1 and a
+/// 1620 px "large thumbnail (full-HD class)" appended, the way Sony, Nikon or Fujifilm bodies store them.
+private func mpfCopies(of files: [URL], in dir: URL) throws -> [URL] {
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    var out: [URL] = []
+    for url in files where ["jpg", "jpeg"].contains(url.pathExtension.lowercased()) {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              (props[kCGImagePropertyPixelWidth] as? Int ?? 0) >= 3000 else { continue }
+        let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                        kCGImageSourceThumbnailMaxPixelSize: 1620]
+        guard let preview = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { continue }
+        let encoded = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(encoded, "public.jpeg" as CFString, 1, nil) else { continue }
+        CGImageDestinationAddImage(destination, preview, [kCGImageDestinationLossyCompressionQuality: 0.9] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { continue }
+        let target = dir.appendingPathComponent("mpf_" + url.lastPathComponent)
+        try mpfFile(primary: try Data(contentsOf: url), preview: encoded as Data).write(to: target)
+        out.append(target)
+    }
+    return out
+}
+
+private func mpfFile(primary: Data, preview: Data) -> Data {
+    let bytes = [UInt8](primary)
+    var insert = 2
+    while insert + 4 <= bytes.count, bytes[insert] == 0xFF, bytes[insert + 1] == 0xE0 || bytes[insert + 1] == 0xE1 {
+        insert += 2 + (Int(bytes[insert + 2]) << 8 | Int(bytes[insert + 3]))
+    }
+    func be16(_ v: Int) -> [UInt8] { [UInt8(v >> 8 & 0xFF), UInt8(v & 0xFF)] }
+    func be32(_ v: Int) -> [UInt8] { [UInt8(v >> 24 & 0xFF), UInt8(v >> 16 & 0xFF), UInt8(v >> 8 & 0xFF), UInt8(v & 0xFF)] }
+    let entryOffset = 8 + 2 + 3 * 12 + 4
+    let payloadLength = 4 + entryOffset + 16 * 2
+    let base = insert + 8  // FFE2, length, "MPF\0"
+    let primarySize = bytes.count + 4 + payloadLength
+    var payload = Array("MPF\0".utf8) + [0x4D, 0x4D, 0x00, 0x2A] + be32(8) + be16(3)
+    payload += be16(0xB000) + be16(7) + be32(4) + Array("0100".utf8)
+    payload += be16(0xB001) + be16(4) + be32(1) + be32(2)
+    payload += be16(0xB002) + be16(7) + be32(32) + be32(entryOffset) + be32(0)
+    payload += be32(0x2003_0000) + be32(primarySize) + be32(0) + be32(0)
+    payload += be32(0x01_0002) + be32(preview.count) + be32(primarySize - base) + be32(0)
+    return Data(Array(bytes[0..<insert]) + [0xFF, 0xE2] + be16(payloadLength + 2) + payload + Array(bytes[insert...])
+                + [UInt8](preview))
+}
+
+// MARK: - --variants
+
+private typealias SurfaceFn = @convention(c) (CGImageSource, Int, CFDictionary?) -> Unmanaged<IOSurfaceRef>?
+private let surfaceSPI: SurfaceFn? = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "CGImageSourceCreateIOSurfaceAtIndex")
+    .map { unsafeBitCast($0, to: SurfaceFn.self) }
+
+/// The alternatives measured for progressive JPEG `.screen` and HEIF/AVIF `.preview` (see the routing notes
+/// in `ImageIODecoder`): every ImageIO subsample factor through the IOSurface SPI and a CGImage draw, a
+/// resampled `…Always` thumbnail, and (progressive) the decoder's libjpeg-turbo `.screen` at a covering and
+/// at a half-size scale.
+private func runVariants(_ files: [URL], decoder: ImageDecoder, pool: PixelBufferPool, iters: Int, screen: Int) throws {
+    func source(_ url: URL) -> CGImageSource? {
+        CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary)
+    }
+    func time(_ body: () -> String) -> String {
+        var out = ""
+        _ = autoreleasepool { body() }
+        var times: [Double] = []
+        for _ in 0..<iters {
+            autoreleasepool {
+                let t0 = Trace.now()
+                out = body()
+                times.append(Trace.ms(since: t0))
+            }
+        }
+        return String(format: "%7.1f ms %@", median(times), out)
+    }
+    func surface(_ url: URL, _ factor: Int) -> String {
+        var options: [CFString: Any] = [kCGImageSourceShouldCache: false]
+        if factor > 1 { options[kCGImageSourceSubsampleFactor] = factor }
+        guard let surfaceSPI, let src = source(url), let s = surfaceSPI(src, 0, options as CFDictionary)?.takeRetainedValue() else {
+            return "nil"
+        }
+        return "\(IOSurfaceGetWidth(s))x\(IOSurfaceGetHeight(s))"
+    }
+    func drawn(_ url: URL, _ factor: Int) -> String {
+        var options: [CFString: Any] = [kCGImageSourceShouldCache: false]
+        if factor > 1 { options[kCGImageSourceSubsampleFactor] = factor }
+        guard let src = source(url), let image = CGImageSourceCreateImageAtIndex(src, 0, options as CFDictionary),
+              let context = CGContext(data: nil, width: image.width, height: image.height, bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return "nil" }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return "\(image.width)x\(image.height)"
+    }
+    func thumbnail(_ url: URL, _ maxPixel: Int) -> String {
+        let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+                                        kCGImageSourceCreateThumbnailWithTransform: true, kCGImageSourceShouldCache: false]
+        guard let src = source(url), let image = CGImageSourceCreateThumbnailAtIndex(src, 0, options as CFDictionary) else { return "nil" }
+        return "\(image.width)x\(image.height)"
+    }
+    func tier(_ url: URL, _ target: Int) -> String {
+        guard let image = try? decoder.decode(url, tier: .screen, targetLongSide: target, pool: pool) else { return "error" }
+        return "\(image.pixels.width)x\(image.pixels.height)"
+    }
+    for url in files {
+        guard let info = try? decoder.probe(url) else { continue }
+        let format = info.exif["format"] ?? ""
+        let heif = ["HEIC", "HEIF", "AVIF"].contains(format)
+        guard format.hasPrefix("JPEG progressive") || heif else { continue }
+        print("\(url.lastPathComponent) (\(format), \(info.pixelWidth)x\(info.pixelHeight))")
+        for factor in heif ? [2, 4, 8] : [1, 2, 4, 8] {
+            print("  /\(factor)  iosurface \(time { surface(url, factor) })   cgimage+draw \(time { drawn(url, factor) })")
+        }
+        if heif {
+            print("  thumbnail Always 1024 \(time { thumbnail(url, 1024) })")
+        } else {
+            let long = max(info.pixelWidth, info.pixelHeight)
+            print("  libjpeg-turbo .screen covering \(screen) px \(time { tier(url, screen) })")
+            print("  libjpeg-turbo .screen at half size \(time { tier(url, (long + 1) / 2) })")
+        }
     }
 }
