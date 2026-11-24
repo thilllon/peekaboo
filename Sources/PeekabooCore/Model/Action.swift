@@ -1,75 +1,119 @@
-/// Everything a key, gesture or menu item can trigger. The keymap maps chords to
-/// actions; the app executes them. String ids (`Action(id:)` / `.id`) are the
-/// vocabulary of the user config file.
+/// Everything a key, gesture or menu item can trigger. The keymap maps chords
+/// (or chord sequences) to one action or a list of actions; the app executes them.
+///
+/// Config ids follow `namespace.verb[:arg]` (see `Action(id:)`), e.g. `nav.next`,
+/// `nav.jump:+10`, `zoom.set:2`, `file.move:keep`, `meta.rate:3`, `exec:open -R {path}`.
 public enum Action: Hashable, Sendable {
-    // Navigation
-    case next, previous, first, last, random
-    case forward(Int), backward(Int)
-    // Zoom & view
-    case zoomFit, zoomFill, zoomActual, zoomIn, zoomOut, zoomToggle
-    case pan(PanDirection)
+    // nav
+    case next, previous, first, last
+    /// Relative jump, e.g. +10 / -10.
+    case jump(Int)
+    // zoom
+    case zoomFit, zoomFill, zoomActual, zoomIn, zoomOut, zoomToggle, zoomKeep
+    /// Absolute magnification (1 = one image pixel per device pixel).
+    case zoomSet(Double)
+    // pan
+    case pan(Direction), panEdge(Edge), panCenter
+    // view
+    case fullscreen, fullscreenNative, hud, hudHide, background, help
     case rotateClockwise, rotateCounterClockwise, flipHorizontal, flipVertical
-    case toggleFullscreen, toggleHUD, toggleInfo, togglePixelGrid, cycleBackground, toggleHelp, toggleSlideshow
-    // Files
-    case trash, undo, revealInFinder, copyImage, copyPath
-    /// Move / copy the current file to a folder: a path (`~` allowed) or a named slot from the config.
-    case moveTo(String), copyTo(String)
-    /// Open the current file with an application (name, path or bundle id).
+    // file
+    case trash, delete, reveal, copyPath, copyName, copyImage, openWithChooser
+    /// Move / copy the current file: a slot name, a path (`~` and `./relative` allowed), `ask` or `last`.
+    case move(String), copy(String)
+    /// Open with an app slot, bundle id, app name or path.
     case openWith(String)
-    // Sorting
-    case sort(SortKey), reverseSort
-    // App
-    case closeWindow, quit, reloadConfig, openConfig
+    // meta (stored as Finder tags)
+    case rate(Int)
+    case label(String)
+    case flag(String)
+    // app
+    case undo, redo, config, reloadConfig, escape, close, quit, open, makeDefault
+    /// Shell template with `{path} {dir} {name} {stem} {ext} {index} {count}` placeholders (each shell-quoted).
+    case exec(String)
+    /// Explicitly unbound.
+    case none
 
-    public enum PanDirection: String, Sendable, CaseIterable { case left, right, up, down }
-    public enum SortKey: String, Sendable, CaseIterable { case name, modified, size, type }
+    public enum Direction: String, Sendable, CaseIterable { case left, right, up, down }
+    public enum Edge: String, Sendable, CaseIterable { case left, right, top, bottom }
 
     private static let simple: [String: Action] = [
-        "nav.next": .next, "nav.prev": .previous, "nav.first": .first, "nav.last": .last, "nav.random": .random,
-        "zoom.fit": .zoomFit, "zoom.fill": .zoomFill, "zoom.actual": .zoomActual,
-        "zoom.in": .zoomIn, "zoom.out": .zoomOut, "zoom.toggle": .zoomToggle,
+        "nav.next": .next, "nav.prev": .previous, "nav.first": .first, "nav.last": .last,
+        "zoom.fit": .zoomFit, "zoom.fill": .zoomFill, "zoom.actual": .zoomActual, "zoom.in": .zoomIn,
+        "zoom.out": .zoomOut, "zoom.toggle": .zoomToggle, "zoom.keep": .zoomKeep,
         "pan.left": .pan(.left), "pan.right": .pan(.right), "pan.up": .pan(.up), "pan.down": .pan(.down),
-        "rotate.cw": .rotateClockwise, "rotate.ccw": .rotateCounterClockwise,
-        "flip.h": .flipHorizontal, "flip.v": .flipVertical,
-        "view.fullscreen": .toggleFullscreen, "view.hud": .toggleHUD, "view.info": .toggleInfo,
-        "view.pixel-grid": .togglePixelGrid, "view.background": .cycleBackground, "view.help": .toggleHelp,
-        "view.slideshow": .toggleSlideshow,
-        "file.trash": .trash, "file.undo": .undo, "file.reveal": .revealInFinder,
-        "file.copy-image": .copyImage, "file.copy-path": .copyPath,
-        "sort.name": .sort(.name), "sort.modified": .sort(.modified), "sort.size": .sort(.size),
-        "sort.type": .sort(.type), "sort.reverse": .reverseSort,
-        "window.close": .closeWindow, "app.quit": .quit, "config.reload": .reloadConfig, "config.open": .openConfig,
+        "pan.center": .panCenter,
+        "view.fullscreen": .fullscreen, "view.fullscreen_native": .fullscreenNative, "view.hud": .hud,
+        "view.hud_hide": .hudHide, "view.background": .background, "view.help": .help,
+        "view.rotate_cw": .rotateClockwise, "view.rotate_ccw": .rotateCounterClockwise,
+        "view.flip_h": .flipHorizontal, "view.flip_v": .flipVertical,
+        "file.trash": .trash, "file.delete": .delete, "file.reveal": .reveal, "file.copy_path": .copyPath,
+        "file.copy_name": .copyName, "file.copy_image": .copyImage, "file.open_with_chooser": .openWithChooser,
+        "app.undo": .undo, "app.redo": .redo, "app.config": .config, "app.reload_config": .reloadConfig,
+        "app.escape": .escape, "app.close": .close, "app.quit": .quit, "app.open": .open,
+        "app.make_default": .makeDefault,
+        "none": .none,
     ]
 
-    /// Parse a config id such as `"nav.next"`, `"nav.forward:10"` or `"file.move:~/Pictures/Keep"`.
-    public init?(id: String) {
+    /// Parse a config id. Returns nil for unknown ids or invalid arguments.
+    public init?(id raw: String) {
+        let id = raw.trimmingCharacters(in: .whitespaces)
         if let action = Action.simple[id] { self = action; return }
+        if id.hasPrefix("exec:") {
+            let command = String(id.dropFirst(5))
+            guard !command.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+            self = .exec(command); return
+        }
         guard let colon = id.firstIndex(of: ":") else { return nil }
         let name = String(id[..<colon])
-        let argument = String(id[id.index(after: colon)...])
-        guard !argument.isEmpty else { return nil }
+        let arg = String(id[id.index(after: colon)...])
+        guard !arg.isEmpty else { return nil }
         switch name {
-        case "nav.forward": guard let n = Int(argument), n > 0 else { return nil }; self = .forward(n)
-        case "nav.backward": guard let n = Int(argument), n > 0 else { return nil }; self = .backward(n)
-        case "file.move": self = .moveTo(argument)
-        case "file.copy": self = .copyTo(argument)
-        case "file.open-with": self = .openWith(argument)
+        case "nav.jump":
+            guard let n = Int(arg.hasPrefix("+") ? String(arg.dropFirst()) : arg), n != 0 else { return nil }
+            self = .jump(n)
+        case "zoom.set":
+            guard let f = Double(arg), f > 0, f.isFinite else { return nil }
+            self = .zoomSet(f)
+        case "pan.edge":
+            guard let edge = Edge(rawValue: arg) else { return nil }
+            self = .panEdge(edge)
+        case "file.move": self = .move(arg)
+        case "file.copy": self = .copy(arg)
+        case "file.open_with": self = .openWith(arg)
+        case "meta.rate":
+            guard let n = Int(arg), (0...5).contains(n) else { return nil }
+            self = .rate(n)
+        case "meta.label":
+            guard Action.labels.contains(arg) else { return nil }
+            self = .label(arg)
+        case "meta.flag":
+            guard ["pick", "reject", "none"].contains(arg) else { return nil }
+            self = .flag(arg)
         default: return nil
         }
     }
 
+    public static let labels = ["red", "orange", "yellow", "green", "blue", "purple", "gray", "none"]
+
+    /// Canonical config id (round-trips through `init(id:)`).
     public var id: String {
         switch self {
-        case .forward(let n): return "nav.forward:\(n)"
-        case .backward(let n): return "nav.backward:\(n)"
-        case .moveTo(let target): return "file.move:\(target)"
-        case .copyTo(let target): return "file.copy:\(target)"
-        case .openWith(let app): return "file.open-with:\(app)"
+        case .jump(let n): return "nav.jump:\(n > 0 ? "+" : "")\(n)"
+        case .zoomSet(let f): return "zoom.set:\(f.formatted(.number.grouping(.never)))"
+        case .panEdge(let edge): return "pan.edge:\(edge.rawValue)"
+        case .move(let target): return "file.move:\(target)"
+        case .copy(let target): return "file.copy:\(target)"
+        case .openWith(let app): return "file.open_with:\(app)"
+        case .rate(let n): return "meta.rate:\(n)"
+        case .label(let color): return "meta.label:\(color)"
+        case .flag(let flag): return "meta.flag:\(flag)"
+        case .exec(let command): return "exec:\(command)"
         default: return Action.simple.first { $0.value == self }!.key
         }
     }
 
-    /// All parameterless ids, for help screens and validation messages.
+    /// Every parameterless id, for validation messages and the help overlay.
     public static var simpleIDs: [String] { simple.keys.sorted() }
 }
 
@@ -83,12 +127,15 @@ public struct KeyModifiers: OptionSet, Hashable, Sendable {
     public static let shift = KeyModifiers(rawValue: 1 << 3)
 }
 
-/// A key press independent of AppKit. `key` is a normalized name: a lowercase
-/// printable character ("a", "1", "/", "[") or a named key ("left", "right", "up",
-/// "down", "space", "return", "escape", "delete", "forward-delete", "tab", "home",
-/// "end", "page-up", "page-down", "f1"…"f12"). Shift is kept as a modifier for
-/// letters and named keys; for other characters the shifted character itself is
-/// the key (shift+/ is "?" with no `.shift`).
+/// A physical key press, independent of AppKit and of the active input method.
+///
+/// `key` is the *unshifted* character of the key in the current ASCII-capable
+/// layout ("a", "1", "/", "=") or a named key ("left", "right", "up", "down",
+/// "space", "return", "tab", "esc", "backspace", "forwarddelete", "home", "end",
+/// "pageup", "pagedown", "f1"…"f20", "kp0"…"kp9", "kp+", "kp-", "kp*", "kp/",
+/// "kp.", "kpenter"). Shift is always a modifier: `?` is `shift+/`, `G` is
+/// `shift+g`. Matching on the physical key keeps bindings working while a
+/// non-Latin input method (e.g. Korean 2-Set) is active.
 public struct KeyChord: Hashable, Sendable {
     public let key: String
     public let modifiers: KeyModifiers

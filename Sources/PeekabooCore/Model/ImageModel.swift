@@ -3,6 +3,9 @@ import Foundation
 import ImageIO
 
 /// One image file of the folder being browsed.
+///
+/// Identity is the file URL: two values for the same path are equal even when one
+/// was created before the file was stat'ed. Cache validity uses `version`.
 public struct ImageFile: Hashable, Sendable {
     public let url: URL
     public let name: String
@@ -19,6 +22,12 @@ public struct ImageFile: Hashable, Sendable {
         self.modified = modified
         self.fileID = fileID
     }
+
+    /// Changes whenever the file's contents may have changed (size or modification time).
+    public var version: String { "\(byteSize)-\(modified)" }
+
+    public static func == (a: ImageFile, b: ImageFile) -> Bool { a.url == b.url }
+    public func hash(into hasher: inout Hasher) { hasher.combine(url) }
 }
 
 /// Progressive quality tiers. Lower tiers arrive first and are replaced by higher ones.

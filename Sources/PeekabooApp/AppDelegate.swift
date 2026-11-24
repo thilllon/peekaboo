@@ -2,16 +2,19 @@ import AppKit
 import PeekabooCore
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var windows: [NSWindow] = []
+    private var viewer: ViewerWindowController?
     /// Paths opened during launch; AppKit may deliver argv paths *and* an
     /// open-documents event for the same file, so dedupe for a short window.
     private var recentlyOpened: [String: Date] = [:]
+    private var openedSomething = false
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = MainMenu.make()
-        // `Peekaboo <path>` from a terminal: start as early as possible.
+        // Build the window now so its creation overlaps the wait for the open-documents event.
+        viewer = ViewerWindowController()
+        // `Peekaboo <path>` from a terminal: start immediately.
         let paths = CommandLine.arguments.dropFirst().filter { FileManager.default.fileExists(atPath: $0) }
-        if !paths.isEmpty { open(urls: paths.map { URL(fileURLWithPath: $0) }) }
+        if !paths.isEmpty { open(paths.map { URL(fileURLWithPath: $0) }) }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -19,13 +22,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        open(urls: urls)
+        open(urls)
     }
 
     /// Stay resident after the last window closes so the next open is instant.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
-    private func open(urls: [URL]) {
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        if !hasVisibleWindows, openedSomething { viewer?.showWindow(nil) }
+        return true
+    }
+
+    private func open(_ urls: [URL]) {
         let now = Date()
         let fresh = urls.filter { url in
             let key = url.standardizedFileURL.path
@@ -33,17 +41,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             recentlyOpened[key] = now
             return true
         }
-        guard let first = fresh.first else { return }
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1280, height: 800),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered, defer: false)
-        window.titlebarAppearsTransparent = true
-        window.backgroundColor = .black
-        window.title = first.lastPathComponent
-        window.isReleasedWhenClosed = false
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        windows.append(window)
+        guard !fresh.isEmpty else { return }
+        openedSomething = true
+        if viewer == nil { viewer = ViewerWindowController() }
+        viewer?.open(fresh)
     }
 }
