@@ -294,6 +294,9 @@ Safety rules:
   folder, keeps the change for another try.
 - A read-only source or destination folder fails with a message such as `Cannot move IMG_0042.jpg:
   Permission denied`; nothing is moved or recorded. Messages name files and folders, not full paths.
+- A file locked in Finder (Get Info › Locked) is copied with its lock, and cannot be moved, on the same
+  volume or across volumes (`Cannot move IMG_0042.jpg: Operation not permitted (it is locked)`).
+  Undoing a copy of it unlocks the copy to put it in the Trash.
 
 `file.move:ask` (`m`) and `file.copy:ask` (`c`) open a menu of your slots. A slot whose name is one
 character (`1`…`9`, `k`, …) is chosen with that key. Return picks the previous destination, and `o`

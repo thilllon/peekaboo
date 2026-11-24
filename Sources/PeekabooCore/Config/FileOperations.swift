@@ -266,15 +266,24 @@ public final class FileOperations {
         guard Self.itemExists(url) else { return }
         // Never trash or delete a file that replaced the copy, or the copy after it was edited.
         try Self.check(stamp, at: url, missing: "is no longer there", since: "copied")
-        guard trashesUndoneCopies else {
-            do { try fm.removeItem(at: url) } catch { throw Failure("Cannot remove the copy: \(Self.reason(error))") }
-            return
-        }
+        // The copy of a locked file is locked too: unlock it to remove it, and lock it again if that fails.
+        let flags = Self.flags(url) ?? 0
+        let locked = flags & Self.lockFlags != 0
+        if locked { lchflags(url.path, flags & ~Self.lockFlags) }
         do {
-            try trashCopy(url)
+            if trashesUndoneCopies {
+                do {
+                    try trashCopy(url)
+                } catch {
+                    // Never delete it instead (a network share has no Trash): the copy may be the only one left.
+                    throw Failure("Cannot move the copy to the Trash: \(Self.reason(error))")
+                }
+            } else {
+                do { try fm.removeItem(at: url) } catch { throw Failure("Cannot remove the copy: \(Self.reason(error))") }
+            }
         } catch {
-            // Never delete it instead (a network share has no Trash): by now the copy may be the only one left.
-            throw Failure("Cannot move the copy to the Trash: \(Self.reason(error))")
+            if locked { lchflags(url.path, flags) }
+            throw error
         }
     }
 
@@ -326,13 +335,17 @@ public final class FileOperations {
                     // A file system without exclusive renames (some network volumes): check, then rename.
                     if itemExists(target) { continue }
                     if rename(source.path, target.path) == 0 { return .moved(target) }
-                    throw PlaceFailure(errno)
-                default: throw PlaceFailure(code)
+                    throw renameFailure(errno, source)
+                default: throw renameFailure(code, source)
                 }
             }
         }
         // What a move must find again after the copy before it may remove the original.
         let original = mode == .moveByCopying ? Snapshot(source) : nil
+        // A locked file cannot be removed, so it cannot be moved (as it cannot be renamed): say so before copying.
+        if let original, original.flags & (lockFlags | systemLockFlags) != 0 {
+            throw PlaceFailure(EPERM, hint: " (it is locked)")
+        }
         // Copy to a private name in the destination folder, then rename that exclusively into place: a failed
         // copy leaves nothing behind, and no existing file is ever written to.
         let temporary = folder.appendingPathComponent(".peekaboo-\(UUID().uuidString).tmp")
@@ -340,10 +353,15 @@ public final class FileOperations {
         // (It is not exclusive by itself, hence the private name.)
         if copyfile(source.path, temporary.path, nil, copyfile_flags_t(COPYFILE_CLONE)) != 0 {
             let code = errno
-            unlink(temporary.path)
+            discard(temporary)
             throw PlaceFailure(code)
         }
         if mode == .moveByCopying { afterCopyingForMove?(source) }
+        // The copy of a locked file is locked too, and could be neither renamed into place nor removed:
+        // unlock it until it is in place, then lock it like the original.
+        let copiedFlags = flags(temporary) ?? 0
+        let locked = copiedFlags & lockFlags != 0
+        if locked { lchflags(temporary.path, copiedFlags & ~lockFlags) }
         var n = 1
         var target: URL
         while true {
@@ -354,9 +372,10 @@ public final class FileOperations {
             let code = errno
             if code == EEXIST { continue }
             if code == ENOTSUP || code == EINVAL, !itemExists(target), rename(temporary.path, target.path) == 0 { break }
-            unlink(temporary.path)
+            discard(temporary)
             throw PlaceFailure(code)
         }
+        if locked { lchflags(target.path, copiedFlags) }
         guard mode == .moveByCopying else { return .copied(target) }
         // The copy is complete. Remove the original only if it is still the item that was copied, unchanged:
         // another app may have saved a new version meanwhile (a temporary file renamed over it), and removing
@@ -365,17 +384,42 @@ public final class FileOperations {
         if let original, now == original {
             if unlink(source.path) == 0 { return .moved(target) }
             let code = errno
-            unlink(target.path)
+            discard(target)
             let readOnly = code == EACCES || code == EPERM || code == EROFS
             throw PlaceFailure(code, hint: readOnly ? " (its folder is read-only: copy it instead)" : "")
         }
         if let original, let now, now.isSameItem(as: original) {
             // Written to while it was copied: the copy may hold parts of two versions. Keep only the original.
-            unlink(target.path)
+            discard(target)
             throw PlaceFailure(changed: "it changed while it was being copied (left as it is)")
         }
         // Replaced, renamed or removed meanwhile: the copy holds the version that was copied; leave the rest alone.
         return .copied(target)
+    }
+
+    /// Finder's "Locked" and append-only: a file with either can be neither renamed nor removed.
+    private static let lockFlags = UInt32(UF_IMMUTABLE | UF_APPEND)
+    /// The same set by the system, which no app can clear.
+    private static let systemLockFlags = UInt32(SF_IMMUTABLE | SF_APPEND)
+
+    /// The BSD flags of the item at `url` (not following a symbolic link).
+    private static func flags(_ url: URL) -> UInt32? {
+        var st = stat()
+        return lstat(url.path, &st) == 0 ? st.st_flags : nil
+    }
+
+    private static func isLocked(_ url: URL) -> Bool { (flags(url) ?? 0) & (lockFlags | systemLockFlags) != 0 }
+
+    /// Remove an item this code made (a temporary file, a copy), unlocking it first: the copy of a locked
+    /// file is locked too, and `unlink` alone would leave it behind.
+    private static func discard(_ url: URL) {
+        if let flags = flags(url), flags & lockFlags != 0 { lchflags(url.path, flags & ~lockFlags) }
+        unlink(url.path)
+    }
+
+    /// The failure of renaming `source`, saying so when it is locked.
+    private static func renameFailure(_ code: Int32, _ source: URL) -> PlaceFailure {
+        PlaceFailure(code, hint: code == EPERM && isLocked(source) ? " (it is locked)" : "")
     }
 
     /// `folder/name` for n = 1, else "stem n.ext".
@@ -431,6 +475,8 @@ public final class FileOperations {
         let stamp: Stamp
         let changeSeconds: Int
         let changeNanoseconds: Int
+        /// BSD file flags (`UF_IMMUTABLE` is Finder's "Locked").
+        let flags: UInt32
 
         init?(_ url: URL) {
             var st = stat()
@@ -438,6 +484,7 @@ public final class FileOperations {
             stamp = Stamp(st)
             changeSeconds = st.st_ctimespec.tv_sec
             changeNanoseconds = st.st_ctimespec.tv_nsec
+            flags = st.st_flags
         }
 
         /// The same file (volume and inode), whether or not it changed.

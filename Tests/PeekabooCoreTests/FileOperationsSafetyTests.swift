@@ -15,13 +15,20 @@ final class FileOperationsSafetyTests: XCTestCase {
     override func tearDownWithError() throws {
         FileOperations.afterCopyingForMove = nil
         FileOperations.movesByCopying = false
-        // Read-only folders left by a failed test would stop the removal.
+        // Read-only folders and locked files left by a failed test would stop the removal.
         if let walker = fm.enumerator(atPath: root.path) {
             for case let relative as String in walker {
-                try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: root.appendingPathComponent(relative).path)
+                let path = root.appendingPathComponent(relative).path
+                lchflags(path, 0)
+                try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
             }
         }
         try? fm.removeItem(at: root)
+    }
+
+    private func flags(_ url: URL) -> UInt32 {
+        var st = stat()
+        return lstat(url.path, &st) == 0 ? st.st_flags : 0
     }
 
     @discardableResult
@@ -366,6 +373,35 @@ final class FileOperationsSafetyTests: XCTestCase {
         XCTAssertEqual(ops.undoStack, [])
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: readOnly.path)
         XCTAssertEqual(try listing("readonly"), [])
+    }
+
+    func testLockedFilesCopyWithoutLeftoversAndAreNeverHalfMoved() throws {
+        let locked = try make("shoot/locked.jpg", "locked")
+        guard chflags(locked.path, UInt32(UF_IMMUTABLE)) == 0 else { throw XCTSkip("volume does not store file flags") }
+        let keep = root.appendingPathComponent("keep")
+        let ops = FileOperations()
+        ops.trashesUndoneCopies = false
+        // The copy is locked like the original, and no hidden temporary file stays behind.
+        let copy = keep.appendingPathComponent("locked.jpg")
+        XCTAssertEqual(try ops.copy(locked, toFolder: keep), .copied(from: locked, to: copy))
+        XCTAssertEqual(try listing("keep"), ["locked.jpg"])
+        XCTAssertEqual(flags(copy) & UInt32(UF_IMMUTABLE), UInt32(UF_IMMUTABLE))
+        XCTAssertEqual(try String(contentsOf: copy, encoding: .utf8), "locked")
+        // A second copy beside it gets the next name the same way.
+        XCTAssertEqual(try ops.copy(locked, toFolder: keep), .copied(from: locked, to: keep.appendingPathComponent("locked 2.jpg")))
+        // Undo removes the copies (a locked file could not be removed as it is).
+        _ = try ops.undo()
+        _ = try ops.undo()
+        XCTAssertEqual(try listing("keep"), [])
+
+        // A move fails as the rename of a locked file does, across volumes too, before anything is copied.
+        for mode in [FileOperations.Mode.move, .moveByCopying] {
+            XCTAssertThrowsError(try FileOperations.transfer(locked, toFolder: keep, mode: mode)) { error in
+                XCTAssertEqual("\(error)", "Cannot move locked.jpg: Operation not permitted (it is locked)")
+            }
+        }
+        XCTAssertEqual(try listing("keep"), [])
+        XCTAssertEqual(try listing("shoot"), ["locked.jpg"])
     }
 
     func testMoveAcrossVolumesCopiesThenRemovesTheOriginal() throws {
