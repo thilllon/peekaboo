@@ -29,7 +29,8 @@ public enum Action: Hashable, Sendable {
     case flag(String)
     // app
     case undo, redo, config, reloadConfig, escape, close, quit, open, makeDefault
-    /// Shell template with `{path} {dir} {name} {stem} {ext} {index} {count}` placeholders (each shell-quoted).
+    /// Shell template with `{path} {dir} {name} {stem} {ext} {index} {count}` placeholders; each becomes a quoted
+    /// `${PEEKABOO_*}` reference and the values travel through the environment, never through the shell string.
     case exec(String)
     /// Explicitly unbound.
     case none
