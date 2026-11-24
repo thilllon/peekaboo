@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# CLI launcher: `peekaboo <image-or-folder> ...` — hands paths to the (possibly
+# already running) app as open-document events, so a resident instance opens instantly.
+set -euo pipefail
+if [[ $# -eq 0 ]]; then exec open -a Peekaboo; fi
+exec open -a Peekaboo "$@"
