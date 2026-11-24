@@ -187,15 +187,41 @@ final class FileActions {
             folder = resolved
         }
         let existed = FileManager.default.fileExists(atPath: folder.path)
-        do {
-            let change = copy ? try operations.copy(context.file.url, toFolder: folder)
-                : try operations.move(context.file.url, toFolder: folder)
+        let file = context.file
+        func toast(for change: FileOperations.Change) -> String {
+            var text = "\(copy ? "Copied" : "Moved") to \(folder.lastPathComponent)"
+            switch change {
+            case .moved(_, let to), .copied(_, let to):
+                if to.lastPathComponent != file.name { text += " as \(to.lastPathComponent)" }
+            default: break
+            }
+            return text + (existed ? "" : " (new folder)") + " · ⌘Z"
+        }
+        // A copy, or a move to another volume, moves bytes: do it off the main thread. The viewer advances
+        // at once; the change joins the undo stack when it completes, and a failure puts the file back.
+        if copy || FileOperations.crossesVolumes(file.url, folder) {
             lastDestination = folder
-            var toast = "\(copy ? "Copied" : "Moved") to \(folder.lastPathComponent)"
-            if case .moved(_, let to) = change, to.lastPathComponent != context.file.name { toast += " as \(to.lastPathComponent)" }
-            if case .copied(_, let to) = change, to.lastPathComponent != context.file.name { toast += " as \(to.lastPathComponent)" }
-            if !existed { toast += " (new folder)" }
-            return FileActionResult(outcome: copy ? .unchanged : .removed(context.file), toast: toast + " · ⌘Z")
+            let owner = WeakFileActions(self)
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = Result { try FileOperations.transfer(file.url, toFolder: folder, copy: copy) }
+                DispatchQueue.main.async {
+                    guard let actions = owner.value else { return }
+                    switch result {
+                    case .success(let change):
+                        actions.operations.record(change)
+                        if !copy { actions.onLateResult?(FileActionResult(toast: toast(for: change))) }
+                    case .failure(let error):
+                        actions.onLateResult?(FileActionResult(outcome: copy ? .unchanged : .restored(file), toast: "\(error)"))
+                    }
+                }
+            }
+            return FileActionResult(outcome: copy ? .unchanged : .removed(file),
+                                    toast: copy ? "Copied to \(folder.lastPathComponent) · ⌘Z" : "Moving to \(folder.lastPathComponent)…")
+        }
+        do {
+            let change = try operations.move(file.url, toFolder: folder)
+            lastDestination = folder
+            return FileActionResult(outcome: .removed(file), toast: toast(for: change))
         } catch {
             return FileActionResult(toast: "\(error)")
         }

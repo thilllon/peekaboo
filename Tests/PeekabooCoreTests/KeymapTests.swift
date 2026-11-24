@@ -139,6 +139,20 @@ final class KeymapTests: XCTestCase {
         }
     }
 
+    func testResolveIsCheap() throws {
+        let map = try config("[keymap]\nvim = true\n").keymap
+        let hit = seq("shift+3"), miss = seq("ctrl+opt+f19"), prefix = seq("g")
+        let started = Trace.now()
+        for _ in 0..<10_000 {
+            _ = map.resolve(hit, context: .zoomed)
+            _ = map.resolve(miss, context: .zoomed)
+            _ = map.resolve(prefix, context: .normal)
+        }
+        let perCall = Trace.ms(since: started) * 1000 / 30_000
+        print("Keymap.resolve: \(String(format: "%.2f", perCall)) µs per call (hit, miss and prefix mixed)")
+        XCTAssertLessThan(perCall, 100)
+    }
+
     func testResolveTreatsStoredNoneAsUnbound() {
         var map = Keymap.default
         map.bindings[.zoomed]?[seq("space")] = [.none]

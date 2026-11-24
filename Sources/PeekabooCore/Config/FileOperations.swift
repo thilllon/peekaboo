@@ -52,7 +52,7 @@ public final class FileOperations {
     /// Move into `folder` (created if missing); a name collision becomes "name 2.ext".
     @discardableResult
     public func move(_ url: URL, toFolder folder: URL) throws -> Change {
-        let change = try transfer(url, toFolder: folder, copy: false)
+        let change = try Self.transfer(url, toFolder: folder, copy: false)
         record(change)
         return change
     }
@@ -60,7 +60,7 @@ public final class FileOperations {
     /// Copy into `folder` (created if missing); a name collision becomes "name 2.ext".
     @discardableResult
     public func copy(_ url: URL, toFolder folder: URL) throws -> Change {
-        let change = try transfer(url, toFolder: folder, copy: true)
+        let change = try Self.transfer(url, toFolder: folder, copy: true)
         record(change)
         return change
     }
@@ -112,9 +112,9 @@ public final class FileOperations {
             case .trashed(let original, _):
                 redone = try performTrash(original)
             case .moved(let from, let to):
-                redone = try transfer(from, toFolder: to.deletingLastPathComponent(), copy: false)
+                redone = try Self.transfer(from, toFolder: to.deletingLastPathComponent(), copy: false)
             case .copied(let from, let to):
-                redone = try transfer(from, toFolder: to.deletingLastPathComponent(), copy: true)
+                redone = try Self.transfer(from, toFolder: to.deletingLastPathComponent(), copy: true)
             case .tagged(let url, let before, let after):
                 try Self.write(after, to: url)
                 redone = .tagged(url, before: before, after: after)
@@ -127,7 +127,8 @@ public final class FileOperations {
         }
     }
 
-    private func record(_ change: Change) {
+    /// Push a change made elsewhere (e.g. a cross-volume move finished on a background queue) onto the undo stack.
+    public func record(_ change: Change) {
         undoStack.append(change)
         redoStack.removeAll()
     }
@@ -143,7 +144,9 @@ public final class FileOperations {
         return .trashed(original: url, trashed: trashed)
     }
 
-    private func transfer(_ url: URL, toFolder folder: URL, copy: Bool) throws -> Change {
+    /// Move or copy into `folder` without recording it (thread-safe; `record(_:)` it on the owning thread).
+    public static func transfer(_ url: URL, toFolder folder: URL, copy: Bool) throws -> Change {
+        let fm = FileManager.default
         let folder = folder.standardizedFileURL
         if !copy, folder.path == url.deletingLastPathComponent().standardizedFileURL.path {
             throw Failure("\(url.lastPathComponent) is already in \(folder.lastPathComponent)")
@@ -154,7 +157,7 @@ public final class FileOperations {
             if copy { try fm.copyItem(at: url, to: target) } else { try fm.moveItem(at: url, to: target) }
             return copy ? .copied(from: url, to: target) : .moved(from: url, to: target)
         } catch {
-            throw Failure("Cannot \(copy ? "copy" : "move") \(url.lastPathComponent): \(Self.reason(error))")
+            throw Failure("Cannot \(copy ? "copy" : "move") \(url.lastPathComponent): \(reason(error))")
         }
     }
 
@@ -190,6 +193,22 @@ public final class FileOperations {
     }
 
     // MARK: Destinations
+
+    /// Whether moving `url` into `folder` crosses volumes (a copy plus delete rather than a rename).
+    /// A folder that does not exist yet is judged by its nearest existing parent.
+    public static func crossesVolumes(_ url: URL, _ folder: URL) -> Bool {
+        func volume(_ start: URL) -> NSObject? {
+            var probe = start.standardizedFileURL
+            while true {
+                if let id = (try? probe.resourceValues(forKeys: [.volumeIdentifierKey]))?.volumeIdentifier as? NSObject { return id }
+                let parent = probe.deletingLastPathComponent()
+                if parent.path == probe.path { return nil }
+                probe = parent
+            }
+        }
+        guard let a = volume(url), let b = volume(folder) else { return false }
+        return !a.isEqual(b)
+    }
 
     /// A target is a path (rather than a slot name) when it contains "/" or starts with "~" or ".".
     public static func isPathLike(_ target: String) -> Bool {

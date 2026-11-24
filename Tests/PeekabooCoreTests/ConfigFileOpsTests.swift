@@ -128,6 +128,19 @@ final class ConfigFileOpsTests: XCTestCase {
         XCTAssertTrue(exists(root.appendingPathComponent("shoot/_rejects/IMG_9.jpg")))
     }
 
+    func testBackgroundTransferJoinsTheUndoStack() throws {
+        let photo = try make("shoot/bg.jpg")
+        let folder = root.appendingPathComponent("elsewhere")
+        XCTAssertFalse(FileOperations.crossesVolumes(photo, folder), "same volume, folder not created yet")
+        let ops = FileOperations()
+        let change = try FileOperations.transfer(photo, toFolder: folder, copy: false)
+        XCTAssertTrue(ops.undoStack.isEmpty)
+        ops.record(change)
+        _ = try ops.undo()
+        XCTAssertTrue(exists(photo))
+        XCTAssertFalse(exists(folder.appendingPathComponent("bg.jpg")))
+    }
+
     func testAvailableNames() throws {
         let folder = root.appendingPathComponent("shoot")
         XCTAssertEqual(FileOperations.availableURL(for: "x.jpg", in: folder).lastPathComponent, "x.jpg")

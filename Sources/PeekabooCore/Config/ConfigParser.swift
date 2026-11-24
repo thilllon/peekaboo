@@ -107,11 +107,29 @@ private struct ConfigReader {
             case "keymap.defaults": if let v = bool(entry) { keymapDefaults = v; config.keymapDefaults = v }
             case "keymap.vim": if let v = bool(entry) { vim = v; config.vimKeys = v }
             default:
-                fail(entry, "unknown key \"\(name)\"")
+                fail(entry, "unknown key \"\(name)\"\(Self.keyHint(path))")
             }
         }
         config.keymap = buildKeymap(keyEntries, defaults: keymapDefaults, vim: vim, autoAdvance: autoAdvance)
         return config
+    }
+
+    /// Every settings key, for hints about misplaced keys.
+    private static let settingKeys = [
+        "view.background", "view.keep_zoom", "view.zoom_step", "view.refine_delay_ms", "fullscreen.mode",
+        "fullscreen.avoid_notch", "hud.mode", "cache.memory_mb", "rating.storage", "rating.star",
+        "rating.auto_advance", "keymap.defaults", "keymap.vim",
+    ]
+
+    /// ` (it belongs under [view])` for a known key in the wrong table, ` (key bindings go under [keys])`
+    /// for a chord outside `[keys]`.
+    private static func keyHint(_ path: [String]) -> String {
+        guard let last = path.last else { return "" }
+        if let home = settingKeys.first(where: { $0.hasSuffix("." + last) }) {
+            return " (it belongs under [\(home.split(separator: ".")[0])])"
+        }
+        if path.count == 1, KeyChord.sequence(spec: last) != nil { return " (key bindings go under [keys])" }
+        return ""
     }
 
     // MARK: Keys

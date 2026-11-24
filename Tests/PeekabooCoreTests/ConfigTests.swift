@@ -126,6 +126,9 @@ final class ConfigTests: XCTestCase {
             "config.toml:15: unknown key \"keys.other.a\" (bindings go in [keys] or [keys.zoomed])",
         ])
         XCTAssertEqual(errors("a = \n"), ["config.toml:1: expected a value"])
+        XCTAssertEqual(errors("background = \"gray\"\n"), ["config.toml:1: unknown key \"background\" (it belongs under [view])"])
+        XCTAssertEqual(errors("[hud]\nvim = true\n"), ["config.toml:2: unknown key \"hud.vim\" (it belongs under [keymap])"])
+        XCTAssertEqual(errors("\"k\" = \"nav.next\"\n"), ["config.toml:1: unknown key \"k\" (key bindings go under [keys])"])
         XCTAssertEqual(errors("[keys]\n\"1\" = \"meta.rate:9\"\n"), ["config.toml:2: unknown action \"meta.rate:9\" (check its argument)"])
         XCTAssertEqual(errors("[keys]\n\"1\" = [\"none\", \"nav.next\"]\n"), ["config.toml:2: \"none\" cannot be part of an action list"])
     }
