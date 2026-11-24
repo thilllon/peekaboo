@@ -136,6 +136,37 @@ func runRenderBench(_ args: ArraySlice<String>) throws {
     }
     print(String(format: "fit, screen tier %dx%d: settle frame %.3f ms (%@)", screen.pixels.width, screen.pixels.height,
                  median(times), tiered.lastPath))
+
+    // Next / previous image: `prepare` pre-renders the fit canvas, so the first frame after `setImage` only presents.
+    var firstFrames: [Double] = [], rasterised = 0
+    for i in 0..<frames {
+        let next = DecodedImage(pixels: image.pixels, tier: .full, fullWidth: image.fullWidth, fullHeight: image.fullHeight,
+                                orientation: image.orientation, isHDR: false, decodeNanos: 0)
+        tiered.prepare(next)
+        let until = Date().addingTimeInterval(10)
+        while !tiered.isPyramidComplete(for: next) && Date() < until { RunLoop.main.run(until: Date().addingTimeInterval(0.001)) }
+        tiered.setImage(next, key: "next-\(i)")
+        _ = tiered.renderOffscreen(format: .bgra8Unorm, reuseTarget: true)
+        firstFrames.append(tiered.lastFrameGPUms)
+        if tiered.lastFrameRasterised { rasterised += 1 }
+    }
+    print(String(format: "next image after prepare(): first frame %.3f ms (%@, %d/%d rasterised)", median(firstFrames),
+                 tiered.lastPath, rasterised, frames))
+
+    // Main-thread cost of `setImage` for an uncommon ICC profile (first sight: the probe used to run here).
+    if let adobe = CGColorSpace(name: CGColorSpace.adobeRGB1998) {
+        let px = image.pixels
+        let pixels = PixelBuffer(width: px.width, height: px.height, bytesPerRow: px.bytesPerRow, layout: px.layout, alpha: px.alpha,
+                                 colorSpace: adobe, storage: px.storage)
+        let probeImage = DecodedImage(pixels: pixels, tier: .full, fullWidth: image.fullWidth, fullHeight: image.fullHeight,
+                                      orientation: image.orientation, isHDR: false, decodeNanos: 0)
+        let viewer = Renderer(layer: CAMetalLayer())
+        viewer.setViewSize(CGSize(width: size.0, height: size.1), backingScale: 1)
+        let t0 = Trace.now()
+        viewer.setImage(probeImage, key: "adobe")
+        let setMs = Trace.ms(since: t0)
+        print(String(format: "setImage, Adobe RGB (1998) first sight: main thread %.3f ms (ICC probe runs off the main thread)", setMs))
+    }
 }
 
 /// Write a `bgra8Unorm` frame (Display P3 encoded) as PNG, for eyeballing the renderer's output.

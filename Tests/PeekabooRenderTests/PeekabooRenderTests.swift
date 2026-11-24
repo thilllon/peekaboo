@@ -402,7 +402,9 @@ final class PeekabooRenderTests: XCTestCase {
         r.setViewSize(CGSize(width: 50, height: 40), backingScale: 1)
         r.setImage(image, key: "hdr")
         XCTAssertEqual(layer.pixelFormat, .rgba16Float)
-        XCTAssertTrue(layer.wantsExtendedDynamicRangeContent)
+        XCTAssertEqual(layer.preferredDynamicRange, .high)
+        XCTAssertEqual(layer.contentsHeadroom, Renderer.hdrHeadroom)
+        XCTAssertGreaterThan(layer.contentsHeadroom, 1)
         let c = render(r)[x: 25, y: 20]
         XCTAssertEqual(c.x, 3.0, accuracy: 0.01)
         XCTAssertEqual(c.y, 0.5, accuracy: 0.01)
@@ -410,6 +412,150 @@ final class PeekabooRenderTests: XCTestCase {
         // Back to SDR for an SDR image.
         r.setImage(makeImage(width: 8, height: 8) { _, _ in SIMD4(1, 2, 3, 255) }, key: "sdr")
         XCTAssertEqual(layer.pixelFormat, .bgra8Unorm)
+        XCTAssertEqual(layer.preferredDynamicRange, .standard)
+        XCTAssertEqual(layer.contentsHeadroom, 0)
+    }
+
+    // MARK: Present latency
+
+    /// Discrete updates present immediately (13.6 → 5.9 ms median present latency); gestures and animations keep
+    /// display sync so continuous motion does not tear.
+    func testPresentModeFollowsInteraction() {
+        let layer = CAMetalLayer()
+        let r = Renderer(layer: layer)
+        r.setViewSize(CGSize(width: 64, height: 48), backingScale: 1)
+        r.setImage(makeImage(width: 64, height: 48, fill: pattern), key: "p")
+        XCTAssertFalse(layer.displaySyncEnabled, "image swaps present immediately")
+        _ = render(r)
+        XCTAssertFalse(r.lastFrameDisplaySync)
+        r.beginInteraction()
+        XCTAssertTrue(layer.displaySyncEnabled, "gestures are vsync-aligned")
+        r.zoom(by: 1.2, anchor: CGPoint(x: 32, y: 24))
+        _ = render(r)
+        XCTAssertTrue(r.lastFrameDisplaySync)
+        r.endInteraction()
+        XCTAssertFalse(layer.displaySyncEnabled, "the refine pass after a gesture is discrete")
+        r.isAnimating = true
+        XCTAssertTrue(layer.displaySyncEnabled)
+        r.isAnimating = false
+        XCTAssertFalse(layer.displaySyncEnabled)
+        r.rotate(clockwise: true)
+        _ = render(r)
+        XCTAssertFalse(r.lastFrameDisplaySync, "a single rotate step is discrete")
+        XCTAssertEqual(layer.maximumDrawableCount, 3)
+    }
+
+    // MARK: Prepared neighbours
+
+    /// `prepare` pre-renders the fit canvas: showing the image is a present-only frame with the same pixels as a
+    /// freshly rasterised one; a resize invalidates it.
+    func testPreparedFitCanvasIsPresentOnly() {
+        let r = makeRenderer(width: 300, height: 200)
+        let first = makeImage(width: 900, height: 600, fill: pattern)
+        r.setImage(first, key: "first")
+        _ = render(r)
+        let next = makeImage(width: 1000, height: 700) { x, y in self.pattern(y, x) }
+        r.prepare(next)
+        waitForPyramid(r, next)
+        r.setImage(next, key: "next")
+        let prepared = render(r)
+        XCTAssertEqual(r.lastPath, "canvas")
+        XCTAssertFalse(r.lastFrameRasterised, "the prepared fit canvas is presented as is")
+        r.discardCanvas()
+        let fresh = render(r)
+        XCTAssertTrue(r.lastFrameRasterised)
+        var maxDiff = 0.0
+        for i in 0..<fresh.px.count { let a = fresh.px[i], b = prepared.px[i]; let d = SIMD4<Double>(a.x - b.x, a.y - b.y, a.z - b.z, a.w - b.w); maxDiff = max(maxDiff, abs(d.x), abs(d.y), abs(d.z), abs(d.w)) }
+        XCTAssertLessThan(maxDiff, 1e-3, "prepared and fresh fit canvases match")
+
+        // Going back to the first image (prepared again) and a resize in between: the stale canvas is not used.
+        r.prepare(first)
+        waitForPyramid(r, first)
+        r.setViewSize(CGSize(width: 320, height: 200), backingScale: 1)
+        r.setImage(first, key: "first")
+        let resized = render(r)
+        XCTAssertEqual(r.lastPath, "canvas")
+        XCTAssertTrue(r.lastFrameRasterised, "a resize invalidates prepared canvases")
+        XCTAssertEqual(resized.width, 320)
+    }
+
+    // MARK: Colour management off the main thread
+
+    /// An uncommon ICC profile is probed on a background queue: `setImage` returns at once (fallback colours), and
+    /// the frame after the probe lands is colour managed exactly like the synchronous probe.
+    func testUncommonProfileIsProbedOffTheMainThread() throws {
+        let space = try XCTUnwrap(CGColorSpace(name: CGColorSpace.adobeRGB1998))
+        let image = makeImage(width: 64, height: 48, space: space) { _, _ in SIMD4(40, 180, 90, 255) }
+        let r = makeRenderer(width: 64, height: 48)
+        let start = Trace.now()
+        r.setImage(image, key: "adobe")
+        let setMs = Trace.ms(since: start)
+        _ = render(r)   // drawn with the fallback until the probe lands
+        let deadline = Date().addingTimeInterval(5)
+        while !r.isColorReady(for: image) && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.002)) }
+        XCTAssertTrue(r.isColorReady(for: image), "probe finished")
+        let c = render(r)[x: 32, y: 24]
+        let probeStart = Trace.now()
+        let expected = try XCTUnwrap(ColorTransform.probe(space))
+        let probeMs = Trace.ms(since: probeStart)
+        func dec(_ v: UInt8) -> Float {
+            let i = min(Int((Float(v) / 255 * Float(expected.lut.count - 1)).rounded()), expected.lut.count - 1)
+            return expected.curve == .table ? expected.lut[i] : Float(v) / 255
+        }
+        let lin = SIMD3<Float>(dec(40), dec(180), dec(90))
+        let p3 = SIMD3((expected.rows.0 * lin).sum(), (expected.rows.1 * lin).sum(), (expected.rows.2 * lin).sum())
+        XCTAssertEqual(c.x, Double(p3.x), accuracy: 3e-3)
+        XCTAssertEqual(c.y, Double(p3.y), accuracy: 3e-3)
+        XCTAssertEqual(c.z, Double(p3.z), accuracy: 3e-3)
+        print(String(format: "setImage with an unprobed profile: %.3f ms on the main thread (the synchronous probe it "
+                     + "replaces: %.3f ms)", setMs, probeMs))
+    }
+
+    /// Embedded sRGB and Display P3 profiles (unnamed ICC spaces, as decoded from most photos) are recognised as the
+    /// sRGB curve with snapped primaries, so 8-bit tiers use `_srgb` views and the fast HQ path; Adobe RGB is not.
+    func testEmbeddedSRGBProfilesUseTheSRGBCurve() throws {
+        for name in [CGColorSpace.sRGB, CGColorSpace.displayP3] {
+            let data = try XCTUnwrap(CGColorSpace(name: name)?.copyICCData())
+            let embedded = try XCTUnwrap(CGColorSpace(iccData: data))
+            let t = try XCTUnwrap(ColorTransform.probe(embedded))
+            XCTAssertEqual(t.curve, .srgb, "\(name)")
+            let expected = name == CGColorSpace.sRGB ? ColorTransform.srgbToP3Rows : ColorTransform.identityRows
+            XCTAssertEqual(t.rows.0, expected.0)
+            XCTAssertEqual(t.rows.1, expected.1)
+            XCTAssertEqual(t.rows.2, expected.2)
+        }
+        let adobe = try XCTUnwrap(ColorTransform.probe(XCTUnwrap(CGColorSpace(name: CGColorSpace.adobeRGB1998))))
+        XCTAssertNotEqual(adobe.curve, .srgb)
+        // Gamma 2.2 is close to, but not, the sRGB curve.
+        var gamma = [Float](repeating: 0, count: 1024)
+        for i in 0..<1024 { gamma[i] = Float(pow(Double(i) / 1023, 2.2)) }
+        XCTAssertFalse(ColorTransform.matchesSRGBCurve(gamma))
+    }
+
+    /// The first image with an embedded sRGB profile (probed off the main thread) ends up on the `_srgb` fast path
+    /// with the same pixels as a named sRGB image.
+    func testFirstSightEmbeddedSRGBMatchesNamedSRGB() throws {
+        // No other test shows an embedded sRGB profile, so this is its first sight in the process.
+        let data = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB)?.copyICCData())
+        let embedded = try XCTUnwrap(CGColorSpace(iccData: data))
+        let image = makeImage(width: 400, height: 300, space: embedded, fill: pattern)
+        let reference = makeImage(width: 400, height: 300, fill: pattern)
+        let r = makeRenderer(width: 230, height: 170)
+        r.setImage(image, key: "embedded")
+        let deadline = Date().addingTimeInterval(5)
+        while !r.isColorReady(for: image) && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.002)) }
+        XCTAssertTrue(r.isColorReady(for: image))
+        waitForPyramid(r, image)
+        let a = render(r)
+        r.setImage(reference, key: "named")
+        waitForPyramid(r, reference)
+        let b = render(r)
+        var maxDiff = 0.0
+        for i in 0..<a.px.count {
+            let p = a.px[i], q = b.px[i]
+            maxDiff = max(maxDiff, abs(p.x - q.x), abs(p.y - q.y), abs(p.z - q.z))
+        }
+        XCTAssertLessThan(maxDiff, 2e-3, "embedded sRGB renders like named sRGB")
     }
 
     // MARK: Robustness
