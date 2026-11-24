@@ -61,8 +61,9 @@ struct LaneLimits: Sendable, Equatable {
 /// The main thread replaces the queued set on every replan (`submit`), which cancels queued work instantly;
 /// running decodes cannot be aborted and finish normally. Workers pick the best runnable job under the lock:
 /// - visible jobs may use every decode lane, including the reserved one (and one slot above the CPU/general caps);
-/// - prefetch waits while any visible job is queued or running (foreground gate), never holds the reserved
-///   lane and respects the per-resource caps (hardware engines ≤ 2, general ImageIO ≤ 4, CPU fills the rest);
+/// - prefetch waits while any visible decode is queued or running (foreground gate; QuickLook probes excluded),
+///   never holds the reserved lane and respects the per-resource caps (hardware engines ≤ 2, general ImageIO ≤ 4,
+///   CPU fills the rest);
 /// - sweep jobs run on their own utility lanes only while no decode-lane work is queued or gated.
 final class DecodeScheduler: @unchecked Sendable {
     private struct Active {
@@ -86,12 +87,23 @@ final class DecodeScheduler: @unchecked Sendable {
     private let limits: LaneLimits
     private let decoder: ImageDecoder
     private let pool: PixelBufferPool
+    private let quickLook: QuickLookSource
     private let deliver: @Sendable (DecodeOutcome) -> Void
 
+    /// Where QuickLook previews come from (`systemQuickLook`; a seam for tests).
+    typealias QuickLookSource = @Sendable (_ url: URL, _ longSide: Int, _ info: ImageInfo?, _ pool: PixelBufferPool,
+                                           _ timeout: TimeInterval) -> DecodedImage?
+
+    static let systemQuickLook: QuickLookSource = { url, longSide, info, pool, timeout in
+        QuickLookPreview.preview(url, longSide: longSide, info: info, pool: pool, timeout: timeout)
+    }
+
     init(decoder: ImageDecoder, pool: PixelBufferPool, limits: LaneLimits,
+         quickLook: @escaping QuickLookSource = DecodeScheduler.systemQuickLook,
          deliver: @escaping @Sendable (DecodeOutcome) -> Void) {
         self.decoder = decoder
         self.pool = pool
+        self.quickLook = quickLook
         self.limits = limits
         self.deliver = deliver
         for n in 0..<max(1, limits.decodeLanes) {
@@ -251,8 +263,7 @@ final class DecodeScheduler: @unchecked Sendable {
         if job.quickLook {
             // Full size for layout comes from the metadata; QuickLook applies the EXIF orientation itself.
             let preview = autoreleasepool {
-                QuickLookPreview.preview(url, longSide: job.targetLongSide, info: job.info, pool: pool,
-                                         timeout: job.kind == .visible ? 0.5 : 2)
+                quickLook(url, job.targetLongSide, job.info, pool, job.kind == .visible ? 0.5 : 2)
             }
             result = preview.map { .success($0) } ?? .failure(QuickLookPreview.Miss())
         } else {
@@ -267,9 +278,14 @@ final class DecodeScheduler: @unchecked Sendable {
                              concurrency: concurrency)
     }
 
+    /// The visible image's own decodes are queued or running. A QuickLook probe does not count: it waits on
+    /// QuickLook's processes (up to 0.5 s) without using a decode resource, and holding prefetch back for it would
+    /// delay the neighbours long after the visible image is sharp.
     private var foregroundBusyLocked: Bool {
-        if queued.values.contains(where: { $0.kind == .visible }) { return true }
-        for key in visibleKeys where active[key]?.running == true { return true }
+        if queued.values.contains(where: { $0.kind == .visible && !$0.quickLook }) { return true }
+        for key in visibleKeys {
+            if let entry = active[key], entry.running, !entry.job.quickLook { return true }
+        }
         return false
     }
 

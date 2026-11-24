@@ -155,14 +155,20 @@ public final class ImagePipeline {
     /// Pixels the cache let go of, freed off the main thread.
     private let releaser = Releaser()
 
-    public init(decoder: ImageDecoder, pool: PixelBufferPool, config: PipelineConfig = PipelineConfig()) {
+    public convenience init(decoder: ImageDecoder, pool: PixelBufferPool, config: PipelineConfig = PipelineConfig()) {
+        self.init(decoder: decoder, pool: pool, config: config, quickLook: DecodeScheduler.systemQuickLook)
+    }
+
+    /// `quickLook`: where QuickLook previews come from (tests substitute it).
+    init(decoder: ImageDecoder, pool: PixelBufferPool, config: PipelineConfig,
+         quickLook: @escaping DecodeScheduler.QuickLookSource) {
         self.decoder = decoder
         self.pool = pool
         self.config = config
         costs.alpha = config.tuning.alpha
         let box = WeakPipeline()
         let inbox = self.inbox
-        scheduler = DecodeScheduler(decoder: decoder, pool: pool, limits: config.laneLimits) { outcome in
+        scheduler = DecodeScheduler(decoder: decoder, pool: pool, limits: config.laneLimits, quickLook: quickLook) { outcome in
             inbox.push(outcome)
             DispatchQueue.main.async { box.pipeline?.drainInbox() }
         }
@@ -389,8 +395,11 @@ public final class ImagePipeline {
 
         var jobs: [DecodeJob] = []
         jobs.reserveCapacity(plan.jobs.count)
+        // The visible image's decodes gate prefetch only until it is sharp: a preview still decoding after the screen
+        // tier landed is of no use and must not hold back the neighbours.
         let current = files[index].url
-        let visible: Set<JobKey> = [JobKey(url: current, tier: .preview), JobKey(url: current, tier: .screen)]
+        let visible: Set<JobKey> = isCached(index, .screen) ? []
+            : [JobKey(url: current, tier: .preview), JobKey(url: current, tier: .screen)]
         for planned in plan.jobs {
             let j = planned.index
             let file = files[j]
@@ -488,7 +497,8 @@ public final class ImagePipeline {
                 costs.record(family: family(i), megapixels: CostModel.megapixels(slots[i].info), tier: key.tier,
                              ms: outcome.wallMs, concurrency: outcome.concurrency)
             }
-            guard keep(i, key.tier) else { stats.wasted += 1; return }
+            // A QuickLook preview that lands after a sharp tier is of no use, even for the image on screen.
+            guard keep(i, key.tier), !(outcome.job.quickLook && isCached(i, .screen)) else { stats.wasted += 1; return }
             if outcome.job.quickLook { stats.quickLookPreviews += 1 }
             insert(image, at: i, tier: key.tier)
             onDecoded?(file, image)

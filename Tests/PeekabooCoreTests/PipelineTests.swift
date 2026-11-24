@@ -98,13 +98,21 @@ class PipelineTestCase: XCTestCase {
     }
 
     func makePipeline(_ decoder: ImageDecoder, configure: (inout PipelineConfig) -> Void = { _ in }) -> ImagePipeline {
+        makePipeline(decoder, quickLook: nil, configure: configure)
+    }
+
+    /// `quickLook` replaces QuickLook's thumbnail generator (for `quickLookSweep = true`).
+    func makePipeline(_ decoder: ImageDecoder, quickLook: DecodeScheduler.QuickLookSource?,
+                      configure: (inout PipelineConfig) -> Void = { _ in }) -> ImagePipeline {
         var config = PipelineConfig(screenLongSide: 1024, previewLongSide: 256, memoryBudget: 1 << 30)
         config.readAhead = false
         config.monitorsMemoryPressure = false
         config.sweepLanes = 0
         config.quickLookSweep = false
         configure(&config)
-        return ImagePipeline(decoder: decoder, pool: PixelBufferPool(device: device), config: config)
+        let pool = PixelBufferPool(device: device)
+        if let quickLook { return ImagePipeline(decoder: decoder, pool: pool, config: config, quickLook: quickLook) }
+        return ImagePipeline(decoder: decoder, pool: pool, config: config)
     }
 
     @discardableResult
