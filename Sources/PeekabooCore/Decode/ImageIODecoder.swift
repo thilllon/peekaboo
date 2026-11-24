@@ -60,7 +60,8 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
         }
         switch info.typeIdentifier {
         case "public.heic", "public.heif", "public.avif", "public.heics", "public.avci", "public.avis": return .hardware
-        case "com.canon.cr3-raw-image": return tier == .full ? .general : .hardware
+        // CR3 previews are embedded JPEG/HEVC (hardware); larger tiers may need a RAW decode.
+        case "com.canon.cr3-raw-image": return tier == .preview ? .hardware : .general
         default: return .general
         }
     }
