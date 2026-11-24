@@ -21,6 +21,9 @@ import IOSurface
 public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     public init() {}
 
+    /// Parsed metadata per file version: `probe` and the decodes of every tier share one parse.
+    let probes = ProbeCache()
+
     /// Decode gain-map images (`hasGainMap`) to HDR (`kCGImageSourceDecodeToHDR`, extended-linear
     /// Display P3 `.rgba16f`, `isHDR = true`) for `.screen`/`.full`. Off by default: the HDR rendition
     /// costs 8–12× the SDR decode (gain-map application plus a converting draw; see
@@ -38,7 +41,7 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     static let previewAspectTolerance = 0.01
 
     public func probe(_ url: URL) throws -> ImageInfo {
-        try autoreleasepool { try ImageProbe(url: url).info }
+        try autoreleasepool { try ImageProbe.make(url: url, cache: probes).info }
     }
 
     public func lane(for url: URL, info: ImageInfo?, tier: Tier) -> DecodeLane {
@@ -69,7 +72,7 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     public func decode(_ url: URL, tier: Tier, targetLongSide: Int, pool: PixelBufferPool) throws -> DecodedImage {
         let start = Trace.now()
         return try autoreleasepool {
-            let probe = try ImageProbe(url: url)
+            let probe = try ImageProbe.make(url: url, cache: probes)
             let target = tier == .full ? 0 : max(16, targetLongSide)
             let output = try decode(probe, url: url, tier: tier, target: target, pool: pool)
             let nanos = Trace.now() - start

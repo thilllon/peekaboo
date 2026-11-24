@@ -55,10 +55,15 @@ func runDecodeBench(_ args: ArraySlice<String>) throws {
         var outs: [String] = []
         var probeTimes: [Double] = []
         for _ in 0..<iters {
+            // A fresh decoder each time: the probe column is the uncached metadata parse. The tier
+            // decodes below then reuse the shared decoder's probe cache, as they do after the
+            // pipeline's own probe.
+            let fresh: ImageDecoder = skeleton ? decoder : ImageIODecoder()
             let t0 = Trace.now()
-            _ = try? decoder.probe(url)
+            _ = try? fresh.probe(url)
             probeTimes.append(Trace.ms(since: t0))
         }
+        _ = try? decoder.probe(url)
         let probe = median(probeTimes)
         row += lpad(String(format: "%.2f", probe), 8)
         totals[0] += probe

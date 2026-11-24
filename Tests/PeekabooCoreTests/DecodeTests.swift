@@ -387,6 +387,21 @@ final class DecodeTests: XCTestCase {
         XCTAssertEqual(decoder.lane(for: files[1], info: try decoder.probe(files[1]), tier: .screen), .general)
     }
 
+    func testProbeCacheFollowsFileVersion() throws {
+        let url = try write(try quadrants(320, 240), "cached.jpg", type: .jpeg)
+        let decoder = ImageIODecoder()
+        XCTAssertEqual(try decoder.probe(url).pixelWidth, 320)
+        XCTAssertEqual(decoder.probes.count, 1)
+        _ = try decoder.decode(url, tier: .screen, targetLongSide: 100, pool: pool)
+        XCTAssertEqual(decoder.probes.count, 1, "decode reuses the probe")
+        // Replace the file with a different image: new size/mtime, new key.
+        let replacement = try write(try quadrants(640, 200), "replacement.jpg", type: .jpeg)
+        _ = try FileManager.default.replaceItemAt(url, withItemAt: replacement)
+        XCTAssertEqual(try decoder.probe(url).pixelWidth, 640)
+        let image = try decoder.decode(url, tier: .full, targetLongSide: 0, pool: pool)
+        XCTAssertEqual(image.pixels.width, 640)
+    }
+
     func testUnreadableFileThrows() throws {
         let url = dir.appendingPathComponent("garbage.jpg")
         try Data("not an image".utf8).write(to: url)

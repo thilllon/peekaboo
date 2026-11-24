@@ -15,6 +15,14 @@ struct ImageProbe {
         case other
     }
 
+    /// Everything the probe learned except the (per-call) source, cached across calls.
+    struct Facts {
+        let index: Int
+        let kind: Kind
+        let info: ImageInfo
+        let hasThumbnailItem: Bool
+    }
+
     let source: CGImageSource
     let index: Int
     let kind: Kind
@@ -22,7 +30,18 @@ struct ImageProbe {
     /// HEIF thumbnail item(s) listed in the container (cheap embedded preview).
     let hasThumbnailItem: Bool
 
+    var facts: Facts { Facts(index: index, kind: kind, info: info, hasThumbnailItem: hasThumbnailItem) }
+
     static let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+
+    /// A fresh source for a file whose metadata was already parsed (`CreateWithURL` reads nothing).
+    init(source: CGImageSource, facts: Facts) {
+        self.source = source
+        index = facts.index
+        kind = facts.kind
+        info = facts.info
+        hasThumbnailItem = facts.hasThumbnailItem
+    }
 
     init(url: URL) throws {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, Self.sourceOptions) else {
@@ -83,6 +102,22 @@ struct ImageProbe {
         info = ImageInfo(pixelWidth: width, pixelHeight: height, orientation: orientation, typeIdentifier: type,
                          hasAlpha: alpha, hasGainMap: hasGainMap, frameCount: CGImageSourceGetCount(source),
                          colorProfileName: profile, exif: exif)
+    }
+
+    /// Probe through `cache`: ImageIO's metadata parse (`CopyPropertiesAtIndex`, 0.1–3 ms on XMP-heavy
+    /// files) then runs once per file version instead of once per tier; the decode paths themselves
+    /// only need a fresh source.
+    static func make(url: URL, cache: ProbeCache) throws -> ImageProbe {
+        let key = ProbeCache.key(url)
+        if let key, let facts = cache[key] {
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions) else {
+                throw DecodeError.unreadable(url.lastPathComponent)
+            }
+            return ImageProbe(source: source, facts: facts)
+        }
+        let probe = try ImageProbe(url: url)
+        if let key { cache[key] = probe.facts }
+        return probe
     }
 
     private static func containerImage(_ source: CGImageSource, _ index: Int) -> [CFString: Any]? {
