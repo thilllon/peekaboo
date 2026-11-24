@@ -34,6 +34,24 @@ final class UnlistedFileTests: ViewerTestCase {
         XCTAssertEqual(viewer.pipeline.currentFile?.name, "a3.jpg")
     }
 
+    /// A path typed in Terminal is NFC while the folder lists the name as stored (NFD): the opened file is the
+    /// listed one, not a second, unlisted entry (nor the folder's first image).
+    func testOpeningAPathInAnotherUnicodeNormalizationUsesTheListedFile() throws {
+        let viewer = try makeViewer()
+        writeImage(folder.appendingPathComponent("a1.jpg"), width: 900, height: 600, gray: 0.3)
+        writeImage(folder.appendingPathComponent("cafe\u{301}.jpg"), width: 900, height: 600, gray: 0.6)
+        let stored = try XCTUnwrap(FolderScanner.scan(folder).first { $0.name.hasPrefix("caf") }?.name)
+        let typed = "caf\u{E9}.jpg"
+        guard Array(stored.unicodeScalars) != Array(typed.unicodeScalars) else {
+            throw XCTSkip("the file system stored the name as typed")
+        }
+        openAndWait(viewer, [folder.appendingPathComponent(typed)])
+        spin(0.2)
+        XCTAssertEqual(names(viewer).count, 2, "the opened file was listed twice: \(names(viewer))")
+        XCTAssertEqual(viewer.pipeline.currentFile?.name, typed)
+        XCTAssertTrue(viewer.pipeline.currentFile?.name.unicodeScalars.elementsEqual(stored.unicodeScalars) == true)
+    }
+
     func testOpeningAHiddenImageKeepsItOnScreen() throws {
         let viewer = try makeViewer()
         writeImage(folder.appendingPathComponent("a1.jpg"), width: 900, height: 600, gray: 0.3)
