@@ -1,6 +1,7 @@
 import AppKit
 import PeekabooRender
 
+LaunchClock.mainWall = LaunchClock.wallNow()
 // Programmatic entry point: no storyboard, no nib, no SwiftUI — nothing to
 // unarchive before the first window can appear. GPU setup (device + shader
 // compile) starts first, on a background thread, hidden behind AppKit init.

@@ -2,28 +2,127 @@ import AppKit
 import PeekabooCore
 import PeekabooRender
 
-/// One viewer window: owns the renderer, the pipeline and the browsing state, and
-/// turns key presses and gestures into actions.
-///
-/// Walking skeleton: navigation, zoom/pan/rotate/flip, background, fullscreen and
-/// close/quit work; file actions, HUD, help, instant fullscreen and config loading
-/// are added by their workstreams.
+/// Borderless windows cannot become key by default; instant full screen needs them to.
+final class ViewerWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+
+/// One rendered frame, for tracing and the self-test.
+struct FrameRecord {
+    let tag: Int
+    /// File whose pixels the frame shows (nil = background only).
+    let file: ImageFile?
+    let tier: Tier?
+    /// `Trace.now()` right after the frame was encoded and committed.
+    let committed: UInt64
+}
+
+/// Finder tags of a file as the HUD shows them (stars, colour label, pick/reject).
+struct FileTags: Equatable {
+    var names: [String] = []
+    var labelNumber = 0
+
+    /// HUD text, e.g. `★★★ ⚑ Pick ● Red` (computed once when the tags are read).
+    var summary: String {
+        guard !names.isEmpty || labelNumber != 0 else { return "" }
+        var parts: [String] = []
+        // Stars are a tag made of 1–5 copies of one symbol (★ by default, configurable).
+        if let stars = names.first(where: { name in
+            guard let c = name.first, name.count <= 5, !c.isLetter, !c.isNumber else { return false }
+            return name.allSatisfy { $0 == c }
+        }) { parts.append(stars) }
+        if names.contains("Pick") { parts.append("⚑ Pick") }
+        if names.contains("Reject") { parts.append("✕ Reject") }
+        let labels = Self.labelNames
+        if labelNumber > 0, labelNumber < labels.count {
+            parts.append("● \(labels[labelNumber])")
+        } else if let color = names.first(where: { labels.dropFirst().contains($0) }) {
+            parts.append("● \(color)")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    /// Localized Finder label names (index = label number); read once.
+    static let labelNames = NSWorkspace.shared.fileLabels
+}
+
+/// One viewer window: owns the renderer, the pipeline and the browsing state, turns key
+/// presses, gestures and menu items into actions, and draws the HUD above the image.
 final class ViewerWindowController: NSWindowController, NSWindowDelegate, ViewerViewDelegate {
+    private enum BrowseSource { case none, folder(URL), files }
+
+    private let rootView: ViewerRootView
     private let viewerView: ViewerView
     private let renderer: Renderer
-    private let pipeline: ImagePipeline
+    let pipeline: ImagePipeline
     private let configStore: ConfigStore
     private var config: AppConfig { configStore.config }
     private lazy var fileActions = FileActions { [weak self] in self?.configStore.config ?? .default }
+    private let hud: HUD
+    private lazy var gate = InteractionGate(
+        begin: { [weak self] in self?.renderer.beginInteraction() },
+        end: { [weak self] in
+            self?.renderer.endInteraction()
+            self?.afterGeometryChange()
+        })
+    private lazy var motion = MotionDriver(view: viewerView)
+
+    /// Open requests from the window (drag & drop) and the `app.open` action.
+    var onOpenURLs: (([URL]) -> Void)?
+    var onOpenPanel: (() -> Void)?
+
     private var pendingChords: [KeyChord] = []
+    /// Navigation keys are auto-repeating (skimming) until the next key-up.
+    private var skimming = false
     private var keyMonitor: Any?
     /// File currently on screen and the tier shown for it.
     private var shownFile: ImageFile?
     private var shownTier: Tier?
 
+    // Browsing
+    private var browseSource = BrowseSource.none
+    private var openGeneration = 0
+    private var listingPending = false
+    private var lastListing: UInt64 = 0
+    private var failures: [URL: String] = [:]
+    private var tags: [URL: FileTags] = [:]
+    private var tagSummaries: [URL: String] = [:]
+    private var loadingWork: DispatchWorkItem?
+    private var navigationStart: UInt64 = 0
+    private var lastAppliedHUDMode: AppConfig.HUDMode?
+
+    // Full screen and chrome
+    private var instantFullscreen: (frame: NSRect, style: NSWindow.StyleMask)?
+    private var lastPointerMove: UInt64 = 0
+    private var idleTimer: Timer?
+    private var chromeHidden = false
+
+    // Gestures
+    private var magnifying = false
+    private var dragging = false
+    private var dragVelocity = CGVector.zero
+    private var lastDragEvent: UInt64 = 0
+
+    // Rendering
+    private var renderScheduled = false
+    private var frameCounter = 0
+    private var frames: [Int: FrameRecord] = [:]
+    /// Observers for the self-test / tracing (main thread). Presentation time is `CACurrentMediaTime`-based; 0 = dropped.
+    var onFramePresented: ((FrameRecord, CFTimeInterval) -> Void)?
+    var onFrameCommitted: ((FrameRecord) -> Void)?
+    /// Attach presented handlers to every drawable (on with `PEEKABOO_TRACE=1` and in the self-test).
+    var tracksFrames = false { didSet { configureFrameTracking() } }
+
+    private var memoryPressure: DispatchSourceMemoryPressure?
+    private var observers: [NSObjectProtocol] = []
+    private var lastTitle = ""
+    private var pendingTitle: String?
+
     init(configStore: ConfigStore) {
         self.configStore = configStore
-        let window = NSWindow(
+        NSWindow.allowsAutomaticWindowTabbing = false
+        let window = ViewerWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1280, height: 820),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered, defer: false)
@@ -31,37 +130,73 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         window.titleVisibility = .hidden
         window.backgroundColor = .black
         window.isReleasedWhenClosed = false
+        window.isRestorable = false
+        window.animationBehavior = .none
+        window.acceptsMouseMovedEvents = true
         window.collectionBehavior.insert(.fullScreenPrimary)
         window.setFrameAutosaveName("PeekabooViewer")
         if window.frame.origin == .zero { window.center() }
 
-        viewerView = ViewerView(frame: window.contentLayoutRect)
-        window.contentView = viewerView
+        rootView = ViewerRootView(frame: NSRect(origin: .zero, size: window.contentLayoutRect.size))
+        viewerView = rootView.viewerView
+        window.contentView = rootView
         renderer = Renderer(layer: viewerView.metalLayer)
+        hud = HUD(parent: viewerView.overlayLayer)
         let pool = PixelBufferPool(device: RenderContext.shared.device)
-        pipeline = ImagePipeline(decoder: ImageIODecoder(), pool: pool,
-                                 config: PipelineConfig(screenLongSide: Self.largestScreenLongSide()))
+        var pipelineConfig = PipelineConfig(screenLongSide: Self.largestScreenLongSide())
+        if let mb = configStore.config.cacheBudgetMB { pipelineConfig.memoryBudget = mb << 20 }
+        pipeline = ImagePipeline(decoder: ImageIODecoder(), pool: pool, config: pipelineConfig)
         super.init(window: window)
         window.delegate = self
+        rootView.delegate = self
         viewerView.delegate = self
-        renderer.onNeedsDisplay = { [weak self] in self?.renderer.render() }
+        renderer.onNeedsDisplay = { [weak self] in self?.setNeedsRender() }
         pipeline.onDecoded = { [weak self] file, image in self?.decoded(image, for: file) }
-        pipeline.onFailed = { [weak self] file, error in
-            Trace.log("decode failed \(file.name): \(error)")
-            if file == self?.pipeline.currentFile { self?.window?.title = "\(file.name) — cannot open" }
+        pipeline.onFailed = { [weak self] file, error in self?.failed(file, error) }
+        motion.viewport = { [weak self] in self?.viewerView.bounds.size ?? CGSize(width: 1000, height: 700) }
+        motion.onPan = { [weak self] delta in
+            guard let self else { return }
+            self.renderer.pan(by: delta)
+            self.renderFrame()
+        }
+        motion.onActiveChanged = { [weak self] active in
+            if active { self?.gate.acquire() } else { self?.gate.release() }
         }
         installKeyMonitor()
+        installSystemObservers()
+        tracksFrames = Trace.enabled
         apply(configStore.config)
         viewerViewDidResize(viewerView)
+    }
+
+    required init?(coder: NSCoder) { fatalError("unused") }
+
+    deinit {
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
+        for observer in observers { NotificationCenter.default.removeObserver(observer) }
+        memoryPressure?.cancel()
+        motion.invalidate()
     }
 
     /// Apply a (re)loaded configuration.
     func apply(_ config: AppConfig) {
         renderer.keepZoom = config.keepZoom
-        renderer.settings.background = Background(rawValue: config.background) ?? .black
+        let background = Background(rawValue: config.background) ?? .black
+        if renderer.settings.background != background { renderer.settings.background = background }
+        if lastAppliedHUDMode != config.hud {
+            hud.mode = config.hud
+            lastAppliedHUDMode = config.hud
+        }
+        var pipelineConfig = pipeline.config
+        if let mb = config.cacheBudgetMB { pipelineConfig.memoryBudget = mb << 20 }
+        if pipelineConfig != pipeline.config { pipeline.updateConfig(pipelineConfig) }
+        if hud.isHelpVisible { hud.setHelp(KeyLabels.helpSections(config.keymap)) }
+        if instantFullscreen != nil, let screen = window?.screen { rootView.topInset = notchInset(screen) }
+        updateHUD()
     }
 
-    required init?(coder: NSCoder) { fatalError("unused") }
+    /// Show a toast (e.g. a config error).
+    func toast(_ text: String) { hud.showToast(text) }
 
     // MARK: Opening
 
@@ -69,92 +204,422 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     func open(_ urls: [URL]) {
         guard let first = urls.first else { return }
         let opened = Trace.now()
+        openGeneration += 1
+        let generation = openGeneration
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
-        // First pixel first: decode the opened file before listing its folder.
-        let isFolder = (try? first.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
-        if urls.count == 1, !isFolder {
+        failures.removeAll()
+        hud.setMessage(nil)
+        listingPending = true
+        // First pixel first: decode the opened file before listing its folder. Decide "file or
+        // folder" from the URL alone (no file-system access on the main thread).
+        let singleFile = urls.count == 1 && !first.hasDirectoryPath && FolderScanner.isSupported(first)
+        if singleFile {
+            browseSource = .folder(first.deletingLastPathComponent())
+            beginNavigation()
             pipeline.setFiles([ImageFile(url: first, name: first.lastPathComponent, byteSize: 0, modified: 0, fileID: 0)], index: 0)
-            updateTitle()
+            presentCurrent()
+        } else {
+            browseSource = urls.count == 1 ? .folder(first) : .files
         }
+        updateHUD()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let listing = try? FolderScanner.browse(urls)
             DispatchQueue.main.async {
-                guard let self, let listing, !listing.files.isEmpty else { return }
+                guard let self, generation == self.openGeneration else { return }
+                self.listingPending = false
+                self.lastListing = Trace.now()
+                guard let listing, !listing.files.isEmpty else {
+                    // An unreadable parent folder still shows the opened file on its own.
+                    if singleFile {
+                        self.updateHUD()
+                    } else {
+                        self.showEmpty(urls.count == 1 ? first : nil)
+                    }
+                    return
+                }
+                let previous = self.pipeline.currentFile
                 self.pipeline.setFiles(listing.files, index: listing.index)
-                self.updateTitle()
+                if self.pipeline.currentFile != previous { self.beginNavigation() }
+                self.presentCurrent()
+                self.updateHUD()
                 Trace.log("folder listed: \(listing.files.count) files, \(String(format: "%.1f", Trace.ms(since: opened))) ms after open")
             }
         }
+    }
+
+    /// Nothing to show: an empty folder, or no file opened yet.
+    func showEmpty(_ folder: URL?) {
+        pipeline.setFiles([], index: 0)
+        shownFile = nil
+        shownTier = nil
+        renderer.setImage(nil, key: nil)
+        setLoading(false)
+        renderFrame()
+        if let folder {
+            hud.setMessage("No images in “\(folder.lastPathComponent)”\nDrop images here or press ⌘O")
+        } else {
+            hud.setMessage("Drop images or a folder here\nor press ⌘O to open")
+        }
+        updateHUD()
+        showWindow(nil)
+    }
+
+    /// Re-show the window (Dock click) with the last image.
+    func reopen() {
+        showWindow(nil)
+        window?.makeKeyAndOrderFront(nil)
+        if pipeline.currentFile == nil, shownFile == nil { showEmpty(nil) } else { renderFrame() }
     }
 
     // MARK: Pipeline → screen
 
     private func decoded(_ image: DecodedImage, for file: ImageFile) {
         guard file == pipeline.currentFile else { return }
-        if shownFile == file, let shownTier, shownTier >= image.tier { return }
+        if failures.removeValue(forKey: file.url) != nil { hud.setMessage(nil) }
+        if shownFile == file, let shownTier, shownTier >= image.tier {
+            updateHUD()
+            return
+        }
         show(image, for: file)
     }
 
+    private func failed(_ file: ImageFile, _ error: Error) {
+        Trace.log("decode failed \(file.name): \(error)")
+        guard file == pipeline.currentFile, shownFile != file, pipeline.best(for: file) == nil else { return }
+        let reason: String
+        func detail(_ s: String, _ generic: String) -> String {
+            s.isEmpty || s == file.name || s == file.url.path ? generic : "\(generic) (\(s))"
+        }
+        switch error as? DecodeError {
+        case .unsupported(let s)?: reason = detail(s, "Unsupported format")
+        case .unreadable(let s)?: reason = detail(s, "Damaged file or not an image")
+        case .outOfMemory?: reason = "Not enough memory to decode it"
+        case nil: reason = error.localizedDescription
+        }
+        failures[file.url] = reason
+        // Do not leave the previous image under the new name.
+        shownFile = file
+        shownTier = nil
+        renderer.setImage(nil, key: file.url)
+        setLoading(false)
+        renderFrame()
+        hud.setMessage("Cannot open “\(file.name)”\n\(reason)")
+        updateHUD()
+    }
+
     private func show(_ image: DecodedImage, for file: ImageFile) {
+        let wasNewFile = shownFile != file
+        let t0 = Trace.now()
         renderer.setImage(image, key: file.url)
         shownFile = file
         shownTier = image.tier
-        renderer.render()
+        setLoading(false)
+        if failures[file.url] == nil { hud.setMessage(nil) }
+        let t1 = Trace.now()
+        renderFrame()
+        let t2 = Trace.now()
         if renderer.wantsFullResolution { pipeline.requestFullResolution() }
-        Trace.log("shown \(file.name) tier=\(image.tier) \(image.pixels.width)x\(image.pixels.height) decode=\(String(format: "%.1f", Double(image.decodeNanos) / 1e6)) ms")
+        updateHUD()
+        if Trace.enabled {
+            Trace.log(String(format: "show main thread: setImage %.3f  render %.3f  hud %.3f ms",
+                             Double(t1 &- t0) / 1e6, Double(t2 &- t1) / 1e6, Double(Trace.now() &- t2) / 1e6))
+            Trace.log("shown \(file.name) tier=\(image.tier) \(image.pixels.width)x\(image.pixels.height) decode=\(String(format: "%.1f", Double(image.decodeNanos) / 1e6)) ms\(wasNewFile ? String(format: " +%.2f ms after nav", Trace.ms(since: navigationStart)) : "")")
+        }
     }
+
+    /// Show the best tier of the current file now, or keep the previous image and arm the progress line.
+    private func presentCurrent() {
+        guard let file = pipeline.currentFile else { return }
+        if let best = pipeline.best(for: file) {
+            if shownFile != file || (shownTier ?? .preview) < best.tier || shownTier == nil { show(best, for: file) }
+        } else if shownFile != file {
+            armLoadingIndicator(for: file)
+        }
+        loadTags(for: file)
+    }
+
+    private func beginNavigation() { navigationStart = Trace.now() }
 
     private func navigate(to index: Int, isRepeat: Bool) {
         guard !pipeline.files.isEmpty else { return }
         let target = min(max(index, 0), pipeline.files.count - 1)
-        guard target != pipeline.index || shownFile == nil else { return }
-        pipeline.navigate(to: target, isRepeat: isRepeat)
-        updateTitle()
-        if let file = pipeline.currentFile, let best = pipeline.best(for: file) {
-            show(best, for: file)
+        if target != index, target == pipeline.index {
+            hud.showToast(index < 0 ? "First image" : "Last image")
+            return
         }
-        // Otherwise keep the previous image on screen until the first tier arrives.
+        guard target != pipeline.index || shownFile == nil else { return }
+        beginNavigation()
+        pipeline.navigate(to: target, isRepeat: isRepeat)
+        let t1 = Trace.now()
+        presentCurrent()
+        let t2 = Trace.now()
+        // Title and HUD switch to the target in the same run-loop turn (same frame) as the swap.
+        updateHUD()
+        if Trace.enabled {
+            let t3 = Trace.now()
+            Trace.log(String(format: "nav main thread: pipeline %.3f  present %.3f  hud %.3f ms",
+                             Double(t1 &- navigationStart) / 1e6, Double(t2 &- t1) / 1e6, Double(t3 &- t2) / 1e6))
+        }
     }
 
-    private func updateTitle() {
-        guard let file = pipeline.currentFile else { return }
-        window?.title = "\(file.name) — \(pipeline.index + 1)/\(pipeline.files.count)"
+    private func armLoadingIndicator(for file: ImageFile) {
+        loadingWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.pipeline.currentFile == file, self.shownFile != file else { return }
+            self.hud.setLoading(true)
+            Trace.log("progress line: \(file.name) has no pixels 150 ms after navigation")
+        }
+        loadingWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+    }
+
+    private func setLoading(_ loading: Bool) {
+        if !loading { loadingWork?.cancel(); loadingWork = nil }
+        hud.setLoading(loading)
+    }
+
+    // MARK: HUD
+
+    private func updateHUD() {
+        guard let file = pipeline.currentFile else {
+            hud.setContent(HUDContent())
+            setTitle("Peekaboo")
+            return
+        }
+        let index = listingPending ? "…" : "\(pipeline.index + 1)"
+        let count = listingPending ? "…" : "\(pipeline.files.count)"
+        var parts = [file.name, "\(index)/\(count)"]
+        let info = pipeline.info(for: file)
+        let onScreen = shownFile == file ? renderer.image : nil
+        if let info {
+            parts.append("\(info.orientedWidth)×\(info.orientedHeight)")
+        } else if let onScreen {
+            parts.append("\(onScreen.fullWidth)×\(onScreen.fullHeight)")
+        }
+        if onScreen != nil { parts.append("\(Int((renderer.effectiveScale * 100).rounded())) %") }
+        if let summary = tagSummaries[file.url], !summary.isEmpty { parts.append(summary) }
+        if failures[file.url] != nil { parts.append("cannot open") }
+        var content = HUDContent(line: parts.joined(separator: "  ·  "))
+        if hud.mode == .full { content.details = detailRows(file, info, onScreen) }
+        hud.setContent(content)
+        setTitle("\(file.name) — \(index)/\(count)")
+    }
+
+    /// The title is hidden (Window menu and Mission Control only) and costs ~0.5 ms to set, so it
+    /// follows the HUD after the frame instead of on the navigation's critical path, coalesced
+    /// while skimming.
+    private func setTitle(_ title: String) {
+        guard title != lastTitle else {
+            pendingTitle = nil
+            return
+        }
+        let schedule = pendingTitle == nil
+        pendingTitle = title
+        guard schedule else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self, let title = self.pendingTitle else { return }
+            self.pendingTitle = nil
+            self.lastTitle = title
+            self.window?.title = title
+        }
+    }
+
+    private func detailRows(_ file: ImageFile, _ info: ImageInfo?, _ image: DecodedImage?) -> [HUDContent.Row] {
+        var rows: [HUDContent.Row] = []
+        let exif = info?.exif ?? [:]
+        func add(_ label: String, _ value: String?) {
+            if let value, !value.isEmpty { rows.append(.init(label: label, value: value)) }
+        }
+        add("Camera", exif["camera"])
+        add("Lens", exif["lens"])
+        // The decoder formats each value ("35 mm", "f/2.8", "1/250 s", "ISO 100"): one exposure row.
+        let exposure = ["focal", "aperture", "shutter", "iso"].compactMap { exif[$0] }.filter { !$0.isEmpty }
+        if !exposure.isEmpty { add("Exposure", exposure.joined(separator: "  ")) }
+        add("Date", exif["date"])
+        add("Profile", exif["profile"] ?? info?.colorProfileName)
+        var format = exif["format"] ?? info.map { Self.formatName($0.typeIdentifier) }
+        if let info, info.hasGainMap { format = (format ?? "") + " · HDR gain map" }
+        if let info, info.frameCount > 1 { format = (format ?? "") + " · \(info.frameCount) frames" }
+        add("Format", format)
+        if let info {
+            let mp = Double(info.pixelWidth * info.pixelHeight) / 1e6
+            add("Pixels", "\(info.orientedWidth)×\(info.orientedHeight) (\(String(format: "%.1f", mp)) MP)")
+        }
+        if file.byteSize > 0 { add("Size", ByteCountFormatter.string(fromByteCount: file.byteSize, countStyle: .file)) }
+        if let image, let tier = shownTier {
+            add("Shown", "\(tier) \(image.pixels.width)×\(image.pixels.height)\(image.isHDR ? " HDR" : "")")
+        }
+        return rows
+    }
+
+    private static func formatName(_ uti: String) -> String {
+        let known = ["public.jpeg": "JPEG", "public.png": "PNG", "public.heic": "HEIC", "public.heif": "HEIF",
+                     "public.avif": "AVIF", "org.webmproject.webp": "WebP", "public.tiff": "TIFF",
+                     "public.jpeg-xl": "JPEG XL", "com.compuserve.gif": "GIF", "com.adobe.raw-image": "DNG"]
+        if let name = known[uti] { return name }
+        return uti.split(separator: ".").last.map { $0.uppercased() } ?? uti
+    }
+
+    private func loadTags(for file: ImageFile, force: Bool = false) {
+        if !force, tags[file.url] != nil { return }
+        let url = file.url
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // A fresh URL: NSURL caches resource values, which would hide a tag just written.
+            let values = try? URL(fileURLWithPath: url.path, isDirectory: false).resourceValues(forKeys: [.tagNamesKey, .labelNumberKey])
+            let result = FileTags(names: values?.tagNames ?? [], labelNumber: values?.labelNumber ?? 0)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if self.tags.count > 4096 { self.tags.removeAll(); self.tagSummaries.removeAll() }
+                let changed = self.tags[url] != result
+                self.tags[url] = result
+                self.tagSummaries[url] = result.summary
+                if changed, self.pipeline.currentFile?.url == url { self.updateHUD() }
+            }
+        }
+    }
+
+    // MARK: Rendering
+
+    private func setNeedsRender() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.setNeedsRender() }
+            return
+        }
+        guard !renderScheduled else { return }
+        renderScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.renderScheduled else { return }
+            self.renderFrame()
+        }
+    }
+
+    /// Encode and present one frame now (every frame of the window goes through here).
+    private func renderFrame() {
+        renderScheduled = false
+        guard tracksFrames else {
+            renderer.render()
+            return
+        }
+        frameCounter += 1
+        let tag = frameCounter
+        viewerView.metalLayer.nextTag = tag
+        renderer.render()
+        let record = FrameRecord(tag: tag, file: renderer.image == nil ? nil : shownFile, tier: shownTier, committed: Trace.now())
+        frames[tag] = record
+        lastCommittedFrame = record
+        if frames.count > 512 { frames = frames.filter { $0.key > tag - 256 } }
+        onFrameCommitted?(record)
+    }
+
+    /// File whose pixels are on screen (may lag `pipeline.currentFile` until its first tier lands).
+    var displayedFile: ImageFile? { shownFile }
+    private(set) var lastCommittedFrame: FrameRecord?
+
+    /// Present the current state again.
+    func redraw() { renderFrame() }
+
+    private func configureFrameTracking() {
+        guard tracksFrames else {
+            viewerView.metalLayer.onPresented = nil
+            return
+        }
+        viewerView.metalLayer.onPresented = { [weak self] tag, time in
+            guard let self, let record = self.frames.removeValue(forKey: tag) else { return }
+            self.onFramePresented?(record, time)
+        }
     }
 
     // MARK: Keys
 
     private func installKeyMonitor() {
-        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
             guard let self, event.window === self.window else { return event }
+            if event.type == .keyUp {
+                if self.skimming { self.endSkim() }
+                return self.motion.releasePanKey(event.keyCode) ? nil : event
+            }
             return self.handleKey(event) ? nil : event
         }
     }
 
     private func handleKey(_ event: NSEvent) -> Bool {
+        // A held pan key moves at display rate from key state; its auto-repeats are noise.
+        if event.isARepeat, motion.isHolding(keyCode: event.keyCode) { return true }
         guard let chord = KeyChord(event: event) else { return false }
         pendingChords.append(chord)
         let context: KeyContext = renderer.isZoomedBeyondFit ? .zoomed : .normal
-        switch config.keymap.resolve(pendingChords, context: context) {
+        var result = config.keymap.resolve(pendingChords, context: context)
+        if case .unbound = result, pendingChords.count > 1 {
+            // A broken sequence: the last chord may still be a binding on its own.
+            pendingChords = [chord]
+            result = config.keymap.resolve(pendingChords, context: context)
+        }
+        switch result {
         case .actions(let actions):
             pendingChords.removeAll()
+            if actions.count == 1, case .pan(let direction) = actions[0] {
+                if !event.isARepeat { motion.pressPanKey(event.keyCode, direction: direction) }
+                return true
+            }
             for action in actions { perform(action, isRepeat: event.isARepeat) }
+            if event.isARepeat, actions.contains(where: Self.isNavigation) { skimming = true }
             return true
         case .pending:
             return true
         case .unbound:
-            let consumed = pendingChords.count > 1
             pendingChords.removeAll()
-            return consumed
+            return false
+        }
+    }
+
+    private static func isNavigation(_ action: Action) -> Bool {
+        switch action {
+        case .next, .previous, .jump: return true
+        default: return false
+        }
+    }
+
+    /// Key-up after auto-repeat navigation: once the user has dwelt 90 ms, tell the pipeline the
+    /// current image is no longer being skimmed so its screen tier is decoded.
+    private func endSkim() {
+        skimming = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) { [weak self] in
+            guard let self, !self.skimming, let file = self.pipeline.currentFile,
+                  (self.pipeline.best(for: file)?.tier ?? .preview) < .screen else { return }
+            self.pipeline.navigate(to: self.pipeline.index, isRepeat: false)
+            self.presentCurrent()
+        }
+    }
+
+    // MARK: Actions
+
+    /// Whether a menu item for `action` should be enabled.
+    func canPerform(_ action: Action, plainKeyEquivalent: Bool) -> Bool {
+        if plainKeyEquivalent, window?.isKeyWindow != true { return false }
+        switch action {
+        case .open, .quit, .config, .reloadConfig, .makeDefault, .help, .hud, .hudHide, .undo, .redo, .background:
+            return true
+        case .fullscreen, .fullscreenNative, .close, .escape:
+            return window?.isVisible == true
+        default:
+            return pipeline.currentFile != nil
         }
     }
 
     func perform(_ action: Action, isRepeat: Bool = false) {
-        if fileActions.handles(action), let file = pipeline.currentFile {
-            let result = fileActions.perform(action, context: FileActionContext(
-                file: file, index: pipeline.index, count: pipeline.files.count, window: window))
-            handle(result)
-            return
+        if fileActions.handles(action) {
+            if let file = pipeline.currentFile {
+                handle(fileActions.perform(action, context: FileActionContext(
+                    file: file, index: pipeline.index, count: pipeline.files.count, window: window)))
+                return
+            }
+            switch action {
+            case .undo: handle(fileActions.undo()); return
+            case .redo: handle(fileActions.redo()); return
+            case .config, .reloadConfig, .makeDefault: break  // app-level fallbacks below
+            default: return
+            }
         }
         switch action {
         case .next: navigate(to: pipeline.index + 1, isRepeat: isRepeat)
@@ -164,74 +629,158 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         case .jump(let n): navigate(to: pipeline.index + n, isRepeat: isRepeat)
         case .zoomFit: zoom(.fit)
         case .zoomFill: zoom(.fill)
-        case .zoomActual: zoom(.scale(1))
-        case .zoomSet(let factor): zoom(.scale(factor))
+        case .zoomActual: zoom(.scale(1), anchor: mouseInView())
+        case .zoomSet(let factor): zoom(.scale(factor), anchor: mouseInView())
         case .zoomIn: zoomStep(1.25)
         case .zoomOut: zoomStep(0.8)
         case .zoomToggle: zoom(renderer.zoomMode == .fit ? .scale(1) : .fit, anchor: mouseInView())
-        case .zoomKeep: renderer.keepZoom.toggle()
-        case .pan(let direction): pan(direction)
-        case .panCenter: zoom(renderer.zoomMode)
-        case .rotateClockwise: renderer.rotate(clockwise: true); renderer.render()
-        case .rotateCounterClockwise: renderer.rotate(clockwise: false); renderer.render()
-        case .flipHorizontal: renderer.flip(horizontal: true); renderer.render()
-        case .flipVertical: renderer.flip(horizontal: false); renderer.render()
+        case .zoomKeep:
+            renderer.keepZoom.toggle()
+            hud.showToast(renderer.keepZoom ? "Keep zoom: on" : "Keep zoom: off")
+        case .pan(let direction): motion.tap(direction)
+        case .panEdge(let edge): panToEdge(edge)
+        case .panCenter: centerImage()
+        case .rotateClockwise: renderer.rotate(clockwise: true); afterGeometryChange()
+        case .rotateCounterClockwise: renderer.rotate(clockwise: false); afterGeometryChange()
+        case .flipHorizontal: renderer.flip(horizontal: true); renderFrame()
+        case .flipVertical: renderer.flip(horizontal: false); renderFrame()
         case .background:
             let all = Background.allCases
-            renderer.settings.background = all[(all.firstIndex(of: renderer.settings.background)! + 1) % all.count]
-        case .fullscreen, .fullscreenNative: window?.toggleFullScreen(nil)
+            let next = all[((all.firstIndex(of: renderer.settings.background) ?? 0) + 1) % all.count]
+            renderer.settings.background = next
+            renderFrame()
+            hud.showToast("Background: \(next.rawValue)")
+        case .hud:
+            hud.hidesAll = false
+            let all = AppConfig.HUDMode.allCases
+            hud.mode = all[((all.firstIndex(of: hud.mode) ?? 0) + 1) % all.count]
+            updateHUD()
+        case .hudHide: hud.hidesAll.toggle()
+        case .help: toggleHelp()
+        case .fullscreen:
+            if config.fullscreen == .native { toggleNativeFullscreen() } else { toggleInstantFullscreen() }
+        case .fullscreenNative: toggleNativeFullscreen()
         case .escape:
-            if window?.styleMask.contains(.fullScreen) == true { window?.toggleFullScreen(nil) } else { window?.performClose(nil) }
+            if hud.isHelpVisible {
+                hud.setHelp(nil)
+            } else if instantFullscreen != nil {
+                toggleInstantFullscreen()
+            } else if window?.styleMask.contains(.fullScreen) == true {
+                window?.toggleFullScreen(nil)
+            } else {
+                window?.performClose(nil)
+            }
         case .close: window?.performClose(nil)
         case .quit: NSApp.terminate(nil)
-        default: Trace.log("action not implemented yet: \(action.id)")
+        case .open: onOpenPanel?()
+        case .undo: handle(fileActions.undo())
+        case .redo: handle(fileActions.redo())
+        case .config: openConfigFile()
+        case .reloadConfig:
+            configStore.load()
+            hud.showToast("Config reloaded")
+        case .none: break
+        default:
+            hud.showToast("\(KeyLabels.title(action)): not available")
+            Trace.log("action not implemented: \(action.id)")
         }
+    }
+
+    private func openConfigFile() {
+        do {
+            let url = try configStore.createDefaultFileIfMissing()
+            NSWorkspace.shared.open(url)
+        } catch {
+            hud.showToast("Cannot create config: \(error.localizedDescription)")
+        }
+    }
+
+    private func toggleHelp() {
+        if hud.isHelpVisible { hud.setHelp(nil) } else { hud.setHelp(KeyLabels.helpSections(config.keymap)) }
     }
 
     /// Update the browsing set after a file action.
     private func handle(_ result: FileActionResult) {
-        if let toast = result.toast { Trace.log("toast: \(toast)") }
+        if let toast = result.toast { hud.showToast(toast) }
         switch result.outcome {
         case .removed(let file):
             var files = pipeline.files
             guard let i = files.firstIndex(of: file) else { return }
             files.remove(at: i)
-            shownFile = nil
-            pipeline.setFiles(files, index: min(i, max(files.count - 1, 0)))
-            updateTitle()
-            if let current = pipeline.currentFile, let best = pipeline.best(for: current) { show(best, for: current) }
+            tags[file.url] = nil
+            tagSummaries[file.url] = nil
+            if files.isEmpty {
+                showEmpty(currentFolder)
+                return
+            }
+            beginNavigation()
+            pipeline.setFiles(files, index: min(i, files.count - 1))
+            presentCurrent()
+            updateHUD()
         case .restored(let file):
             var files = pipeline.files
-            files.append(file)
-            files.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            if !files.contains(file) {
+                files.append(file)
+                files.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            }
+            hud.setMessage(nil)
+            beginNavigation()
             pipeline.setFiles(files, index: files.firstIndex(of: file) ?? pipeline.index)
-            updateTitle()
-        case .changed, .unchanged:
+            presentCurrent()
+            updateHUD()
+        case .changed(let file):
+            loadTags(for: file, force: true)
+            updateHUD()
+        case .unchanged:
             break
         }
     }
 
+    private var currentFolder: URL? {
+        if case .folder(let url) = browseSource { return url }
+        return nil
+    }
+
+    // MARK: Zoom & pan
+
     private func zoom(_ mode: ZoomMode, anchor: CGPoint? = nil) {
         renderer.setZoom(mode, anchor: anchor)
-        renderer.render()
-        if renderer.wantsFullResolution { pipeline.requestFullResolution() }
+        afterGeometryChange()
     }
 
     private func zoomStep(_ factor: Double) {
         renderer.zoom(by: factor, anchor: mouseInView() ?? CGPoint(x: viewerView.bounds.midX, y: viewerView.bounds.midY))
-        renderer.render()
-        if renderer.wantsFullResolution { pipeline.requestFullResolution() }
+        afterGeometryChange()
     }
 
-    private func pan(_ direction: Action.Direction) {
-        let stepX = viewerView.bounds.width * 0.1, stepY = viewerView.bounds.height * 0.1
-        switch direction {
-        case .left: renderer.pan(by: CGVector(dx: stepX, dy: 0))
-        case .right: renderer.pan(by: CGVector(dx: -stepX, dy: 0))
-        case .up: renderer.pan(by: CGVector(dx: 0, dy: stepY))
-        case .down: renderer.pan(by: CGVector(dx: 0, dy: -stepY))
+    /// Present the new geometry, ask for full resolution when the view needs it, refresh the zoom %.
+    private func afterGeometryChange() {
+        renderFrame()
+        if renderer.wantsFullResolution { pipeline.requestFullResolution() }
+        updateHUD()
+    }
+
+    private func panToEdge(_ edge: Action.Edge) {
+        let far: CGFloat = 1e7
+        switch edge {
+        case .left: renderer.pan(by: CGVector(dx: far, dy: 0))
+        case .right: renderer.pan(by: CGVector(dx: -far, dy: 0))
+        case .top: renderer.pan(by: CGVector(dx: 0, dy: far))
+        case .bottom: renderer.pan(by: CGVector(dx: 0, dy: -far))
         }
-        renderer.render()
+        renderFrame()
+    }
+
+    private func centerImage() {
+        guard let image = renderer.image else { return }
+        let scale = renderer.effectiveScale
+        let backing = Double(window?.backingScaleFactor ?? 2)
+        var w = Double(image.fullWidth), h = Double(image.fullHeight)
+        if renderer.quarterTurns % 2 == 1 { swap(&w, &h) }
+        let vw = Double(viewerView.bounds.width) * backing, vh = Double(viewerView.bounds.height) * backing
+        renderer.pan(by: CGVector(dx: 1e7, dy: 1e7))  // top-left corner
+        renderer.pan(by: CGVector(dx: -max(w * scale - vw, 0) / (2 * backing), dy: -max(h * scale - vh, 0) / (2 * backing)))
+        renderFrame()
     }
 
     private func mouseInView() -> CGPoint? {
@@ -240,49 +789,298 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         return viewerView.bounds.contains(p) ? p : nil
     }
 
+    // MARK: Full screen
+
+    private var isFullscreen: Bool { instantFullscreen != nil || window?.styleMask.contains(.fullScreen) == true }
+
+    private func notchInset(_ screen: NSScreen) -> CGFloat { config.avoidNotch ? screen.safeAreaInsets.top : 0 }
+
+    /// Borderless, screen-sized window with auto-hidden menu bar and Dock: no Space animation,
+    /// takes effect on the next frame.
+    private func toggleInstantFullscreen() {
+        guard let window else { return }
+        if instantFullscreen != nil {
+            exitInstantFullscreen(reorder: true)
+        } else {
+            if window.styleMask.contains(.fullScreen) { window.toggleFullScreen(nil); return }
+            guard let screen = window.screen ?? NSScreen.main else { return }
+            instantFullscreen = (window.frame, window.styleMask)
+            window.setFrameAutosaveName("")  // never persist the full-screen frame
+            NSApp.presentationOptions = [.autoHideMenuBar, .autoHideDock]
+            window.styleMask = [.borderless]
+            window.setFrame(screen.frame, display: true)
+            rootView.topInset = notchInset(screen)
+            window.makeKeyAndOrderFront(nil)
+            window.makeFirstResponder(viewerView)
+            lastPointerMove = Trace.now()
+            scheduleIdleCheck()
+        }
+    }
+
+    /// Restore the window's style and frame. `reorder` is false while the window is closing.
+    private func exitInstantFullscreen(reorder: Bool) {
+        guard let window, let saved = instantFullscreen else { return }
+        instantFullscreen = nil
+        NSApp.presentationOptions = []
+        window.styleMask = saved.style
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.setFrame(saved.frame, display: reorder)
+        window.setFrameAutosaveName("PeekabooViewer")
+        rootView.topInset = 0
+        if reorder {
+            window.makeKeyAndOrderFront(nil)
+            window.makeFirstResponder(viewerView)
+        }
+        showChrome()
+    }
+
+    private func toggleNativeFullscreen() {
+        if instantFullscreen != nil { toggleInstantFullscreen() }
+        window?.toggleFullScreen(nil)
+    }
+
+    // MARK: Cursor & chrome auto-hide
+
+    func viewerPointerMoved(_ view: NSView) {
+        lastPointerMove = Trace.now()
+        if chromeHidden { showChrome() }
+        scheduleIdleCheck()
+    }
+
+    private func scheduleIdleCheck(after seconds: Double = 1.5) {
+        guard idleTimer == nil else { return }
+        let timer = Timer(timeInterval: seconds, repeats: false) { [weak self] _ in self?.idleCheck() }
+        RunLoop.main.add(timer, forMode: .common)
+        idleTimer = timer
+    }
+
+    private func idleCheck() {
+        idleTimer = nil
+        let idle = Trace.ms(since: lastPointerMove)
+        if idle < 1500 {
+            scheduleIdleCheck(after: (1500 - idle) / 1000 + 0.01)
+            return
+        }
+        guard let window, window.isKeyWindow else { return }
+        if isFullscreen {
+            NSCursor.setHiddenUntilMouseMoves(true)
+        } else {
+            let p = window.mouseLocationOutsideOfEventStream
+            let inTitlebar = p.y > window.frame.height - 32 && p.y <= window.frame.height && p.x >= 0 && p.x <= window.frame.width
+            if !inTitlebar { hideChrome() }
+        }
+    }
+
+    private var titlebarControls: NSView? { window?.standardWindowButton(.closeButton)?.superview }
+
+    private func hideChrome() {
+        guard !chromeHidden, let controls = titlebarControls else { return }
+        chromeHidden = true
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.25
+            controls.animator().alphaValue = 0
+        }
+    }
+
+    private func showChrome() {
+        guard chromeHidden else { return }
+        chromeHidden = false
+        guard let controls = titlebarControls else { return }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.12
+            controls.animator().alphaValue = 1
+        }
+    }
+
+    // MARK: NSWindowDelegate
+
+    func windowWillClose(_ notification: Notification) {
+        exitInstantFullscreen(reorder: false)
+        motion.releaseAllKeys()
+        motion.stopMomentum()
+        hud.setHelp(nil)
+        // Stay resident but give back the big caches; the current image stays for a Dock reopen.
+        pipeline.handleMemoryPressure(critical: false)
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        motion.releaseAllKeys()
+        pendingChords.removeAll()
+        showChrome()
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        lastPointerMove = Trace.now()
+        scheduleIdleCheck()
+        rescanIfNeeded()
+    }
+
+    func windowDidChangeScreen(_ notification: Notification) {
+        motion.screenChanged()
+        if instantFullscreen != nil, let screen = window?.screen {
+            window?.setFrame(screen.frame, display: true)
+            rootView.topInset = notchInset(screen)
+        }
+    }
+
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        lastPointerMove = Trace.now()
+        scheduleIdleCheck()
+    }
+
+    // MARK: Folder refresh
+
+    /// Self-contained fallback for a folder watcher: re-list the folder when the window
+    /// becomes key (files added or removed in Finder while Peekaboo was in the background).
+    private func rescanIfNeeded() {
+        guard Trace.ms(since: lastListing) > 1500 else { return }
+        rescanFolder()
+    }
+
+    /// Re-list the browsed folder off the main thread and apply additions, removals and changed
+    /// versions, keeping the current file (a `FolderWatcher` callback can call this directly).
+    func rescanFolder() {
+        guard case .folder(let folder) = browseSource, !listingPending else { return }
+        let generation = openGeneration
+        lastListing = Trace.now()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let files = try? FolderScanner.scan(folder) else { return }
+            DispatchQueue.main.async {
+                guard let self, generation == self.openGeneration, !self.listingPending else { return }
+                self.lastListing = Trace.now()
+                let fingerprint = { (list: [ImageFile]) in list.map { $0.url.path + "|" + $0.version } }
+                guard fingerprint(files) != fingerprint(self.pipeline.files) else { return }
+                if files.isEmpty {
+                    self.showEmpty(folder)
+                    return
+                }
+                let current = self.pipeline.currentFile
+                let index = current.flatMap { files.firstIndex(of: $0) } ?? min(self.pipeline.index, files.count - 1)
+                self.pipeline.setFiles(files, index: index)
+                if self.pipeline.currentFile != current { self.beginNavigation() }
+                self.hud.setMessage(self.failures[self.pipeline.currentFile?.url ?? folder] == nil ? nil : self.hudMessageForFailure())
+                self.presentCurrent()
+                self.updateHUD()
+                Trace.log("folder rescanned: \(files.count) files")
+            }
+        }
+    }
+
+    private func hudMessageForFailure() -> String? {
+        guard let file = pipeline.currentFile, let reason = failures[file.url] else { return nil }
+        return "Cannot open “\(file.name)”\n\(reason)"
+    }
+
+    // MARK: System events
+
+    private func installSystemObservers() {
+        let center = NotificationCenter.default
+        observers.append(center.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.screensChanged()
+        })
+        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .main)
+        source.setEventHandler { [weak self, weak source] in
+            guard let self, let source else { return }
+            let critical = source.data.contains(.critical)
+            Trace.log("memory pressure: \(critical ? "critical" : "warning")")
+            self.pipeline.handleMemoryPressure(critical: critical)
+        }
+        source.activate()
+        memoryPressure = source
+    }
+
+    /// Displays were added, removed or changed resolution: the screen tier must cover the largest one.
+    private func screensChanged() {
+        var pipelineConfig = pipeline.config
+        let side = Self.largestScreenLongSide()
+        if pipelineConfig.screenLongSide != side {
+            pipelineConfig.screenLongSide = side
+            pipeline.updateConfig(pipelineConfig)
+            Trace.log("screen tier long side → \(side)")
+        }
+        motion.screenChanged()
+        if instantFullscreen != nil, let screen = window?.screen {
+            window?.setFrame(screen.frame, display: true)
+            rootView.topInset = notchInset(screen)
+        }
+    }
+
     // MARK: ViewerViewDelegate
 
     func viewerViewDidResize(_ view: ViewerView) {
-        renderer.setViewSize(view.bounds.size, backingScale: window?.backingScaleFactor ?? 2)
-        renderer.render()
+        let scale = window?.backingScaleFactor ?? 2
+        renderer.setViewSize(view.bounds.size, backingScale: scale)
+        hud.layout(size: view.bounds.size, topInset: instantFullscreen == nil ? 28 : 0, scale: scale)
+        renderFrame()
+        updateHUD()
     }
 
     func viewer(_ view: ViewerView, magnifyBy factor: Double, at point: CGPoint, phase: NSEvent.Phase) {
-        if phase.contains(.began) { renderer.beginInteraction() }
+        if phase.contains(.began) || !magnifying {
+            if !magnifying { magnifying = true; gate.acquire() }
+            motion.stopMomentum()
+        }
         renderer.zoom(by: factor, anchor: point)
-        renderer.render()
+        renderFrame()
+        updateHUD()
         if phase.contains(.ended) || phase.contains(.cancelled) {
-            renderer.endInteraction()
-            if renderer.wantsFullResolution { pipeline.requestFullResolution() }
+            magnifying = false
+            gate.release()
         }
     }
 
     func viewer(_ view: ViewerView, scrollBy delta: CGVector, at point: CGPoint, precise: Bool,
                 modifiers: NSEvent.ModifierFlags, phase: NSEvent.Phase) {
+        gate.touch()
         if modifiers.contains(.command) || !precise {
             // Mouse wheel or ⌘-scroll: zoom around the pointer.
             renderer.zoom(by: pow(1.0025, Double(delta.dy) * (precise ? 1 : 20)), anchor: point)
+            renderFrame()
+            updateHUD()
         } else {
+            if phase.contains(.began) { motion.stopMomentum() }
             renderer.pan(by: delta)
+            renderFrame()
         }
-        renderer.render()
-        if phase.contains(.ended) && renderer.wantsFullResolution { pipeline.requestFullResolution() }
     }
 
     func viewer(_ view: ViewerView, dragBy delta: CGVector, phase: NSEvent.Phase) {
+        let now = Trace.now()
         switch phase {
-        case .began: renderer.beginInteraction()
-        case .ended: renderer.endInteraction()
+        case .began:
+            motion.stopMomentum()
+            if !dragging { dragging = true; gate.acquire() }
+            dragVelocity = .zero
+            lastDragEvent = now
+        case .ended:
+            guard dragging else { return }
+            dragging = false
+            // Momentum only if the pointer was still moving when released.
+            if Double(now &- lastDragEvent) / 1e6 < 50 { motion.fling(dragVelocity) }
+            gate.release()
         default:
+            let dt = max(Double(now &- lastDragEvent) / 1e9, 1.0 / 240)
+            lastDragEvent = now
+            let v = CGVector(dx: delta.dx / dt, dy: delta.dy / dt)
+            dragVelocity = CGVector(dx: 0.6 * v.dx + 0.4 * dragVelocity.dx, dy: 0.6 * v.dy + 0.4 * dragVelocity.dy)
             renderer.pan(by: delta)
-            renderer.render()
+            renderFrame()
         }
     }
 
-    func viewer(_ view: ViewerView, doubleClickAt point: CGPoint) { perform(.zoomToggle) }
+    func viewer(_ view: ViewerView, doubleClickAt point: CGPoint) {
+        zoom(renderer.zoomMode == .fit ? .scale(1) : .fit, anchor: point)
+    }
 
     func viewerSmartMagnify(_ view: ViewerView, at point: CGPoint) {
         zoom(renderer.zoomMode == .fit ? .scale(1) : .fit, anchor: point)
+    }
+
+    func viewer(_ view: NSView, didDrop urls: [URL]) -> Bool {
+        guard !urls.isEmpty else { return false }
+        if let onOpenURLs { onOpenURLs(urls) } else { open(urls) }
+        return true
     }
 
     // MARK: Helpers
