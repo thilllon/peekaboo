@@ -54,8 +54,8 @@ public struct TOMLTable: Equatable, Sendable {
 /// Dependency-free parser for the TOML subset of `docs/CONFIG.md`: `#` comments, `[a.b]` table headers,
 /// bare/quoted/dotted keys, basic strings (`\" \\ \b \t \n \f \r \e \uXXXX \UXXXXXXXX`), literal strings,
 /// integers (`_` separators, `0x`/`0o`/`0b`), floats (`inf`, `nan`), booleans and arrays (may span lines,
-/// trailing comma, comments inside). Duplicate keys and tables are errors. Not supported (reported as
-/// errors): multi-line strings, inline tables, arrays of tables and dates.
+/// trailing comma, comments inside, nested up to 32 deep). Duplicate keys and tables are errors. Not
+/// supported (reported as errors): multi-line strings, inline tables, arrays of tables and dates.
 public struct TOMLDocument: Equatable, Sendable {
     public let entries: [TOMLEntry]
     public let tables: [TOMLTable]
@@ -241,19 +241,26 @@ private struct TOMLParser {
 
     // MARK: Values
 
-    private mutating func parseValue() throws -> TOMLValue {
+    /// Arrays nest by recursion, so the depth is capped: a pasted `[[[[…]]]]` must be an error, not a crash
+    /// of the parsing thread (the config needs flat arrays of strings).
+    static let maxArrayDepth = 32
+
+    private mutating func parseValue(depth: Int = 0) throws -> TOMLValue {
         guard let c = peek else { throw error("expected a value") }
         switch c {
         case UInt8(ascii: "\""): return .string(try parseBasicString())
         case UInt8(ascii: "'"): return .string(try parseLiteralString())
-        case UInt8(ascii: "["): return try parseArray()
+        case UInt8(ascii: "["): return try parseArray(depth: depth + 1)
         case UInt8(ascii: "{"): throw error("inline tables ({…}) are not supported; use a [table]")
         case 0x0A, 0x0D, UInt8(ascii: "#"): throw error("expected a value")
         default: return try parseScalar()
         }
     }
 
-    private mutating func parseArray() throws -> TOMLValue {
+    private mutating func parseArray(depth: Int) throws -> TOMLValue {
+        guard depth <= Self.maxArrayDepth else {
+            throw error("arrays nested more than \(Self.maxArrayDepth) deep are not supported")
+        }
         let openLine = line
         let openColumn = error("").column
         i += 1
@@ -264,7 +271,7 @@ private struct TOMLParser {
                 throw TOMLError(line: openLine, column: openColumn, message: "unterminated array")
             }
             if c == UInt8(ascii: "]") { i += 1; return .array(items) }
-            items.append(try parseValue())
+            items.append(try parseValue(depth: depth))
             skipWhitespaceCommentsAndNewlines()
             if peek == UInt8(ascii: ",") { i += 1; continue }
             if peek == UInt8(ascii: "]") { i += 1; return .array(items) }

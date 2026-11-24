@@ -55,7 +55,8 @@ only in a comment, so uncommenting its settings never produces a warning.
 
 The file is standard TOML, limited to what the schema needs: `# comments`, `[table]` headers, bare,
 quoted and dotted keys, basic strings (`"…"` with `\" \\ \n \t \uXXXX` escapes), literal strings
-(`'…'`), integers, floats, booleans and arrays (which may span lines and end with a comma).
+(`'…'`), integers, floats, booleans and arrays (which may span lines and end with a comma, and nest
+up to 32 deep).
 Multi-line strings, inline tables, arrays of tables and dates are not supported and are reported as
 errors. A key made of anything other than letters, digits, `_` and `-` must be quoted:
 `"cmd+," = "app.config"`, `"?" = "view.help"`, `"g g" = "nav.first"`.
