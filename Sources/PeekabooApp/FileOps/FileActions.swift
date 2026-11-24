@@ -258,7 +258,8 @@ final class FileActions {
             add("\(name)   \(url.lastPathComponent)  (\(slots[name]!))", url, key: name.count == 1 ? name : "")
         }
         menu.addItem(.separator())
-        let other = menu.addItem(withTitle: "Other Folder…", action: #selector(MenuPicker.pick(_:)), keyEquivalent: "o")
+        let other = menu.addItem(withTitle: "Other Folder…", action: #selector(MenuPicker.pick(_:)),
+                                 keyEquivalent: slots["o"] == nil ? "o" : "")
         other.keyEquivalentModifierMask = []
         other.target = picker
         other.tag = -1
