@@ -262,7 +262,8 @@ public final class Renderer {
             requestDisplay()
         }
     }
-    /// Keep zoom and pan when switching to another image.
+    /// Keep zoom and pan when switching to another image: the zoom mode stays, and the same point of the picture
+    /// relative to its size (the same pixel for images of the same size) stays at the view centre.
     public var keepZoom = false
     /// Asks the host to call `render()` soon (e.g. a refinement became available).
     public var onNeedsDisplay: (() -> Void)?
@@ -294,9 +295,14 @@ public final class Renderer {
     private var backingScale: CGFloat = 2
     /// Image-space point (display orientation, full-resolution pixels) at the view centre.
     private var center = SIMD2<Double>(0, 0)
+    /// `center` as a fraction of the last image's display size: the pan `keepZoom` carries to the next file (also
+    /// across an image-less file, e.g. one that failed to decode).
+    private var relativeCenter = SIMD2<Double>(0.5, 0.5)
 
     private typealias Canvas = HQCanvas
     private var canvas: Canvas?
+    /// How the last frame was drawn (`.canvas`: `canvas` is on screen).
+    private var lastMode = Mode.background
     private var offscreenTarget: MTLTexture?
     private var canvasTexture: MTLTexture?
     private var tmpTexture: MTLTexture?
@@ -322,8 +328,10 @@ public final class Renderer {
     private var refitWork: DispatchWorkItem?
 
     private var hdrActive = false
+    private var pressureSource: DispatchSourceMemoryPressure?
 
-    public init(layer: CAMetalLayer) {
+    /// `monitorsMemoryPressure`: trim on the system's memory-pressure events (as `ImagePipeline` does; see `trim`).
+    public init(layer: CAMetalLayer, monitorsMemoryPressure: Bool = true) {
         context = RenderContext.shared
         self.layer = layer
         layer.device = context.device
@@ -333,6 +341,53 @@ public final class Renderer {
         layer.colorspace = CGColorSpace(name: CGColorSpace.displayP3)
         layer.maximumDrawableCount = 3
         updatePresentMode()
+        if monitorsMemoryPressure {
+            let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .main)
+            source.setEventHandler { [weak self, weak source] in
+                guard let self, let event = source?.data else { return }
+                self.handleMemoryPressure(event)
+            }
+            source.resume()
+            pressureSource = source
+        }
+    }
+
+    deinit { pressureSource?.cancel() }
+
+    // MARK: Memory
+
+    /// Give back GPU memory (memory pressure; the host's window closed). Lets go of everything held for images other
+    /// than the shown one — the prepared neighbours with their pixels (which return to the pool or the system once the
+    /// pipeline has evicted them too), pyramids and fit canvases — and of the previous tier, a canvas no longer on
+    /// screen, the scratch textures and the weight tables; all are rebuilt lazily, so the next navigation to a dropped
+    /// neighbour rasterises instead of presenting. `critical` also frees the shown image's pyramid levels above the one
+    /// its view reads (rebuilt when a view reads them). The view on screen stays present-only. A host that also trims
+    /// its decode cache calls this first, so the pixel buffers released here reach its pool before it is drained.
+    public func trim(critical: Bool) {
+        var released = prepared.map(\.gpu).filter { $0 !== gpu }
+        if let p = previousTier, !released.contains(where: { $0 === p }) { released.append(p) }
+        for g in released {
+            g.cancel()
+            g.onLevelReady = nil   // a level or colour transform landing later must not render a fit canvas for it
+            g.onColorReady = nil
+        }
+        prepared.removeAll { $0.gpu !== gpu }
+        previousTier = nil
+        refitWork?.cancel()
+        refitWork = nil
+        gpu?.fitCanvas = nil
+        if lastMode != .canvas || canvas?.source != gpu.map(ObjectIdentifier.init) { canvas = nil }
+        if canvasTexture !== canvas?.texture { canvasTexture = nil }
+        tmpTexture = nil
+        tables = nil
+        offscreenTarget = nil
+        if critical, let gpu { gpu.dropLevels(above: gpu.bestLevel(atMost: gpu.wantedLevel(f: 1 / effectiveScale))) }
+        Trace.log("renderer trim\(critical ? " (critical)" : ""): \(released.count) images released")
+    }
+
+    /// The system's memory-pressure event (main queue): `.warning` trims, `.critical` trims the shown image too.
+    func handleMemoryPressure(_ event: DispatchSource.MemoryPressureEvent) {
+        trim(critical: event.contains(.critical))
     }
 
     // MARK: Content
@@ -341,6 +396,7 @@ public final class Renderer {
     /// the same key with a better tier swaps pixels in place without moving anything.
     public func setImage(_ image: DecodedImage?, key: AnyHashable?) {
         let isNewFile = key != imageKey
+        if self.image != nil { relativeCenter = center / displaySize }
         self.image = image
         imageKey = key
         let previous = gpu
@@ -360,8 +416,12 @@ public final class Renderer {
             quarterTurns = 0
             flippedHorizontally = false
             flippedVertically = false
-            if !keepZoom { zoomMode = .fit }
-            center = displaySize / 2
+            if keepZoom {
+                center = relativeCenter * displaySize
+            } else {
+                zoomMode = .fit
+                center = displaySize / 2
+            }
         }
         configureDynamicRange(hdr: image?.isHDR ?? false)
         clampCenter()
@@ -644,6 +704,7 @@ public final class Renderer {
         if let current = g {
             if current.readyLevel >= current.maxLevel { previousTier = nil }
             let f = 1 / effectiveScaleFor(drawable: D)
+            current.rebuildLevels(for: f, context: context)   // levels a critical `trim` freed, once read again
             if levelMissing(current, f: f), let prev = previousTier, prev.isUsable,
                !levelMissing(prev, f: f) || prev.image.tier == .preview {
                 g = prev
@@ -768,6 +829,7 @@ public final class Renderer {
             }
         }
         lastPath = "\(mode)"
+        lastMode = mode
         q.mode = mode.rawValue
 
         let pass = MTLRenderPassDescriptor()

@@ -9,7 +9,8 @@ import QuartzCore
 /// `peekaboo-bench render [image] [--frames N] [--size WxH] [--no-ar] [--png DIR]`
 ///
 /// GPU time per frame of the PPR renderer at fit / 0.5 / 1.0 / 2.5 / 5× (settle frame = pyramid level + residual
-/// Lanczos-3 into the canvas + present; canvas reuse = present only; gesture = trilinear), plus the pyramid build.
+/// Lanczos-3 into the canvas + present; canvas reuse = present only; gesture = trilinear), plus the pyramid build and
+/// the memory `Renderer.trim` gives back.
 /// The default image is `$PEEKABOO_CORPUS/jpeg/jpeg_24mp_5947x3964.jpg`.
 func runRenderBench(_ args: ArraySlice<String>) throws {
     var path: String?
@@ -64,7 +65,7 @@ func runRenderBench(_ args: ArraySlice<String>) throws {
     for _ in 0..<3 {
         let copy = DecodedImage(pixels: image.pixels, tier: .full, fullWidth: image.fullWidth, fullHeight: image.fullHeight,
                                 orientation: image.orientation, isHDR: false, decodeNanos: 0)
-        let probe = Renderer(layer: CAMetalLayer())
+        let probe = Renderer(layer: CAMetalLayer(), monitorsMemoryPressure: false)
         probe.setViewSize(CGSize(width: size.0, height: size.1), backingScale: 1)
         probe.setImage(copy, key: "rebuild")
         let until = Date().addingTimeInterval(10)
@@ -76,7 +77,7 @@ func runRenderBench(_ args: ArraySlice<String>) throws {
                      builds.count, best.gpuMs, best.wallMs))
     }
 
-    let renderer = Renderer(layer: CAMetalLayer())
+    let renderer = Renderer(layer: CAMetalLayer(), monitorsMemoryPressure: false)
     renderer.setViewSize(CGSize(width: size.0, height: size.1), backingScale: 1)
     renderer.settings.antiRinging = !noAR
     renderer.setImage(image, key: "bench")
@@ -123,7 +124,7 @@ func runRenderBench(_ args: ArraySlice<String>) throws {
     }
     // The usual fit view: the screen tier (decoded to cover the screen), treated as pyramid level k.
     let screen = try ImageIODecoder().decode(URL(fileURLWithPath: path), tier: .screen, targetLongSide: max(size.0, size.1), pool: pool)
-    let tiered = Renderer(layer: CAMetalLayer())
+    let tiered = Renderer(layer: CAMetalLayer(), monitorsMemoryPressure: false)
     tiered.setViewSize(CGSize(width: size.0, height: size.1), backingScale: 1)
     tiered.setImage(screen, key: "screen")
     let until = Date().addingTimeInterval(10)
@@ -153,6 +154,48 @@ func runRenderBench(_ args: ArraySlice<String>) throws {
     print(String(format: "next image after prepare(): first frame %.3f ms (%@, %d/%d rasterised)", median(firstFrames),
                  tiered.lastPath, rasterised, frames))
 
+    // Memory pressure / window closed: what `trim` gives back. The shown screen tier plus 3 prepared neighbours that
+    // only the renderer still references (as after the pipeline evicted them), each trim followed by the pool drain
+    // the pipeline's memory-pressure handler does.
+    let holder = Renderer(layer: CAMetalLayer(), monitorsMemoryPressure: false)
+    holder.setViewSize(CGSize(width: size.0, height: size.1), backingScale: 1)
+    holder.setImage(screen, key: "shown")
+    func settle(_ image: DecodedImage) {
+        let until = Date().addingTimeInterval(10)
+        while !holder.isPyramidComplete(for: image) && Date() < until { RunLoop.main.run(until: Date().addingTimeInterval(0.001)) }
+    }
+    settle(screen)
+    _ = holder.renderOffscreen(format: .bgra8Unorm)
+    for _ in 0..<3 {
+        let neighbour = try ImageIODecoder().decode(URL(fileURLWithPath: path), tier: .screen, targetLongSide: max(size.0, size.1), pool: pool)
+        holder.prepare(neighbour)
+        settle(neighbour)
+    }
+    func memory() -> (footprint: Double, metal: Double) {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))   // GPU completion handlers release their resources
+        pool.drain()
+        // Freed GPU memory leaves the footprint with a delay: wait (≤ 2 s) until it holds still for 0.25 s.
+        var footprint = footprintMB(), still = 0, polls = 0
+        while still < 5 && polls < 40 {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+            let now = footprintMB()
+            still = abs(now - footprint) < 1 ? still + 1 : 0
+            footprint = now
+            polls += 1
+        }
+        return (footprint, Double(context.device.currentAllocatedSize) / 1_048_576)
+    }
+    let held = memory()
+    holder.trim(critical: false)
+    let trimmed = memory()
+    holder.setZoom(.scale(1))
+    _ = holder.renderOffscreen(format: .bgra8Unorm)
+    holder.trim(critical: true)
+    let critical = memory()
+    print(String(format: "trim, shown %dx%d + 3 prepared: footprint %.0f -> %.0f MB (trim) -> %.0f MB (critical, 1:1 view); "
+                 + "Metal allocations %.0f -> %.0f -> %.0f MB", screen.pixels.width, screen.pixels.height,
+                 held.footprint, trimmed.footprint, critical.footprint, held.metal, trimmed.metal, critical.metal))
+
     // Main-thread cost of `setImage` for an uncommon ICC profile (first sight: the probe used to run here).
     if let adobe = CGColorSpace(name: CGColorSpace.adobeRGB1998) {
         let px = image.pixels
@@ -160,13 +203,23 @@ func runRenderBench(_ args: ArraySlice<String>) throws {
                                  colorSpace: adobe, storage: px.storage)
         let probeImage = DecodedImage(pixels: pixels, tier: .full, fullWidth: image.fullWidth, fullHeight: image.fullHeight,
                                       orientation: image.orientation, isHDR: false, decodeNanos: 0)
-        let viewer = Renderer(layer: CAMetalLayer())
+        let viewer = Renderer(layer: CAMetalLayer(), monitorsMemoryPressure: false)
         viewer.setViewSize(CGSize(width: size.0, height: size.1), backingScale: 1)
         let t0 = Trace.now()
         viewer.setImage(probeImage, key: "adobe")
         let setMs = Trace.ms(since: t0)
         print(String(format: "setImage, Adobe RGB (1998) first sight: main thread %.3f ms (ICC probe runs off the main thread)", setMs))
     }
+}
+
+/// Physical footprint of the process (Activity Monitor's "Memory"), MB.
+private func footprintMB() -> Double {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+    let result = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) }
+    }
+    return result == KERN_SUCCESS ? Double(info.phys_footprint) / 1_048_576 : .nan
 }
 
 /// Write a `bgra8Unorm` frame (Display P3 encoded) as PNG, for eyeballing the renderer's output.
