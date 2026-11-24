@@ -429,7 +429,7 @@ final class FileActions {
     private func reloadConfig() -> FileActionResult {
         guard let store = ConfigStore.current else { return FileActionResult(toast: "No config loaded") }
         store.load()
-        return FileActionResult(toast: store.lastError ?? "Config reloaded")
+        return FileActionResult(toast: store.lastError ?? store.lastWarning.map { "Config reloaded · \($0)" } ?? "Config reloaded")
     }
 
     /// Register Peekaboo as the default viewer for the image types of its Info.plist (explicit action only).

@@ -68,9 +68,17 @@ public final class ConfigStore {
     /// Main thread, after every successful (re)load.
     public var onChange: ((AppConfig) -> Void)?
     /// Main thread, with a message such as `config.toml:17: unknown action "nav.nxt"`; the previous config stays active.
+    /// Also gets the warnings when `onWarning` is nil (every message is meant for a toast).
     public var onError: ((String) -> Void)?
+    /// Main thread, after a load that applied but skipped unknown tables or keys, with a message such as
+    /// `config.toml:3: ignored unknown key "view.fit" (+1 more)`. When nil, `onError` gets it.
+    public var onWarning: ((String) -> Void)?
     /// The last load's error message (nil after a successful load), for errors raised before `onError` was set.
     public private(set) var lastError: String?
+    /// Every unknown table and key the last successful load skipped, one line-numbered message each.
+    public private(set) var warnings: [String] = []
+    /// `warnings` as one toast-sized message; nil when there are none.
+    public var lastWarning: String? { ConfigError.summary(warnings) }
     /// Debounce for file-system events.
     public var debounce: DispatchTimeInterval = .milliseconds(50)
 
@@ -133,7 +141,7 @@ public final class ConfigStore {
 
     private enum Outcome {
         case unchanged
-        case loaded(AppConfig)
+        case loaded(AppConfig, warnings: [String])
         case failed(String)
     }
 
@@ -142,12 +150,13 @@ public final class ConfigStore {
         let data = try? Data(contentsOf: url)
         if !force, let lastData, lastData == data { return .unchanged }
         lastData = .some(data)
-        guard let data else { return .loaded(.default) }
+        guard let data else { return .loaded(.default, warnings: []) }
         let started = Trace.now()
         do {
-            let config = try AppConfig(toml: String(decoding: data, as: UTF8.self), fileName: url.lastPathComponent)
+            let (config, warnings) = try AppConfig.parse(toml: String(decoding: data, as: UTF8.self), fileName: url.lastPathComponent)
             Trace.log("config loaded \(url.lastPathComponent) (\(data.count) B) in \(String(format: "%.2f", Trace.ms(since: started))) ms")
-            return .loaded(config)
+            if !warnings.isEmpty { Trace.log("config warnings: \(warnings.joined(separator: "; "))") }
+            return .loaded(config, warnings: warnings)
         } catch let error as ConfigError {
             Trace.log("config error: \(error.messages.joined(separator: "; "))")
             return .failed(error.description)
@@ -159,10 +168,12 @@ public final class ConfigStore {
     private func apply(_ outcome: Outcome) {
         switch outcome {
         case .unchanged: return
-        case .loaded(let config):
+        case .loaded(let config, let warnings):
             lastError = nil
+            self.warnings = warnings
             self.config = config
             onChange?(config)
+            if let warning = lastWarning { (onWarning ?? onError)?(warning) }
         case .failed(let message):
             lastError = message
             onError?(message)
