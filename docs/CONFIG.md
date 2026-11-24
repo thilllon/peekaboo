@@ -131,9 +131,20 @@ chord   := ( modifier "+" )* key
 - **Shift is a modifier.** An uppercase letter or a shifted symbol means shift plus the key that
   produces it on a US keyboard: `G` = `shift+g`, `?` = `shift+/`, `+` = `shift+=`, `<` = `shift+,`,
   `>` = `shift+.`, `|` = `shift+\`, `_` = `shift+-`, `!` = `shift+1`, `)` = `shift+0`, `cmd++` = `cmd+shift+=`.
-- **Physical keys.** Chords match the key you press, translated through your ASCII-capable keyboard
-  layout, not the character it types. Bindings keep working while a Korean, Japanese or other input
-  method is active, and `opt+1` is the 1 key rather than `¡`.
+- **Keyboard layouts.** Chords are written in US terms and match keys through your ASCII-capable
+  keyboard layout, so bindings keep working while a Korean, Japanese or other input method is active,
+  and on German, French and other keyboards:
+  - Letters are the keys labelled with them: `z` is the Z key on a German or French keyboard.
+  - Digits are the keys that type them, with or without shift: on a French keyboard `1` is the `&` key
+    and `shift+1` that key with shift. Where a layout types digits only with option (Lithuanian,
+    Vietnamese), the number-row keys are the digits.
+  - A symbol is the key that types it: on a German keyboard `+` is the `+` key and `?` is ⇧ß. With
+    shift held, the shifted symbol counts.
+  - A key that types a letter outside a–z (`ü`, `ß`, `é`, `ñ`, `å`, …) or a symbol of the US number
+    row (`$` on a French keyboard, which would otherwise mean `shift+4`) stands for the US key in its
+    place: `ü` on a German keyboard is `[`.
+  - Option and command do not change the key: `opt+1` is the 1 key rather than `¡`, and on a German
+    keyboard `opt+5` is the 5 key (move to slot 5) although it types `[`.
 
 Leave the system shortcuts alone: ⌃Space and ⌘Space (input source, Spotlight), ⌃arrows (Mission
 Control), ⌘Tab, ⌘\`, ⌘H, ⌥⌘H, ⌘M, ⇧⌘3/4/5, ⌃⌘Q, ⌥⌘Esc and ⌃1…9 never reach the app or are best kept free.
@@ -235,6 +246,20 @@ Ids are `namespace.verb`, optionally followed by `:argument`.
 | `view.help` | `?` `cmd+/` |
 | `app.close` | `cmd+w` `q` |
 | `app.quit` / `app.open` | `cmd+q` / `cmd+o` |
+
+On other keyboard layouts the keys are matched as [above](#chord-syntax). A symbol that a layout
+types only with option has no default key there, because option keeps the physical key: `]`
+(`nav.jump:+10`) and `|` (`view.flip_h`) on German keyboards, `[` and `]` on Spanish ISO ones, `|`
+on Swedish, Danish and French ones. The same goes for the number-row symbols of layouts that type
+their digits with shift, since those keys are the digits (`-` on Lithuanian LST 1582). Bind other
+keys for them if you use them:
+
+```toml
+[keys]
+"shift+pageup" = "nav.jump:-10"
+"shift+pagedown" = "nav.jump:+10"
+"h" = "view.flip_h"
+```
 
 **Zoomed** (`[keys.zoomed]`, while zoomed in beyond fit): `left` `right` `up` `down` pan
 (`pan.*`), `shift+left` `shift+right` `shift+up` `shift+down` jump to that edge (`pan.edge:*`).
