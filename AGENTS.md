@@ -21,6 +21,7 @@ smoothness (120 Hz ProMotion, 144 Hz external), then by features.
 ```sh
 mise install       # pinned gitleaks + lefthook (mise.toml)
 mise run setup     # installs the git hooks
+brew install jpeg-turbo   # static libturbojpeg linked into PeekabooCore
 ```
 
 ## Commands
@@ -29,8 +30,8 @@ mise run setup     # installs the git hooks
 |---|---|
 | Debug build | `swift build` (`mise run build`) |
 | Unit tests | `swift test` (`mise run test`) |
-| Release app bundle | `scripts/build-app.sh` → `build/Peekaboo.app` |
-| Install locally | `scripts/install.sh` → `~/Applications/Peekaboo.app` |
+| Release app bundle | `mise run app` → `build/Peekaboo.app` |
+| Install locally | `mise run install` → `~/Applications/Peekaboo.app` |
 | Secret scan (history + tree) | `mise run secrets` |
 | Latency trace | `PEEKABOO_TRACE=1 build/Peekaboo.app/Contents/MacOS/Peekaboo <image>` |
 | Benchmarks | `swift run -c release peekaboo-bench <suite>` |
@@ -43,7 +44,7 @@ mise run setup     # installs the git hooks
   resampling kernels, progressive refinement).
 - `Sources/PeekabooApp` — programmatic AppKit shell (no storyboards, nibs or SwiftUI).
 - `Sources/PeekabooBench` — `peekaboo-bench` performance regression CLI.
-- `Resources/Info.plist` — bundle metadata and document types; `scripts/` — build/install.
+- `Resources/Info.plist` — bundle metadata and document types; `.mise/tasks/` — app bundle and install tasks.
 
 ## Performance rules
 
@@ -59,7 +60,7 @@ mise run setup     # installs the git hooks
 
 ## Code conventions
 
-- Swift 6.4 toolchain in Swift 5 language mode; deployment target macOS 15.
+- Swift 6.4 toolchain in Swift 5 language mode; deployment target macOS 26 (Apple Silicon).
 - Tests that need Metal, a display or the benchmark corpus must `XCTSkip` when it is unavailable.
 - Prefer Apple frameworks (ImageIO, Metal, Accelerate) and static C libraries over new
   dependencies.

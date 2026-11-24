@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.2
 import PackageDescription
 
 // Release builds favour raw speed: whole-module optimisation is the SwiftPM
@@ -10,7 +10,7 @@ let speed: [SwiftSetting] = [
 
 let package = Package(
     name: "Peekaboo",
-    platforms: [.macOS(.v15)],
+    platforms: [.macOS(.v26)],
     products: [
         .executable(name: "Peekaboo", targets: ["PeekabooApp"]),
         .executable(name: "peekaboo-bench", targets: ["PeekabooBench"]),
@@ -18,8 +18,14 @@ let package = Package(
         .library(name: "PeekabooRender", targets: ["PeekabooRender"]),
     ],
     targets: [
+        // libjpeg-turbo (static): parallel CPU JPEG decoding with DCT scaling and ROI crops.
+        .systemLibrary(name: "CTurboJPEG", path: "Sources/CTurboJPEG"),
         // Decode tiers, tiered cache, prefetch scheduler, folder model, config/keymap. No AppKit.
-        .target(name: "PeekabooCore", swiftSettings: speed),
+        .target(
+            name: "PeekabooCore",
+            dependencies: ["CTurboJPEG"],
+            swiftSettings: speed,
+            linkerSettings: [.unsafeFlags(["/opt/homebrew/opt/jpeg-turbo/lib/libturbojpeg.a"])]),
         // Metal renderer: textures, quality pyramid, resampling kernels, progressive refinement.
         .target(name: "PeekabooRender", dependencies: ["PeekabooCore"], swiftSettings: speed),
         // AppKit shell (programmatic; no storyboard, no SwiftUI).
