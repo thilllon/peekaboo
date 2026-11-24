@@ -2,7 +2,13 @@ import Foundation
 import Metal
 import PeekabooCore
 
-/// `peekaboo-bench pipeline [--corpus DIR] [--trace steady|burst|ab|random|all] [--screen PX] [--quick]`
+/// `peekaboo-bench pipeline [--corpus DIR] [--trace steady|burst|ab|random|all] [--screen PX] [--quick] [--cold]
+/// [--all-previews]`
+///
+/// `--cold` starts each trace right after the first image is sharp, without the background preview sweep (as when
+/// the user starts browsing a folder at once): first-pixel latency is then measured instead of hidden by a warm
+/// preview cache. `--all-previews` restores the old planner rule that also prefetched expensive previews inside the
+/// screen-tier window (A/B against the default).
 ///
 /// Replays navigation traces against the real decoder and reports, per trace, the share of navigations that found
 /// the sharp tier cached (hit rate), time-to-first-pixel and time-to-sharp percentiles, decode/waste counts and the
@@ -12,6 +18,7 @@ func runPipelineBench(_ args: ArraySlice<String>) throws {
     var traceName = "all"
     var screen = 3456
     var quick = false
+    var options = ReplayOptions()
     var listing: Int?
     var rest = args
     while let arg = rest.popFirst() {
@@ -20,6 +27,8 @@ func runPipelineBench(_ args: ArraySlice<String>) throws {
         case "--trace": traceName = rest.popFirst() ?? "all"
         case "--screen": screen = Int(rest.popFirst() ?? "") ?? screen
         case "--quick": quick = true
+        case "--cold": options.cold = true
+        case "--all-previews": options.allPreviews = true
         case "--listing": listing = Int(rest.popFirst() ?? "") ?? 10_000
         default: throw BenchError.usage("unknown option \(arg)")
         }
@@ -42,13 +51,14 @@ func runPipelineBench(_ args: ArraySlice<String>) throws {
         scanTimes.append(Trace.ms(since: start))
     }
     guard files.count >= 8 else { throw BenchError.usage("need at least 8 images in \(folder.lastPathComponent)") }
-    print("pipeline bench: \(files.count) files, screen \(screen) px, scan median \(fmt(median(scanTimes))) ms")
+    print("pipeline bench: \(files.count) files, screen \(screen) px, scan median \(fmt(median(scanTimes))) ms"
+          + (options.cold ? ", cold (no sweep, no settle)" : "") + (options.allPreviews ? ", all previews" : ""))
 
     let traces = makeTraces(count: files.count, quick: quick).filter { traceName == "all" || $0.name == traceName }
     guard !traces.isEmpty else { throw BenchError.usage("unknown trace \(traceName)") }
     print("trace    events  hit%  px@0%  first-pixel p50/p90/p99 ms  sharp p50/p90/p99 ms   decodes wasted  nav() p50/p99 µs")
     for trace in traces {
-        let result = replay(trace, files: files, device: device, screen: screen)
+        let result = replay(trace, files: files, device: device, screen: screen, options: options)
         print(result.line(trace.name))
     }
 }
@@ -136,9 +146,21 @@ private struct ReplayResult {
     }
 }
 
-private func replay(_ trace: NavTrace, files: [ImageFile], device: MTLDevice, screen: Int) -> ReplayResult {
+private struct ReplayOptions {
+    var cold = false
+    var allPreviews = false
+}
+
+private func replay(_ trace: NavTrace, files: [ImageFile], device: MTLDevice, screen: Int,
+                    options: ReplayOptions) -> ReplayResult {
     var config = PipelineConfig(screenLongSide: screen)
     config.monitorsMemoryPressure = false
+    if options.cold {
+        config.sweepLanes = 0
+        config.quickLookSweep = false
+        config.tuning.sweepEnabled = false
+    }
+    if options.allPreviews { config.tuning.screenWindowCheapPreviewsOnly = false }
     let pipeline = ImagePipeline(decoder: ImageIODecoder(), pool: PixelBufferPool(device: device), config: config)
     var result = ReplayResult()
     // Measurement of the navigation in progress.
@@ -166,7 +188,7 @@ private func replay(_ trace: NavTrace, files: [ImageFile], device: MTLDevice, sc
     pipeline.setFiles(files, index: trace.name == "ab" ? trace.events[0].index : startIndex)
     let current = pipeline.currentFile!
     spinRunLoop(until: Date().addingTimeInterval(5)) { pipeline.best(for: current).map { $0.tier >= .screen } == true }
-    spinRunLoop(until: Date().addingTimeInterval(0.8)) { false }
+    if !options.cold { spinRunLoop(until: Date().addingTimeInterval(0.8)) { false } }
     let decodesBefore = pipeline.stats.decodes, wastedBefore = pipeline.stats.wasted
 
     let origin = Trace.now()

@@ -151,6 +151,8 @@ public final class ImagePipeline {
     private var pressureUntil: UInt64 = 0
     private var replanQueued = false
     private var averagePreviewBytes = 1 << 20
+    /// Finished decodes waiting for the main thread (drained by a main-queue hop, or synchronously by `waitForCurrent`).
+    private let inbox = OutcomeInbox()
 
     public init(decoder: ImageDecoder, pool: PixelBufferPool, config: PipelineConfig = PipelineConfig()) {
         self.decoder = decoder
@@ -158,8 +160,10 @@ public final class ImagePipeline {
         self.config = config
         costs.alpha = config.tuning.alpha
         let box = WeakPipeline()
+        let inbox = self.inbox
         scheduler = DecodeScheduler(decoder: decoder, pool: pool, infos: infos, limits: config.laneLimits) { outcome in
-            DispatchQueue.main.async { box.pipeline?.handle(outcome) }
+            inbox.push(outcome)
+            DispatchQueue.main.async { box.pipeline?.drainInbox() }
         }
         box.pipeline = self
         if config.monitorsMemoryPressure { startPressureMonitoring() }
@@ -242,6 +246,23 @@ public final class ImagePipeline {
         guard let file = currentFile, isCached(index, .screen), !isCached(index, .full), fullRequested != file.url else { return }
         fullRequested = file.url
         replan()
+    }
+
+    /// Launch fast path: block the main thread for at most `timeout` until a tier of the current file is decoded and
+    /// deliver it (with every other finished decode) synchronously through `onDecoded`, instead of waiting for a
+    /// main-queue turn (during `NSApplication.finishLaunching` that turn comes ~70 ms late). Returns true when the
+    /// current file has pixels; false on timeout, failure or an empty set.
+    @discardableResult
+    public func waitForCurrent(timeout: TimeInterval) -> Bool {
+        guard let file = currentFile else { return false }
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        while true {
+            drainInbox()
+            guard let i = slotIndex(of: file), currentFile == file else { return false }
+            if slots[i].hasPixels { return true }
+            if slots[i].failed & (1 << Tier.screen.rawValue) != 0 { return false }
+            guard inbox.wait(until: deadline) else { return slots[i].hasPixels }
+        }
     }
 
     /// Best tier decoded so far for `file`.
@@ -426,6 +447,10 @@ public final class ImagePipeline {
 
     // MARK: Results
 
+    private func drainInbox() {
+        for outcome in inbox.take() { handle(outcome) }
+    }
+
     private func handle(_ outcome: DecodeOutcome) {
         let key = outcome.job.key
         scheduler.acknowledge(key)
@@ -582,6 +607,35 @@ public final class ImagePipeline {
         }
         source.resume()
         pressureSource = source
+    }
+}
+
+/// Decode outcomes handed from the worker threads to the main thread, in completion order.
+private final class OutcomeInbox: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var outcomes: [DecodeOutcome] = []
+
+    func push(_ outcome: DecodeOutcome) {
+        condition.lock()
+        outcomes.append(outcome)
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func take() -> [DecodeOutcome] {
+        condition.lock(); defer { condition.unlock() }
+        let taken = outcomes
+        outcomes.removeAll()
+        return taken
+    }
+
+    /// Wait until an outcome is pending; false when `deadline` passed first.
+    func wait(until deadline: Date) -> Bool {
+        condition.lock(); defer { condition.unlock() }
+        while outcomes.isEmpty {
+            if !condition.wait(until: deadline) { return !outcomes.isEmpty }
+        }
+        return true
     }
 }
 

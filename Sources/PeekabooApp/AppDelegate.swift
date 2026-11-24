@@ -17,10 +17,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         // from inserting a second "Enter Full Screen".
         UserDefaults.standard.register(defaults: ["NSFullScreenMenuItemEverywhere": false])
         configStore.load()
-        rebuildMenu(configStore.config.keymap)
         // Build the window now so its creation overlaps the wait for the open-documents event.
         let viewer = ViewerWindowController(configStore: configStore)
         self.viewer = viewer
+        // Until launch finishes, `open` presents the first frame in its own turn (AppKit's launch keeps the main
+        // queue waiting ~70 ms) — and the app must be active for that frame to be in front.
+        viewer.presentsSynchronously = true
         viewer.onOpenURLs = { [weak self] urls in self?.open(urls, dedupe: false) }
         viewer.onOpenPanel = { [weak self] in self?.showOpenPanel() }
         configStore.onChange = { [weak self] config in
@@ -36,16 +38,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             let test = SelfTest(folder: URL(fileURLWithPath: (path as NSString).expandingTildeInPath, isDirectory: true), viewer: viewer)
             selfTest = test
             openedSomething = true
+            NSApp.activate()
             test.start()
+            rebuildMenu(configStore.config.keymap)
             return
         }
         // `Peekaboo <path>` from a terminal: start immediately.
         let paths = arguments.filter { !$0.hasPrefix("-") && FileManager.default.fileExists(atPath: $0) }
         if !paths.isEmpty { open(paths.map { URL(fileURLWithPath: $0) }) }
+        // After the first frame: the menu is not needed to draw it.
+        rebuildMenu(configStore.config.keymap)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        viewer?.presentsSynchronously = false
         NSApp.activate()
+        // `load()` ran before `onError` was set: show a broken config now.
+        if let error = configStore.lastError { viewer?.toast(error) }
         scheduleScriptedActions()
         // Launched from the Dock or Spotlight without a document: show the drop hint.
         DispatchQueue.main.async { [weak self] in
@@ -79,6 +88,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         guard !fresh.isEmpty else { return }
         openedSomething = true
         if viewer == nil { viewer = ViewerWindowController(configStore: configStore) }
+        if viewer?.presentsSynchronously == true { NSApp.activate() }
         viewer?.open(fresh)
     }
 

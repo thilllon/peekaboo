@@ -35,6 +35,9 @@ public struct PrefetchTuning: Sendable, Equatable {
     /// this many ms or at most `cheapPreviewRatio` of the screen-tier estimate.
     public var cheapPreviewMs = 8.0
     public var cheapPreviewRatio = 0.25
+    /// Inside the screen-tier window, prefetch a neighbour's preview only when it is cheap (false = always, the
+    /// previous behaviour; kept for A/B runs of `peekaboo-bench pipeline --all-previews`).
+    public var screenWindowCheapPreviewsOnly = true
 
     public init() {}
 
@@ -245,7 +248,11 @@ func planPrefetch(_ nav: NavModel, now: UInt64, tuning t: PrefetchTuning, contex
                 let inPreview = k <= (behind ? t.previewBehind : k0) && e <= t.previewHorizonMs
                 if inScreen { plan.screenWindow.append(j) } else if inPreview { plan.previewWindow.append(j) }
                 if inScreen && !sharp(j) && !c.busy(j, .screen) { candidates.append((e, j, .screen)) }
-                if inPreview && !sharp(j) && !c.cached(j, .preview) && !c.busy(j, .preview) {
+                // Inside the screen window a preview only helps when it is cheap (embedded thumbnail): an expensive
+                // one (a reduced hardware decode) costs as much as the screen tier, lands after it and takes the
+                // engine slot another neighbour's screen tier needed. While skimming the preview is what is shown.
+                let previewWorthIt = !inScreen || skim || !t.screenWindowCheapPreviewsOnly || c.cheapPreview(j)
+                if inPreview && previewWorthIt && !sharp(j) && !c.cached(j, .preview) && !c.busy(j, .preview) {
                     candidates.append((e - 0.01, j, .preview))
                 }
             }
