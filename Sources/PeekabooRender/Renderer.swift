@@ -985,10 +985,7 @@ public final class Renderer {
         let fT = f * max(ts.x, ts.y)
         // Views the frame does not draw from a canvas (1:1 copy, sharp bilinear, Stage-0 B-spline).
         if abs(f * ts.x - 1) < 1e-6 && abs(f * ts.y - 1) < 1e-6 || g.isFullResolution && s >= 4
-            || image.tier == .preview && fT <= 1 + 1e-9 {
-            g.wantsFitCanvas = false
-            return
-        }
+            || image.tier == .preview && fT <= 1 + 1e-9 { return }
         let wanted = fT > 1 + 1e-9 ? min(Int(floor(log2(fT) + 1e-9)), g.maxLevel) : 0
         guard g.bestLevel(atMost: wanted) >= wanted else { return }   // retried when the level lands
         let minv = Perm.exif(image.orientation).transposed

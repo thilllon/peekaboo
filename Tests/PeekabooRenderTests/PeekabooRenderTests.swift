@@ -495,7 +495,9 @@ final class PeekabooRenderTests: XCTestCase {
         while !r.isColorReady(for: image) && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.002)) }
         XCTAssertTrue(r.isColorReady(for: image), "probe finished")
         let c = render(r)[x: 32, y: 24]
+        let probeStart = Trace.now()
         let expected = try XCTUnwrap(ColorTransform.probe(space))
+        let probeMs = Trace.ms(since: probeStart)
         func dec(_ v: UInt8) -> Float {
             let i = min(Int((Float(v) / 255 * Float(expected.lut.count - 1)).rounded()), expected.lut.count - 1)
             return expected.curve == .table ? expected.lut[i] : Float(v) / 255
@@ -505,7 +507,8 @@ final class PeekabooRenderTests: XCTestCase {
         XCTAssertEqual(c.x, Double(p3.x), accuracy: 3e-3)
         XCTAssertEqual(c.y, Double(p3.y), accuracy: 3e-3)
         XCTAssertEqual(c.z, Double(p3.z), accuracy: 3e-3)
-        print(String(format: "setImage with an unprobed profile: %.3f ms on the main thread", setMs))
+        print(String(format: "setImage with an unprobed profile: %.3f ms on the main thread (the synchronous probe it "
+                     + "replaces: %.3f ms)", setMs, probeMs))
     }
 
     /// Embedded sRGB and Display P3 profiles (unnamed ICC spaces, as decoded from most photos) are recognised as the
