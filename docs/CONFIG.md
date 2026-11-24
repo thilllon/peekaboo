@@ -260,9 +260,10 @@ current image**, so it means "a subfolder next to this photo". Missing folders a
 never overwrites another one: a name that is taken becomes `name 2.jpg`, `name 3.jpg`, … (like
 Finder's Keep Both). Undo moves the file back (or removes the copy).
 
-`file.move:ask` (`m`) and `file.copy:ask` (`c`) open a picker: press a slot's key (`1`…`9`, or the
-first character of a one-letter slot name), Return for the previous destination, or `o` to choose any
-folder. `file.move:last` repeats the previous destination without asking.
+`file.move:ask` (`m`) and `file.copy:ask` (`c`) open a menu of your slots. A slot whose name is one
+character (`1`…`9`, `k`, …) is chosen with that key. Return picks the previous destination, and `o`
+("Other Folder…") chooses any folder. `file.move:last` repeats the previous destination without asking.
+Undoing a copy moves the copy to the Trash, as Finder does.
 
 ### Ratings, labels and flags
 
