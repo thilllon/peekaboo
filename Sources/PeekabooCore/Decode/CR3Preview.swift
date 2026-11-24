@@ -44,7 +44,9 @@ enum CR3Preview {
             let type = String(decoding: head[4..<8], as: UTF8.self)
             var headerSize = 8
             if size == 1 { size = be64(head, 8); headerSize = 16 } else if size == 0 { size = fileSize - offset }
-            guard size >= headerSize, offset + size <= fileSize else { break }
+            // A 64-bit largesize can be anything up to Int.max: compare without `offset + size`, which would
+            // overflow and trap (`read` above guarantees offset < fileSize).
+            guard size >= headerSize, size <= fileSize - offset else { break }
             if type == "moov", size < 16 << 20, let moov = read(offset, size) {
                 result += trackJPEGs(moov, from: headerSize, to: size)
             } else if type == "uuid", let uuid = read(offset + 8, 16), uuid == prvwUUID,
@@ -174,7 +176,7 @@ enum CR3Preview {
             var size = be32(d, offset)
             var header = 8
             if size == 1, offset + 16 <= end { size = be64(d, offset + 8); header = 16 } else if size == 0 { size = end - offset }
-            guard size >= header, offset + size <= end else { break }
+            guard size >= header, size <= end - offset else { break }  // overflow-free, as in `candidates`
             if String(decoding: d[offset + 4..<offset + 8], as: UTF8.self) == type {
                 result.append((offset + header, offset + size))
             }
