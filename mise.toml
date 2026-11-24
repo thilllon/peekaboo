@@ -1,4 +1,5 @@
 # Tooling for Peekaboo. `mise install` once, then `mise run setup` installs the git hooks.
+# Multi-line tasks (app, install) live as files in .mise/tasks/.
 [tools]
 gitleaks = "8.30.1"
 lefthook = "2.2.1"
@@ -14,14 +15,6 @@ run = "swift build"
 [tasks.test]
 description = "Run unit tests"
 run = "swift test"
-
-[tasks.app]
-description = "Build the release app bundle (build/Peekaboo.app)"
-run = "scripts/build-app.sh"
-
-[tasks.install]
-description = "Build and install Peekaboo.app into ~/Applications"
-run = "scripts/install.sh"
 
 [tasks.secrets]
 description = "Scan the whole git history and the working tree for secrets"

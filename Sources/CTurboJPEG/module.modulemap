@@ -1,0 +1,4 @@
+module CTurboJPEG [system] {
+    header "shim.h"
+    export *
+}
