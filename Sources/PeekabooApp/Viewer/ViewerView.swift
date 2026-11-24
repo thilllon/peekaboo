@@ -165,12 +165,22 @@ final class ViewerView: NSView {
         delegate?.viewerViewDidResize(self)
     }
 
-    private func layoutOverlay() {
+    override func layout() {
+        super.layout()
+        layoutOverlay()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        layoutOverlay()
+    }
+
+    func layoutOverlay() {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        // Sublayer coordinates of the overlay must be top-left based whatever AppKit did to the
-        // backing layer's flip state.
-        overlayLayer.isGeometryFlipped = !metalLayer.contentsAreFlipped()
+        // Sublayers must use top-left coordinates. AppKit flips the layer tree of flipped views,
+        // but only once the layer is attached; re-evaluated on every layout.
+        if metalLayer.superlayer != nil { overlayLayer.isGeometryFlipped = !metalLayer.contentsAreFlipped() }
         overlayLayer.frame = metalLayer.bounds
         dropOutline.frame = overlayLayer.bounds.insetBy(dx: 2, dy: 2)
         CATransaction.commit()

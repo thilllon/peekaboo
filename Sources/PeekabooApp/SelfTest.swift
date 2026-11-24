@@ -46,6 +46,8 @@ final class SelfTest {
         let target: ImageFile
         /// Target pixels were on screen in the frame rendered by the action itself.
         let immediate: Bool
+        /// Main-thread time spent inside `perform(.next)` (key handling → frame committed).
+        let mainThreadMs: Double
         var committed: UInt64?
         var presented: UInt64?
         var tier: Tier?
@@ -150,8 +152,10 @@ final class SelfTest {
             }
             let start = Trace.now()
             self.viewer.perform(.next, isRepeat: isRepeat && done > 0)
+            let mainThread = Trace.ms(since: start)
             guard let target = self.viewer.pipeline.currentFile else { return }
-            self.steps.append(Step(start: start, target: target, immediate: self.viewer.displayedFile == target))
+            self.steps.append(Step(start: start, target: target, immediate: self.viewer.displayedFile == target,
+                                   mainThreadMs: mainThread))
             // A frame committed inside perform() was reported before the step existed.
             if let last = self.viewer.lastCommittedFrame, last.file == target, last.committed >= start {
                 self.steps[self.steps.count - 1].committed = last.committed
@@ -163,7 +167,7 @@ final class SelfTest {
 
     private func recordLaunch() {
         let start = LaunchClock.processStartWall()
-        func ms(_ wall: Double?) -> Any { wall.map { round((($0 - start) * 1000) * 10) / 10 } ?? NSNull() }
+        func ms(_ wall: Double?) -> Any { wall.map { SelfTest.number(($0 - start) * 1000, digits: 1) } ?? NSNull() }
         results["launch_to_main_ms"] = ms(LaunchClock.mainWall)
         results["launch_to_first_commit_ms"] = ms(firstCommitWall)
         results["launch_to_first_frame_ms"] = ms(firstPresent?.wall)
@@ -175,7 +179,7 @@ final class SelfTest {
             guard !values.isEmpty else { return NSNull() }
             let sorted = values.sorted()
             let rank = Int((p * Double(sorted.count - 1)).rounded())
-            return round(sorted[rank] * 100) / 100
+            return SelfTest.number(sorted[rank])
         }
         let latencies = steps.compactMap { s in s.presented.map { Double($0 &- s.start) / 1e6 } }
         let commits = steps.compactMap { s in s.committed.map { Double($0 &- s.start) / 1e6 } }
@@ -190,11 +194,18 @@ final class SelfTest {
             "never_shown": steps.filter { $0.presented == nil }.count,
             "p50_ms": percentile(latencies, 0.5),
             "p95_ms": percentile(latencies, 0.95),
-            "max_ms": latencies.max().map { round($0 * 100) / 100 } ?? NSNull(),
+            "max_ms": latencies.max().map { SelfTest.number($0) } ?? NSNull(),
+            "main_thread_p50_ms": percentile(steps.map(\.mainThreadMs), 0.5),
+            "main_thread_max_ms": steps.map(\.mainThreadMs).max().map { SelfTest.number($0, digits: 3) } ?? NSNull(),
             "hit_p50_ms": percentile(immediateLatencies, 0.5),
             "commit_p50_ms": percentile(commits, 0.5),
             "first_tier": tiers,
         ]
+    }
+
+    /// Fixed-precision JSON number (JSONSerialization prints Doubles with binary noise).
+    static func number(_ value: Double, digits: Int = 2) -> NSDecimalNumber {
+        NSDecimalNumber(string: String(format: "%.\(digits)f", value))
     }
 
     private func finish(timedOut: Bool) {

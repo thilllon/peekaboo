@@ -43,6 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.activate()
+        scheduleScriptedActions()
         // Launched from the Dock or Spotlight without a document: show the drop hint.
         DispatchQueue.main.async { [weak self] in
             guard let self, !self.openedSomething else { return }
@@ -76,6 +77,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         openedSomething = true
         if viewer == nil { viewer = ViewerWindowController(configStore: configStore) }
         viewer?.open(fresh)
+    }
+
+    /// Development aid for scripted screenshots: `PEEKABOO_ACTIONS="view.hud,view.help"` performs
+    /// those action ids one after another (400 ms apart), starting 1 s after launch.
+    private func scheduleScriptedActions() {
+        guard let script = ProcessInfo.processInfo.environment["PEEKABOO_ACTIONS"], !script.isEmpty else { return }
+        let actions = script.split(separator: ",").compactMap { Action(id: String($0)) }
+        for (i, action) in actions.enumerated() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1 + 0.4 * Double(i)) { [weak self] in
+                self?.viewer?.perform(action)
+            }
+        }
     }
 
     // MARK: Open panel
