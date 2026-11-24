@@ -43,14 +43,36 @@ public enum FolderScanner {
             if (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
                 return (try scan(url), 0)
             }
-            let files = try scan(url.deletingLastPathComponent())
-            let index = files.firstIndex { $0.url.standardizedFileURL == url.standardizedFileURL } ?? 0
-            return (files, index)
+            return opened(url, in: try scan(url.deletingLastPathComponent()))
         }
         let files = urls.filter(isSupported).map { url in
             ImageFile(url: url, name: url.lastPathComponent, byteSize: 0, modified: 0, fileID: 0)
         }
         return (files, 0)
+    }
+
+    /// The opened file's place in its folder's listing. The path as typed may differ from the name on disk in letter
+    /// case or Unicode normalisation (macOS file systems ignore both): it is matched by file identity then. A file the
+    /// listing leaves out (hidden) is browsed at its Finder position instead of silently showing the first image.
+    static func opened(_ url: URL, in files: [ImageFile]) -> (files: [ImageFile], index: Int) {
+        let target = url.standardizedFileURL
+        if let index = files.firstIndex(where: { $0.url.standardizedFileURL == target }) { return (files, index) }
+        var info = stat()
+        guard stat(target.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { return (files, 0) }
+        let id = UInt64(info.st_ino)
+        let name = target.lastPathComponent
+        let same = files.indices.filter { files[$0].fileID == id }
+        if let index = same.first(where: { files[$0].name.compare(name, options: .caseInsensitive) == .orderedSame })
+            ?? same.first {
+            return (files, index)
+        }
+        guard isSupported(target) else { return (files, 0) }
+        let file = ImageFile(url: target, name: name, byteSize: Int64(info.st_size), modified: seconds(info.st_mtimespec),
+                             fileID: id)
+        let index = files.firstIndex { NaturalSort.precedes(name, $0.name) } ?? files.count
+        var all = files
+        all.insert(file, at: index)
+        return (all, index)
     }
 
     // MARK: Listing
