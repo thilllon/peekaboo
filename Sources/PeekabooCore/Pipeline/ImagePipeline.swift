@@ -380,7 +380,7 @@ public final class ImagePipeline {
         }
         scheduler.submit(jobs, visible: visible)
         armWake(afterMs: plan.wakeAfterMs)
-        if config.readAhead { issueReadAhead(plan) }
+        if config.readAhead { issueReadAhead(plan, skimming: navigation.isSkimming(now: now, tuning: tuning)) }
         if Trace.enabled {
             Trace.log("plan cursor=\(index) skim=\(navigation.isSkimming(now: now, tuning: tuning)) jobs=\(jobs.count) "
                       + "visible=\(plan.jobs.filter { $0.kind == .visible }.map { $0.tier.rawValue }) "
@@ -395,13 +395,18 @@ public final class ImagePipeline {
         return lane
     }
 
-    private func issueReadAhead(_ plan: Plan) {
+    /// Whole files for the screen window, the first 256 KB for the preview window. While skimming most screen tiers
+    /// are skipped, so the screen window only gets the head too (no gigabytes of RAW read-ahead at 30 images/s).
+    private func issueReadAhead(_ plan: Plan, skimming: Bool) {
         var requests: [(url: URL, length: Int?)] = []
-        for j in plan.screenWindow where slots[j].advised < 2 {
-            slots[j].advised = 2
-            requests.append((files[j].url, nil))
+        let headOnly = skimming ? plan.screenWindow + plan.previewWindow : plan.previewWindow
+        if !skimming {
+            for j in plan.screenWindow where slots[j].advised < 2 {
+                slots[j].advised = 2
+                requests.append((files[j].url, nil))
+            }
         }
-        for j in plan.previewWindow where slots[j].advised < 1 {
+        for j in headOnly where slots[j].advised < 1 {
             slots[j].advised = 1
             requests.append((files[j].url, ReadAhead.headBytes))
         }
