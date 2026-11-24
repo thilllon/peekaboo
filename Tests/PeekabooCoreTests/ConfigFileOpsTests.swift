@@ -158,32 +158,33 @@ final class ConfigFileOpsTests: XCTestCase {
         XCTAssertEqual(FileOperations.availableURL(for: "archive.tar.gz", in: folder).lastPathComponent, "archive.tar 2.gz")
     }
 
-    func testExecTemplatesAreShellQuoted() {
+    func testExecTemplatesReferenceQuotedVariables() {
         let file = URL(fileURLWithPath: "/Photos/It's a \"trip\"/IMG $1 `x`.HEIC")
         XCTAssertEqual(FileOperations.shellQuote("it's"), #"'it'\''s'"#)
-        XCTAssertEqual(FileOperations.expand("open -R {path}", file: file, index: 4, count: 120),
-                       #"open -R '/Photos/It'\''s a "trip"/IMG $1 `x`.HEIC'"#)
-        XCTAssertEqual(FileOperations.expand("echo {dir} {name} {stem} {ext} {index}/{count}", file: file, index: 4, count: 120),
-                       #"echo '/Photos/It'\''s a "trip"' 'IMG $1 `x`.HEIC' 'IMG $1 `x`' 'HEIC' '5'/'120'"#)
-        // Already-quoted placeholders are not double-quoted; unknown braces stay.
-        XCTAssertEqual(FileOperations.expand("cp '{path}' \"{dir}\"/b {other}", file: URL(fileURLWithPath: "/a/b c.jpg"), index: 0, count: 1),
-                       "cp '/a/b c.jpg' '/a'/b {other}")
-        // Substituted text is never expanded again.
-        XCTAssertEqual(FileOperations.expand("{name}", file: URL(fileURLWithPath: "/a/{path}.jpg"), index: 0, count: 1),
-                       "'{path}.jpg'")
+        // The command never contains the file's text, only quoted variable references.
+        XCTAssertEqual(FileOperations.expand("open -R {path}", file: file, index: 4, count: 120), #"open -R "${PEEKABOO_PATH}""#)
+        XCTAssertEqual(FileOperations.execCommand("echo {dir} {name} {stem} {ext} {index}/{count}"),
+                       #"echo "${PEEKABOO_DIR}" "${PEEKABOO_NAME}" "${PEEKABOO_STEM}" "${PEEKABOO_EXT}" "${PEEKABOO_INDEX}"/"${PEEKABOO_COUNT}""#)
+        XCTAssertEqual(FileOperations.execEnvironment(file: file, index: 4, count: 120)["PEEKABOO_DIR"], #"/Photos/It's a "trip""#)
+        // Already-quoted placeholders work; unknown braces stay.
+        XCTAssertEqual(FileOperations.execCommand("cp '{path}' \"{dir}\"/b {other}"),
+                       #"cp ''"${PEEKABOO_PATH}"'' "${PEEKABOO_DIR}"/b {other}"#)
+        // A placeholder spelled in a value is never expanded: values are not in the command at all.
+        XCTAssertEqual(FileOperations.execEnvironment(file: URL(fileURLWithPath: "/a/{path}.jpg"), index: 0, count: 1)["PEEKABOO_NAME"],
+                       "{path}.jpg")
     }
 
     func testExecRunsThroughTheShellOffTheMainThread() throws {
         let file = try make("shoot/name with 'quotes' $HOME.jpg")
         let out = root.appendingPathComponent("out.txt")
-        let command = FileOperations.expand("printf '%s|%s|%s' {name} \"$PEEKABOO_INDEX\" {count} > ", file: file, index: 2, count: 7)
-            + FileOperations.shellQuote(out.path)
+        let template = "printf '%s|%s|%s' {name} \"$PEEKABOO_INDEX\" {count} > " + FileOperations.shellQuote(out.path)
         let done = expectation(description: "ran")
-        FileOperations.run(command, environment: ["PEEKABOO_INDEX": "3"]) { status, _ in
+        let command = FileOperations.runExec(template, file: file, index: 2, count: 7) { status, _ in
             XCTAssertFalse(Thread.isMainThread)
             XCTAssertEqual(status, 0)
             done.fulfill()
         }
+        XCTAssertFalse(command.contains("quotes"), command)
         wait(for: [done], timeout: 5)
         XCTAssertEqual(try String(contentsOf: out, encoding: .utf8), "name with 'quotes' $HOME.jpg|3|7")
 

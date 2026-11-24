@@ -390,19 +390,19 @@ final class FileActions {
 
     // MARK: exec
 
+    /// The placeholders become quoted references to `PEEKABOO_*` variables and the file's values travel in
+    /// the child's environment, so no file name is ever parsed as shell code.
     private func exec(_ template: String, context: FileActionContext) -> FileActionResult {
-        let command = FileOperations.expand(template, file: context.file.url, index: context.index, count: context.count)
-        let environment = ["PEEKABOO_PATH": context.file.url.path, "PEEKABOO_INDEX": String(context.index + 1),
-                           "PEEKABOO_COUNT": String(context.count)]
-        Trace.log("exec: \(command)")
         let owner = WeakFileActions(self)
-        FileOperations.run(command, environment: environment) { status, stderr in
+        let command = FileOperations.runExec(template, file: context.file.url, index: context.index,
+                                             count: context.count) { status, stderr in
             guard status != 0 else { return }
             DispatchQueue.main.async {
                 let detail = stderr.isEmpty ? "exit status \(status)" : stderr
                 owner.value?.onLateResult?(FileActionResult(toast: "Command failed: \(detail)"))
             }
         }
+        Trace.log("exec: \(command)")
         let shown = template.count > 48 ? String(template.prefix(47)) + "…" : template
         return FileActionResult(toast: "Ran \(shown)")
     }
