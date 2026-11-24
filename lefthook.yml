@@ -1,0 +1,11 @@
+# Git hooks — install with `mise run setup` (runs `lefthook install`).
+# Every commit and every push is scanned for secrets and personal data; a finding blocks it.
+pre-commit:
+  commands:
+    gitleaks:
+      run: gitleaks git --config .gitleaks.toml --pre-commit --staged --redact --no-banner -v
+
+pre-push:
+  commands:
+    gitleaks:
+      run: gitleaks git --config .gitleaks.toml --redact --no-banner -v
