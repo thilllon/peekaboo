@@ -157,7 +157,7 @@ public final class RenderContext: @unchecked Sendable {
 
     func tileArray(_ image: GPUImage?) -> [MTLTexture?] {
         var list: [MTLTexture?] = Array(repeating: dummy, count: 16)
-        if let image { for (i, t) in image.readTiles.prefix(16).enumerated() { list[i] = t } }
+        if let image { for (i, t) in image.tiles.prefix(16).enumerated() { list[i] = t } }
         return list
     }
 }
@@ -295,6 +295,8 @@ public final class Renderer {
     private var refineWork: DispatchWorkItem?
     /// The last frame used a lower pyramid level than wanted: redraw when it becomes ready.
     private var waitingForLevel = false
+    /// The previous tier of the same file, drawn while the new tier's pyramid level builds.
+    private var previousTier: GPUImage?
 
     // Prepared neighbours (GPU resources built ahead of time).
     private var prepared: [(id: ObjectIdentifier, gpu: GPUImage)] = []
@@ -324,6 +326,11 @@ public final class Renderer {
         let previous = gpu
         gpu = image.map { gpuImage(for: $0) }
         if let previous, previous !== gpu, !prepared.contains(where: { $0.gpu === previous }) { previous.cancel() }
+        if isNewFile {
+            previousTier = nil
+        } else if let previous, previous !== gpu, previous.isUsable {
+            previousTier = previous
+        }
         if let gpu {
             gpu.onLevelReady = { [weak self, weak gpu] _ in
                 guard let self, let gpu, gpu === self.gpu else { return }
@@ -548,11 +555,23 @@ public final class Renderer {
         var canvasTex: MTLTexture?
         var levelA: MTLTexture?, levelB: MTLTexture?
         var mode = Mode.background
-        let g = gpu?.isUsable == true ? gpu : nil
+        var g = gpu?.isUsable == true ? gpu : nil
         lastFrameWasCheap = false
         waitingForLevel = false
+        // A new tier whose pyramid level is still building: keep drawing the previous tier of the same file
+        // (same geometry) instead of an aliased frame; redraw when the level is ready.
+        if let current = g {
+            if current.readyLevel >= current.maxLevel { previousTier = nil }
+            let f = 1 / effectiveScaleFor(drawable: D)
+            if levelMissing(current, f: f), let prev = previousTier, prev.isUsable,
+               !levelMissing(prev, f: f) || prev.image.tier == .preview {
+                g = prev
+                waitingForLevel = true
+            }
+        }
 
-        if let g, let image {
+        if let g {
+            let image = g.image
             // Geometry: stored (pre-orientation) full-resolution pixels -> display -> drawable.
             let s = effectiveScaleFor(drawable: D)
             let f = 1 / s
@@ -848,6 +867,14 @@ public final class Renderer {
 
     private var drawableSize: SIMD2<Double> {
         SIMD2(Double(viewSize.width * backingScale), Double(viewSize.height * backingScale))
+    }
+
+    /// The HQ pass of `g` at reduction `f` (full-resolution pixels per device pixel) needs a level not built yet.
+    private func levelMissing(_ g: GPUImage, f: Double) -> Bool {
+        let fT = f * max(g.scaleX, g.scaleY)
+        guard fT > 2 - 1e-9 else { return false }
+        let wanted = min(Int(floor(log2(fT) + 1e-9)), g.maxLevel)
+        return wanted > 0 && g.bestLevel(atMost: wanted) < wanted
     }
 
     private func effectiveScaleFor(drawable: SIMD2<Double>) -> Double {

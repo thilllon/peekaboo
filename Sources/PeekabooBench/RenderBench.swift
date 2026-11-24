@@ -1,10 +1,12 @@
+import CoreGraphics
 import Foundation
+import ImageIO
 import Metal
 import PeekabooCore
 import PeekabooRender
 import QuartzCore
 
-/// `peekaboo-bench render [image] [--frames N] [--size WxH]`
+/// `peekaboo-bench render [image] [--frames N] [--size WxH] [--no-ar] [--png DIR]`
 ///
 /// GPU time per frame of the PPR renderer at fit / 0.5 / 1.0 / 2.5 / 5× (settle frame = pyramid level + residual
 /// Lanczos-3 into the canvas + present; canvas reuse = present only; gesture = trilinear), plus the pyramid build.
@@ -13,12 +15,14 @@ func runRenderBench(_ args: ArraySlice<String>) throws {
     var path: String?
     var frames = 20
     var noAR = false
+    var pngDir: String?
     var size = (3456, 2234)
     var it = args.makeIterator()
     while let a = it.next() {
         switch a {
         case "--frames": frames = Int(it.next() ?? "") ?? frames
         case "--no-ar": noAR = true
+        case "--png": pngDir = it.next()
         case "--size":
             let parts = (it.next() ?? "").split(separator: "x").compactMap { Int($0) }
             if parts.count == 2 { size = (parts[0], parts[1]) }
@@ -87,6 +91,9 @@ func runRenderBench(_ args: ArraySlice<String>) throws {
         let settlePath = renderer.lastPath
         let reuse = measure {}
         let reusePath = renderer.lastPath
+        if let pngDir, let frame = renderer.renderOffscreen(format: .bgra8Unorm) {
+            savePNG(frame, to: "\(pngDir)/render-\(name).png")
+        }
         print(name.padding(toLength: 6, withPad: " ", startingAt: 0)
               + String(format: " | %15.3f | ", settle) + settlePath.padding(toLength: 10, withPad: " ", startingAt: 0)
               + String(format: " | %13.3f | ", reuse) + reusePath)
@@ -100,4 +107,20 @@ func runRenderBench(_ args: ArraySlice<String>) throws {
         print(String(format: "gesture %@: %.3f ms (%@)", name, t, renderer.lastPath))
         renderer.endInteraction()
     }
+}
+
+/// Write a `bgra8Unorm` frame (Display P3 encoded) as PNG, for eyeballing the renderer's output.
+private func savePNG(_ texture: MTLTexture, to path: String) {
+    let w = texture.width, h = texture.height
+    var bytes = [UInt8](repeating: 0, count: w * h * 4)
+    texture.getBytes(&bytes, bytesPerRow: w * 4, from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+    let info = CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+    guard let provider = CGDataProvider(data: Data(bytes) as CFData),
+          let image = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4,
+                              space: CGColorSpace(name: CGColorSpace.displayP3)!, bitmapInfo: info,
+                              provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent),
+          let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL, "public.png" as CFString, 1, nil)
+    else { return }
+    CGImageDestinationAddImage(dest, image, nil)
+    CGImageDestinationFinalize(dest)
 }

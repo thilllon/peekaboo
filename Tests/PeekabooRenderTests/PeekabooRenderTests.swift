@@ -383,6 +383,35 @@ final class PeekabooRenderTests: XCTestCase {
         }
     }
 
+    // MARK: HDR
+
+    /// Extended-range half-float pixels keep values above 1.0 through the HQ path into the EDR (float) output,
+    /// and the layer switches to the EDR configuration.
+    func testHDRKeepsExtendedRange() {
+        let w = 64, h = 48
+        let space = CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)!
+        let pixels = pool.make(width: w, height: h, layout: .rgba16f, alpha: .opaque, colorSpace: space)!
+        let base = pixels.baseAddress.assumingMemoryBound(to: Float16.self)
+        for y in 0..<h { for x in 0..<w {
+            let o = y * pixels.bytesPerRow / 2 + x * 4
+            base[o] = 3.0; base[o + 1] = 0.5; base[o + 2] = 0.25; base[o + 3] = 1
+        } }
+        let image = DecodedImage(pixels: pixels, tier: .full, fullWidth: w, fullHeight: h, orientation: .up, isHDR: true, decodeNanos: 0)
+        let layer = CAMetalLayer()
+        let r = Renderer(layer: layer)
+        r.setViewSize(CGSize(width: 50, height: 40), backingScale: 1)
+        r.setImage(image, key: "hdr")
+        XCTAssertEqual(layer.pixelFormat, .rgba16Float)
+        XCTAssertTrue(layer.wantsExtendedDynamicRangeContent)
+        let c = render(r)[x: 25, y: 20]
+        XCTAssertEqual(c.x, 3.0, accuracy: 0.01)
+        XCTAssertEqual(c.y, 0.5, accuracy: 0.01)
+        XCTAssertEqual(r.lastPath, "canvas")
+        // Back to SDR for an SDR image.
+        r.setImage(makeImage(width: 8, height: 8) { _, _ in SIMD4(1, 2, 3, 255) }, key: "sdr")
+        XCTAssertEqual(layer.pixelFormat, .bgra8Unorm)
+    }
+
     // MARK: Robustness
 
     func testHugeImageDoesNotCrash() {

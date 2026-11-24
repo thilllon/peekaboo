@@ -58,12 +58,6 @@ final class GPUImage {
     /// Keeps a bytesNoCopy wrapper of an IOSurface alive for tiled surfaces.
     private let surfaceBuffer: MTLBuffer?
 
-    /// Private (GPU-tiled) copies of `tiles`, made by the background job: 2× faster to filter than the
-    /// linear layout of decoder buffers. Main thread.
-    var fastTiles: [MTLTexture]?
-    /// The level-0 textures to read from (main thread).
-    var readTiles: [MTLTexture] { fastTiles ?? tiles }
-
     var isUsable: Bool { !tiles.isEmpty }
     var isFullResolution: Bool { abs(scaleX - 1) < 1e-9 && abs(scaleY - 1) < 1e-9 }
 
@@ -174,7 +168,7 @@ final class GPUImage {
 
     /// Start building the pyramid on the background queue (idempotent).
     func startPyramid(context: RenderContext) {
-        guard !buildStarted, isUsable, maxLevel >= firstLevel || image.tier != .preview else { return }
+        guard !buildStarted, isUsable, maxLevel >= firstLevel else { return }
         buildStarted = true
         let job = PyramidJob(image: self, context: context)
         PyramidJob.queue.async { job.run() }
@@ -223,35 +217,10 @@ private final class PyramidJob: @unchecked Sendable {
         tmpDesc.usage = [.shaderRead, .shaderWrite]
         tmpDesc.storageMode = .private
         guard let tmp = device.makeTexture(descriptor: tmpDesc) else { return }
-        // Step 0: private copies of the level-0 tiles (one blit, ≈ 1 ms for 24 MP); the pyramid reads them too.
+        // Level 0 is read in place (zero copy): a private, GPU-tiled copy measured no faster (5.17 vs 5.25 ms
+        // per 3456×2234 settle frame) and would cost 4 bytes per pixel.
         var levelZero: [MTLTexture?] = img.tiles
-        if img.image.tier != .preview {
-            var copies: [MTLTexture] = []
-            if let blitCB = context.queue.makeCommandBuffer(), let blit = blitCB.makeBlitCommandEncoder() {
-                for t in img.tiles {
-                    let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: t.pixelFormat, width: t.width, height: t.height, mipmapped: false)
-                    d.usage = [.shaderRead]
-                    d.storageMode = .private
-                    if img.image.pixels.layout == .argb8 { d.swizzle = t.swizzle }
-                    guard let c = device.makeTexture(descriptor: d) else { break }
-                    blit.copy(from: t, to: c)
-                    copies.append(c)
-                }
-                blit.endEncoding()
-                blitCB.label = "level-0 copy"
-                blitCB.commit()
-                blitCB.waitUntilCompleted()
-            }
-            if copies.count == img.tiles.count, !img.isCancelled {
-                levelZero = copies
-                DispatchQueue.main.async { img.fastTiles = copies; img.onLevelReady?(0) }
-            }
-        }
         while levelZero.count < 16 { levelZero.append(context.dummy) }
-        guard img.maxLevel >= img.firstLevel else {
-            DispatchQueue.main.async { img.pyramidStats = (Trace.ms(since: start), 0) }
-            return
-        }
         var cb: MTLCommandBuffer?
         var encoder: MTLComputeCommandEncoder?
         var pending = 0
