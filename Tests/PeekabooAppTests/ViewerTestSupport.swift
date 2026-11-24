@@ -129,6 +129,12 @@ class ViewerTestCase: XCTestCase {
         return !layer.isHidden
     }
 
+    /// Text of the last toast (it stays in its layer after fading out).
+    func toastText(_ viewer: ViewerWindowController) -> String? {
+        guard let box: Any = property(hud(viewer), "toast"), let layer: CATextLayer = property(box, "text") else { return nil }
+        return (layer.string as? NSAttributedString)?.string
+    }
+
     /// Stored property `label` of `object` (any access level), through `Mirror`.
     func property<T>(_ object: Any, _ label: String) -> T? {
         var mirror: Mirror? = Mirror(reflecting: object)

@@ -5,7 +5,7 @@ import UniformTypeIdentifiers
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var viewer: ViewerWindowController?
     private let configStore = ConfigStore()
-    /// Paths opened during launch; AppKit may deliver argv paths *and* an
+    /// Paths opened recently; during launch AppKit may deliver argv paths *and* an
     /// open-documents event for the same file, so dedupe for a short window.
     private var recentlyOpened: [String: Date] = [:]
     private var openedSomething = false
@@ -53,8 +53,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     func applicationDidFinishLaunching(_ notification: Notification) {
         viewer?.presentsSynchronously = false
         NSApp.activate()
-        // `load()` ran before `onError` was set: show a broken config now.
-        if let error = configStore.lastError { viewer?.toast(error) }
+        // `load()` ran before `onError` was set: show a broken config, or the keys it skipped, now.
+        if let problem = configStore.lastError ?? configStore.lastWarning { viewer?.toast(problem) }
         scheduleScriptedActions()
         // Launched from the Dock or Spotlight without a document: show the drop hint.
         DispatchQueue.main.async { [weak self] in
@@ -79,6 +79,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     private func open(_ urls: [URL], dedupe: Bool = true) {
         let now = Date()
+        // A duplicate arrives while the window shows the file; opening it again after closing the window is not one.
+        let dedupe = dedupe && viewer?.window?.isVisible == true
         let fresh = urls.filter { url in
             let key = url.standardizedFileURL.path
             if dedupe, let t = recentlyOpened[key], now.timeIntervalSince(t) < 1.5 { return false }
