@@ -91,6 +91,10 @@ public struct PipelineStats: Sendable, Equatable {
 /// Scheduling is the "P4" predictive policy of docs/DESIGN.md §3: every (image, tier) gets a deadline from the
 /// navigation model's ETA, velocity-scaled windows feed an earliest-deadline-first queue, skimming shows previews
 /// only, the visible image gates prefetch, and retention evicts by ETA (not LRU) within per-tier budgets.
+///
+/// The cache follows the files on disk, not the listing: every decode is bracketed by `stat`, files written moments
+/// before they were decoded are rechecked until they settle, and the image navigated to is re-stat'ed on arrival
+/// (writes into an existing file raise no event on its folder). Dropped pixels are freed off the main thread.
 public final class ImagePipeline {
     public let decoder: ImageDecoder
     public let pool: PixelBufferPool
