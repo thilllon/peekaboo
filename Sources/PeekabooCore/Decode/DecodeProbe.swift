@@ -192,10 +192,15 @@ struct DecodeProbe {
            !lens.trimmingCharacters(in: .whitespaces).isEmpty {
             out["lens"] = lens.trimmingCharacters(in: .whitespaces)
         }
-        if let focal = number(exif[kCGImagePropertyExifFocalLength]), focal > 0 { out["focal"] = "\(trim(focal)) mm" }
-        if let f = number(exif[kCGImagePropertyExifFNumber]), f > 0 { out["aperture"] = "f/\(trim(f))" }
-        if let t = number(exif[kCGImagePropertyExifExposureTime]), t > 0 { out["shutter"] = shutter(t) }
-        if let iso = (exif[kCGImagePropertyExifISOSpeedRatings] as? [Any])?.first.flatMap(number), iso > 0 {
+        // XMP `exif:` values arrive as doubles of any size (ImageIO saturates huge integers at 2^63). Values
+        // beyond any camera (focal length 100 m, f/10000, exposures outside 1 ns … ~4 months, ISO 10^8) are
+        // corrupt or crafted: leave them out.
+        if let focal = number(exif[kCGImagePropertyExifFocalLength]), focal > 0, focal <= 100_000 {
+            out["focal"] = "\(trim(focal)) mm"
+        }
+        if let f = number(exif[kCGImagePropertyExifFNumber]), f > 0, f <= 10_000 { out["aperture"] = "f/\(trim(f))" }
+        if let t = number(exif[kCGImagePropertyExifExposureTime]), t >= 1e-9, t <= 1e7 { out["shutter"] = shutter(t) }
+        if let iso = (exif[kCGImagePropertyExifISOSpeedRatings] as? [Any])?.first.flatMap(number), iso > 0, iso <= 1e8 {
             out["iso"] = "ISO \(Int(iso.rounded()))"
         }
         if let date = (exif[kCGImagePropertyExifDateTimeOriginal] as? String) ?? (tiff[kCGImagePropertyTIFFDateTime] as? String),
@@ -211,18 +216,19 @@ struct DecodeProbe {
         return nil
     }
 
-    /// 35 → "35", 2.8 → "2.8", 8.0 → "8", 4.5 → "4.5".
+    /// 35 → "35", 2.8 → "2.8", 8.0 → "8", 4.5 → "4.5". Total: `Int(exactly:)` declines values beyond
+    /// Int's range and non-finite ones (where `Int(_:)` traps), which then print as "%.1f".
     static func trim(_ value: Double) -> String {
         let rounded = (value * 10).rounded() / 10
-        return rounded == rounded.rounded() ? String(Int(rounded)) : String(format: "%.1f", rounded)
+        if let whole = Int(exactly: rounded) { return String(whole) }
+        return String(format: "%.1f", rounded)
     }
 
-    /// 0.004 → "1/250 s", 0.5 → "1/2 s", 2 → "2 s", 1.3 → "1.3 s".
+    /// 0.004 → "1/250 s", 0.5 → "1/2 s", 2 → "2 s", 1.3 → "1.3 s". Total, like `trim`.
     static func shutter(_ seconds: Double) -> String {
         if seconds < 1 {
             let denominator = (1 / seconds).rounded()
-            if abs(1 / denominator - seconds) / seconds < 0.05 { return "1/\(Int(denominator)) s" }
-            return "\(trim(seconds)) s"
+            if let whole = Int(exactly: denominator), abs(1 / denominator - seconds) / seconds < 0.05 { return "1/\(whole) s" }
         }
         return "\(trim(seconds)) s"
     }

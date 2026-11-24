@@ -203,13 +203,70 @@ final class DecodeTests: XCTestCase {
         XCTAssertNotNil(exif["format"])
     }
 
+    /// `jpeg` with an XMP packet (APP1 "http://ns.adobe.com/xap/1.0/") after SOI; `properties` are attributes
+    /// of its rdf:Description, e.g. `exif:FNumber="28/10"`. ImageIO copies XMP `exif:` values into the EXIF
+    /// dictionary, as doubles, whatever their size.
+    private func withXMP(_ jpeg: Data, _ properties: String) -> Data {
+        let packet = "<?xpacket begin=\"\u{FEFF}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?><x:xmpmeta xmlns:x=\"adobe:ns:meta/\">"
+            + "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description rdf:about=\"\" "
+            + "xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" \(properties)/></rdf:RDF></x:xmpmeta><?xpacket end=\"w\"?>"
+        let payload = Array("http://ns.adobe.com/xap/1.0/\0".utf8) + Array(packet.utf8)
+        let length = payload.count + 2
+        var bytes = [UInt8](jpeg)
+        bytes.insert(contentsOf: [0xFF, 0xE1, UInt8(length >> 8), UInt8(length & 0xFF)] + payload, at: 2)
+        return Data(bytes)
+    }
+
+    /// XMP decimals reach the summary as doubles (ImageIO saturates huge integers at 2^63, one past Int.max):
+    /// `Int(_:)` on them trapped inside `probe`, which runs for every file the pipeline touches, so one such
+    /// file crashed the app as soon as its folder was opened. Implausible values are now left out.
+    func testEXIFSummaryIgnoresImplausibleXMPValues() throws {
+        let plain = try Data(contentsOf: try write(try quadrants(64, 48), "plain.jpg", type: .jpeg))
+        let sane = dir.appendingPathComponent("sane.jpg")
+        try withXMP(plain, #"exif:FNumber="28/10" exif:FocalLength="50/1" exif:ExposureTime="1/125""#).write(to: sane)
+        let saneExif = try decoder.probe(sane).exif
+        XCTAssertEqual(saneExif["aperture"], "f/2.8", "XMP exif: values reach the summary")
+        XCTAssertEqual(saneExif["focal"], "50 mm")
+        XCTAssertEqual(saneExif["shutter"], "1/125 s")
+
+        let hostile = [
+            ("aperture", #"exif:FNumber="99999999999999999999999""#),
+            ("aperture", #"exif:FNumber="18446744073709551615/1""#),
+            ("focal", #"exif:FocalLength="10000000000000000000""#),
+            ("shutter", #"exif:ExposureTime="100000000000000000000""#),
+            ("shutter", #"exif:ExposureTime="1/100000000000000000000""#),
+            ("iso", #"exif:ISOSpeedRatings="99999999999999999999""#),  // capped at Int32.max by ImageIO
+        ]
+        for (i, (key, properties)) in hostile.enumerated() {
+            let url = dir.appendingPathComponent("hostile\(i).jpg")
+            try withXMP(plain, properties).write(to: url)
+            let info = try decoder.probe(url)
+            XCTAssertEqual(info.pixelWidth, 64, properties)
+            XCTAssertNil(info.exif[key], "\(properties): \(info.exif[key] ?? "")")
+            XCTAssertNotNil(info.exif["format"], properties)
+        }
+    }
+
+    /// `trim` and `shutter` are total: any double formats without trapping.
+    func testFormattingHandlesExtremeValues() {
+        for value in [0x1p63, -0x1p63, 1e300, -1e300, .infinity, -.infinity, .nan, 0x1p-63, .leastNonzeroMagnitude, 0, -0.0] {
+            XCTAssertFalse(DecodeProbe.trim(value).isEmpty, "\(value)")
+            XCTAssertFalse(DecodeProbe.shutter(value).isEmpty, "\(value)")
+        }
+        XCTAssertEqual(DecodeProbe.trim(9e18), "9000000000000000000", "integers up to Int.max print exactly")
+        XCTAssertEqual(DecodeProbe.shutter(1e-9), "1/1000000000 s")
+    }
+
     func testFormatting() {
         XCTAssertEqual(DecodeProbe.shutter(1.0 / 250), "1/250 s")
         XCTAssertEqual(DecodeProbe.shutter(0.5), "1/2 s")
         XCTAssertEqual(DecodeProbe.shutter(2), "2 s")
         XCTAssertEqual(DecodeProbe.shutter(1.3), "1.3 s")
+        XCTAssertEqual(DecodeProbe.shutter(0.37), "0.4 s")
         XCTAssertEqual(DecodeProbe.trim(8.0), "8")
         XCTAssertEqual(DecodeProbe.trim(4.5), "4.5")
+        XCTAssertEqual(DecodeProbe.trim(35), "35")
+        XCTAssertEqual(DecodeProbe.trim(2.8), "2.8")
         XCTAssertEqual(DecodeProbe.formatDate("2026:05:01 14:03:22"), "2026-05-01 14:03")
         XCTAssertNil(DecodeProbe.formatDate("0000:00:00 00:00:00"))
         XCTAssertEqual(ImageIODecoder.coveringSubsample(long: 5947, target: 3456), 1)
