@@ -12,14 +12,17 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private let viewerView: ViewerView
     private let renderer: Renderer
     private let pipeline: ImagePipeline
-    private var keymap = Keymap.default
+    private let configStore: ConfigStore
+    private var config: AppConfig { configStore.config }
+    private lazy var fileActions = FileActions { [weak self] in self?.configStore.config ?? .default }
     private var pendingChords: [KeyChord] = []
     private var keyMonitor: Any?
     /// File currently on screen and the tier shown for it.
     private var shownFile: ImageFile?
     private var shownTier: Tier?
 
-    init() {
+    init(configStore: ConfigStore) {
+        self.configStore = configStore
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1280, height: 820),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -48,7 +51,14 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             if file == self?.pipeline.currentFile { self?.window?.title = "\(file.name) — cannot open" }
         }
         installKeyMonitor()
+        apply(configStore.config)
         viewerViewDidResize(viewerView)
+    }
+
+    /// Apply a (re)loaded configuration.
+    func apply(_ config: AppConfig) {
+        renderer.keepZoom = config.keepZoom
+        renderer.settings.background = Background(rawValue: config.background) ?? .black
     }
 
     required init?(coder: NSCoder) { fatalError("unused") }
@@ -125,7 +135,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         guard let chord = KeyChord(event: event) else { return false }
         pendingChords.append(chord)
         let context: KeyContext = renderer.isZoomedBeyondFit ? .zoomed : .normal
-        switch keymap.resolve(pendingChords, context: context) {
+        switch config.keymap.resolve(pendingChords, context: context) {
         case .actions(let actions):
             pendingChords.removeAll()
             for action in actions { perform(action, isRepeat: event.isARepeat) }
@@ -140,6 +150,12 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     }
 
     func perform(_ action: Action, isRepeat: Bool = false) {
+        if fileActions.handles(action), let file = pipeline.currentFile {
+            let result = fileActions.perform(action, context: FileActionContext(
+                file: file, index: pipeline.index, count: pipeline.files.count, window: window))
+            handle(result)
+            return
+        }
         switch action {
         case .next: navigate(to: pipeline.index + 1, isRepeat: isRepeat)
         case .previous: navigate(to: pipeline.index - 1, isRepeat: isRepeat)
@@ -169,6 +185,29 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         case .close: window?.performClose(nil)
         case .quit: NSApp.terminate(nil)
         default: Trace.log("action not implemented yet: \(action.id)")
+        }
+    }
+
+    /// Update the browsing set after a file action.
+    private func handle(_ result: FileActionResult) {
+        if let toast = result.toast { Trace.log("toast: \(toast)") }
+        switch result.outcome {
+        case .removed(let file):
+            var files = pipeline.files
+            guard let i = files.firstIndex(of: file) else { return }
+            files.remove(at: i)
+            shownFile = nil
+            pipeline.setFiles(files, index: min(i, max(files.count - 1, 0)))
+            updateTitle()
+            if let current = pipeline.currentFile, let best = pipeline.best(for: current) { show(best, for: current) }
+        case .restored(let file):
+            var files = pipeline.files
+            files.append(file)
+            files.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            pipeline.setFiles(files, index: files.firstIndex(of: file) ?? pipeline.index)
+            updateTitle()
+        case .changed, .unchanged:
+            break
         }
     }
 
