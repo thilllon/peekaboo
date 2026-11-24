@@ -78,8 +78,6 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     var onOpenPanel: (() -> Void)?
 
     private var pendingChords: [KeyChord] = []
-    /// Navigation keys are auto-repeating (skimming) until the next key-up.
-    private var skimming = false
     private var keyMonitor: Any?
     /// File currently on screen and the tier shown for it (nil with a file: its error is shown).
     private var shownFile: ImageFile?
@@ -88,6 +86,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private var shownVersion: String?
     /// Bumped when the shown file's contents change on disk, so the renderer treats the new version as another image.
     private var contentRevision = 0
+    /// Neighbours not prepared while skimming are prepared when the skim ends.
+    private var prepareAfterSkim: DispatchWorkItem?
 
     // Browsing
     private var browseSource = BrowseSource.none
@@ -401,27 +401,52 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     }
 
     private func prepareIfNeighbour(_ image: DecodedImage, for file: ImageFile) {
-        guard image.tier != .preview, currentIsSharp, !pipeline.isSkimming else { return }
+        guard image.tier != .preview, currentIsSharp else { return }
         let files = pipeline.files
         let isNeighbour = neighbourOffsets().contains { offset in
             let j = pipeline.index + offset
             return files.indices.contains(j) && files[j] == file
         }
+        guard isNeighbour else { return }
+        guard !pipeline.isSkimming else {
+            prepareNeighboursWhenSkimEnds()
+            return
+        }
         // Only the best sharp tier (a late screen tier after a `.full` would be prepared for nothing).
-        guard isNeighbour, let best = pipeline.best(for: file), best.pixels === image.pixels else { return }
+        guard let best = pipeline.best(for: file), best.pixels === image.pixels else { return }
         renderer.prepare(image)
     }
 
     /// After the current image is shown: prepare the sharp tiers of the neighbours that are already decoded (the
     /// farthest first, so the next image is the most recently used entry of the renderer's LRU).
     private func prepareNeighbours() {
-        guard currentIsSharp, !pipeline.isSkimming else { return }
+        guard currentIsSharp else { return }
+        guard !pipeline.isSkimming else {
+            prepareNeighboursWhenSkimEnds()
+            return
+        }
         let files = pipeline.files
         for offset in neighbourOffsets().reversed() {
             let j = pipeline.index + offset
             guard files.indices.contains(j), let best = pipeline.best(for: files[j]), best.tier != .preview else { continue }
             renderer.prepare(best)
         }
+    }
+
+    /// While skimming nothing is prepared (the cursor moves on before it would pay off), and no decode may land
+    /// afterwards for a neighbour cached before or during the skim: prepare once the skim is over
+    /// (`skimIntervalMs` after the last navigation), or again later if the user is still skimming then.
+    private func prepareNeighboursWhenSkimEnds() {
+        guard prepareAfterSkim == nil else { return }
+        let sinceNav = pipeline.navigation.msSinceNav(now: Trace.now())
+        let remainingMs = min(max(pipeline.config.tuning.skimIntervalMs - sinceNav, 0), 1000)
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.prepareAfterSkim = nil
+            self.prepareNeighbours()
+        }
+        prepareAfterSkim = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(remainingMs.rounded(.up)) + 2), execute: work)
     }
 
     private func failed(_ file: ImageFile, _ error: Error) {
@@ -695,7 +720,6 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
             guard let self, event.window === self.window else { return event }
             if event.type == .keyUp {
-                if self.skimming { self.endSkim() }
                 return self.motion.releasePanKey(event.keyCode) ? nil : event
             }
             return self.handleKey(event) ? nil : event
@@ -722,32 +746,12 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
                 return true
             }
             for action in actions { perform(action, isRepeat: event.isARepeat) }
-            if event.isARepeat, actions.contains(where: Self.isNavigation) { skimming = true }
             return true
         case .pending:
             return true
         case .unbound:
             pendingChords.removeAll()
             return false
-        }
-    }
-
-    private static func isNavigation(_ action: Action) -> Bool {
-        switch action {
-        case .next, .previous, .jump: return true
-        default: return false
-        }
-    }
-
-    /// Key-up after auto-repeat navigation: once the user has dwelt 90 ms, tell the pipeline the
-    /// current image is no longer being skimmed so its screen tier is decoded.
-    private func endSkim() {
-        skimming = false
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) { [weak self] in
-            guard let self, !self.skimming, let file = self.pipeline.currentFile,
-                  (self.pipeline.best(for: file)?.tier ?? .preview) < .screen else { return }
-            self.pipeline.navigate(to: self.pipeline.index, isRepeat: false)
-            self.presentCurrent()
         }
     }
 
