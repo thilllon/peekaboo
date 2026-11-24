@@ -384,10 +384,14 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         dropped.release(after: 0.25)
     }
 
-    /// The best tier of every cached file: what replacing the set or trimming the cache may free (worth collecting
-    /// only for a large cache; a lower tier of the same file is small or rare).
+    /// Smallest cache whose release is moved off the main thread: below it, freeing is cheaper than the scan that
+    /// collects it (≈ 1.2 ms per 10k files). Internal for tests.
+    var offMainReleaseMinimumBytes = 64 << 20
+
+    /// The best tier of every cached file: what replacing the set or trimming the cache may free (a lower tier of the
+    /// same file is small or rare).
     private func cachedImages() -> [DecodedImage] {
-        guard pipeline.stats.cachedBytes >= 64 << 20 else { return [] }
+        guard pipeline.stats.cachedBytes >= offMainReleaseMinimumBytes else { return [] }
         return pipeline.files.compactMap { pipeline.best(for: $0) }
     }
 

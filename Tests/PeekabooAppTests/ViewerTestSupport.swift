@@ -18,6 +18,8 @@ class ViewerTestCase: XCTestCase {
     override func setUpWithError() throws {
         try super.setUpWithError()
         guard MTLCreateSystemDefaultDevice() != nil else { throw XCTSkip("no Metal device") }
+        // Windows need a window-server session (none for a runner started as a daemon).
+        guard CGSessionCopyCurrentDictionary() != nil else { throw XCTSkip("no window-server session") }
         _ = NSApplication.shared
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("peekaboo-app-tests-\(UUID().uuidString)", isDirectory: true)

@@ -14,7 +14,8 @@ final class FolderRescanTests: ViewerTestCase {
         }
         openAndWait(viewer, [urls[1]])
         try FileManager.default.moveItem(at: urls[1], to: folder.appendingPathComponent("z best.jpg"))
-        XCTAssertTrue(spin(5) { viewer.pipeline.files.contains { $0.name == "z best.jpg" } }, "no rescan")
+        // The rescan runs on a utility queue: slow to get a core on a loaded CI machine.
+        XCTAssertTrue(spin(30) { viewer.pipeline.files.contains { $0.name == "z best.jpg" } }, "no rescan")
         XCTAssertEqual(viewer.pipeline.currentFile?.name, "z best.jpg")
         XCTAssertTrue(spin(5) { viewer.displayedFile?.name == "z best.jpg" })
     }

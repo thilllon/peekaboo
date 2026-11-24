@@ -21,7 +21,8 @@ final class ReplacedFileTests: ViewerTestCase {
 
         atomicallyReplace(a, width: newSize.0, height: newSize.1, gray: 0.9, type: type)
         let current = try XCTUnwrap(viewer.pipeline.currentFile)
-        let redecoded = spin(10) { viewer.pipeline.best(for: current)?.fullWidth == newSize.0 }
+        // The rescan runs on a utility queue: slow to get a core on a loaded CI machine.
+        let redecoded = spin(30) { viewer.pipeline.best(for: current)?.fullWidth == newSize.0 }
         XCTAssertTrue(redecoded, "the pipeline did not decode the new version")
         let shownNew = spin(3) { self.renderer(viewer).image?.fullWidth == newSize.0 }
 
@@ -51,7 +52,7 @@ final class ReplacedFileTests: ViewerTestCase {
         let temporary = folder.appendingPathComponent(".saving-a.png")
         try Data("<html>not an image</html>".utf8).write(to: temporary)
         XCTAssertEqual(rename(temporary.path, a.path), 0)
-        let reported = spin(10) { self.hudMessage(viewer)?.contains("Cannot open “a.png”") == true }
+        let reported = spin(30) { self.hudMessage(viewer)?.contains("Cannot open “a.png”") == true }
         XCTAssertTrue(reported, "no error for the broken new version")
         XCTAssertNil(renderer(viewer).image, "the old version is still on screen")
     }

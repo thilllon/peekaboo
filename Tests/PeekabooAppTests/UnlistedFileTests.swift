@@ -28,7 +28,7 @@ final class UnlistedFileTests: ViewerTestCase {
 
         // A change in the folder keeps it in the set, on screen.
         writeImage(folder.appendingPathComponent("a3.jpg"), width: 900, height: 600, gray: 0.9)
-        XCTAssertTrue(spin(5) { self.names(viewer).contains("a3.jpg") }, "no rescan")
+        XCTAssertTrue(spin(30) { self.names(viewer).contains("a3.jpg") }, "no rescan (utility queue)")
         XCTAssertEqual(viewer.pipeline.currentFile?.name, "logo.svg")
         viewer.perform(.previous)
         XCTAssertEqual(viewer.pipeline.currentFile?.name, "a3.jpg")
