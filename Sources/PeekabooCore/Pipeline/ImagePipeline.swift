@@ -153,6 +153,8 @@ public final class ImagePipeline {
     private var averagePreviewBytes = 1 << 20
     /// Finished decodes waiting for the main thread (drained by a main-queue hop, or synchronously by `waitForCurrent`).
     private let inbox = OutcomeInbox()
+    /// Pixels the cache let go of, freed off the main thread.
+    private let releaser = Releaser()
 
     public init(decoder: ImageDecoder, pool: PixelBufferPool, config: PipelineConfig = PipelineConfig()) {
         self.decoder = decoder
@@ -189,11 +191,15 @@ public final class ImagePipeline {
         cachedIndices.removeAll(keepingCapacity: true)
         tierBytes = [0, 0, 0]
         for i in oldSlots.indices where oldSlots[i].hasState {
-            guard let j = position[oldFiles[i].url] else { continue }  // removed: pixels are released
             var slot = oldSlots[i]
             oldSlots[i] = Slot()
+            guard let j = position[oldFiles[i].url] else {  // removed: pixels are released
+                release(slot)
+                continue
+            }
             if let version = Self.knownVersion(files[j]) {
                 if let cached = slot.version, cached != version {
+                    release(slot)
                     slot = Slot()  // changed on disk: decode again
                     infos.remove(files[j].url)
                 }
@@ -207,6 +213,7 @@ public final class ImagePipeline {
         }
         if let url = fullRequested, position[url] == nil { fullRequested = nil }
         recountBytes()
+        defer { flushReleases() }
         guard !files.isEmpty else {
             self.index = 0
             scheduler.submit([], visible: [])
@@ -280,6 +287,7 @@ public final class ImagePipeline {
     public func updateConfig(_ config: PipelineConfig) {
         self.config = config
         enforceBudgets()
+        flushReleases()
         scheduleReplan()
     }
 
@@ -303,8 +311,8 @@ public final class ImagePipeline {
             }
         }
         pressureUntil = Trace.now() + 60_000_000_000
-        pool.drain()
         enforceBudgets()
+        flushReleases(drainPool: true)
         Trace.log("memory pressure \(critical ? "critical" : "warning"): cached \(stats.cachedBytes >> 20) MB")
         scheduleReplan()
     }
@@ -448,7 +456,14 @@ public final class ImagePipeline {
     // MARK: Results
 
     private func drainInbox() {
-        for outcome in inbox.take() { handle(outcome) }
+        var outcomes = inbox.take()
+        guard !outcomes.isEmpty else { return }
+        for outcome in outcomes { handle(outcome) }
+        // Results that were not cached (late, wasted) are freed with the batch, off the main thread. The main thread
+        // drops its own references first: the release queue may empty the batch before this function returns.
+        releaser.add(outcomes)
+        outcomes.removeAll()
+        flushReleases()
     }
 
     private func handle(_ outcome: DecodeOutcome) {
@@ -550,7 +565,10 @@ public final class ImagePipeline {
 
     private func insert(_ image: DecodedImage, at j: Int, tier: Tier) {
         if slots[j].version == nil { slots[j].version = Self.knownVersion(files[j]) }
-        if let old = slots[j][tier] { tierBytes[tier.rawValue] -= old.pixels.allocatedBytes }
+        if let old = slots[j][tier] {
+            tierBytes[tier.rawValue] -= old.pixels.allocatedBytes
+            releaser.add(old)
+        }
         slots[j][tier] = image
         cachedIndices.insert(j)
         let bytes = image.pixels.allocatedBytes
@@ -562,6 +580,7 @@ public final class ImagePipeline {
     private func evict(_ j: Int, _ tier: Tier) {
         guard let image = slots[j][tier] else { return }
         tierBytes[tier.rawValue] -= image.pixels.allocatedBytes
+        releaser.add(image)
         slots[j][tier] = nil
         if !slots[j].hasPixels { cachedIndices.remove(j) }
         stats.evictions += 1
@@ -569,6 +588,23 @@ public final class ImagePipeline {
     }
 
     private func recountBytes() { stats.cachedBytes = tierBytes.reduce(0, +) }
+
+    /// Hand the pixels of a slot that is dropped to the releaser.
+    private func release(_ slot: Slot) {
+        for tier in Tier.allCases { releaser.add(slot[tier]) }
+    }
+
+    /// Bytes the cache, together with the pool's free buffers, may keep resident.
+    private var totalBudget: Int { Trace.now() < pressureUntil ? config.memoryBudget / 2 : config.memoryBudget }
+
+    /// Free what the cache dropped since the last flush, off the main thread. The pool's free buffers count against
+    /// the memory budget: it is emptied once they exceed what the cache leaves unused.
+    private func flushReleases(drainPool: Bool = false) {
+        releaser.flush(pool: pool, poolLimit: max(0, totalBudget - stats.cachedBytes), drainPool: drainPool)
+    }
+
+    /// Wait until the pixels dropped so far are released (tests).
+    func waitForReleases() { releaser.wait() }
 
     /// Evict by ETA (largest first) until every tier and the total fit; the pinned images are never evicted.
     private func enforceBudgets() {
@@ -590,7 +626,7 @@ public final class ImagePipeline {
             let limit = budget(tier)
             while tierBytes[tier.rawValue] > limit, let (j, t) = victim(tier) { evict(j, t) }
         }
-        let total = Trace.now() < pressureUntil ? config.memoryBudget / 2 : config.memoryBudget
+        let total = totalBudget
         while tierBytes.reduce(0, +) > total, let (j, t) = victim(nil) { evict(j, t) }
         recountBytes()
     }
@@ -608,6 +644,42 @@ public final class ImagePipeline {
         source.resume()
         pressureSource = source
     }
+}
+
+/// Frees dropped pixels off the main thread. The last release of a 90–240 MB IOSurface or buffer unmaps it in the
+/// kernel (1–5 ms for a full-resolution tier), and a memory-pressure trim frees gigabytes: done on the main thread,
+/// that stalls the key press or frame behind it. Collected on the main thread, released in batches on a utility queue.
+private final class Releaser: @unchecked Sendable {
+    private final class Batch: @unchecked Sendable {
+        var images: [DecodedImage] = []
+        var outcomes: [DecodeOutcome] = []
+        var isEmpty: Bool { images.isEmpty && outcomes.isEmpty }
+    }
+
+    private let queue = DispatchQueue(label: "peekaboo.release", qos: .utility)
+    /// Main thread only.
+    private var batch = Batch()
+
+    func add(_ image: DecodedImage?) { if let image { batch.images.append(image) } }
+    func add(_ outcomes: [DecodeOutcome]) { batch.outcomes.append(contentsOf: outcomes) }
+
+    /// Release what was collected, then empty `pool` if its free buffers no longer fit `poolLimit` (the memory budget
+    /// the cache leaves unused) or `drainPool` is set. The batch is emptied on the queue, so its pixels are freed
+    /// there whoever drops the last reference to the batch object.
+    func flush(pool: PixelBufferPool, poolLimit: Int, drainPool: Bool = false) {
+        guard !batch.isEmpty || drainPool else { return }
+        let full = batch
+        batch = Batch()
+        queue.async {
+            full.images.removeAll()
+            full.outcomes.removeAll()
+            // Released `.metal` buffers went back to the pool just now: the free list counts against the budget too.
+            if drainPool || pool.pooledBytes > poolLimit { pool.drain() }
+        }
+    }
+
+    /// Block until everything flushed so far has been released (tests).
+    func wait() { queue.sync {} }
 }
 
 /// Decode outcomes handed from the worker threads to the main thread, in completion order.
