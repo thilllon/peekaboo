@@ -18,8 +18,10 @@ measurements behind them (all measured on an M4 Pro, 48 GB, macOS 26.6, unless n
 ## 2. Decode paths (per format)
 
 ImageIO facts that drive the routing:
-- Baseline JPEG up to at least 60 MP is decoded by the **hardware JPEG engines** (2 on M4 Pro): 24 / 50 / 60 MP in
-  49.8 / 114 / 129 ms vs libjpeg-turbo 109 / 284 / 308 ms. 101 MP and the 22705 px panorama fall back to software.
+- Baseline JPEG is decoded by the **hardware JPEG engines** (2 on M4 Pro) at every size tested — 24 / 50 / 60 MP in
+  49.8 / 114 / 129 ms vs libjpeg-turbo 109 / 284 / 308 ms, and up to 101.5 MP / 65000 px wide through the IOSurface path
+  (101.5 MP: 123 ms wall, 16 ms CPU). Progressive JPEGs never are; that is why the 101 MP and panorama corpus files
+  (both progressive) take 0.7–1 s in ImageIO.
 - `kCGImageSourceShouldCacheImmediately` decodes are **serialised process-wide** (flat 10.5 img/s at 1–12 threads); a lazy
   `CGImage` drawn into our own pre-faulted buffer in its native colour space scales to 33 img/s at 12 threads, and the
   private `CGImageSourceCreateIOSurfaceAtIndex` path also runs in parallel. Never share a `CGImageSource` across threads:
@@ -47,7 +49,7 @@ DCT scaling saves only 10–20% on high-entropy files (Huffman-bound); 10 thread
 |---|---|---|---|
 | JPEG baseline ≤ HW limit | embedded EXIF/MPF thumb if present (0.2–1 ms); else `Subsample 4` (24 MP 40 ms) — never 8 | `Subsample 2` when W/2 ≥ screen (24 MP 44.6 ms), else full | HW: IOSurface path or lazy decode drawn into own buffer (49.8 ms @ 24 MP) |
 | JPEG progressive | `Subsample 8` (DC-only, 32 ms @ 24 MP, 88 ms @ 101 MP) | libjpeg-turbo 1/2 (253 ms @ 24 MP) | libjpeg-turbo (290 ms @ 24 MP) |
-| JPEG > HW limit | embedded thumb, else `Subsample 4` | libjpeg-turbo, DCT scale covering the screen | libjpeg-turbo (641 ms @ 101 MP; tiles above 16384 px) |
+| JPEG baseline > 102 MP | embedded thumb, else `Subsample 4` | libjpeg-turbo, DCT scale covering the screen | libjpeg-turbo (tiles above 16384 px) |
 | HEIC / HEIF / AVIF | embedded thumbnail item (~2 ms); else thumbnail 1024 (70–76 ms @ 50 MP) | thumbnail at the screen long side (62–73 ms @ 50 MP) | ImageIO full via IOSurface (94–110 ms; 195–227 ms if copied out) |
 | Camera RAW | embedded preview, thumbnail without `Always` (ARW 15, RAF 19, NEF 43 ms); CR3 via own BMFF parse | embedded preview at screen size if it covers the screen (RAF 70, NEF 93 ms), else RAW decode in the background | RAW decode (ProRAW 133 … ARW 61 MP 886 ms), only on zoom |
 | PNG / WebP / TIFF / GIF / JXL / PSD / EXR | thumbnail ≤ 512 (TIFF 23, AVIF 48, PNG 277, WebP 303 ms) | parallel lazy-draw path | parallel lazy-draw path |
@@ -106,6 +108,10 @@ viewers score 21–26 dB and alias 10–25× more.
 - **Tiling** above 16384 px (Apple9 limit, verified): level-0 tiles with an 8 px apron, visible tiles first.
 - **Pacing**: event-driven immediate render for discrete actions; `CAMetalDisplayLink` only while animating;
   one drawable per refresh.
+- **Present latency**: measured present → glass on the built-in 120 Hz panel (random key timing): 13.6 ms median with
+  `displaySyncEnabled = true`, 12.5 ms with 2 drawables, **5.9 ms with `displaySyncEnabled = false`**, 23.3 ms with
+  `presentsWithTransaction`. Discrete updates (navigation, single zoom steps, refinements) present with display sync
+  off; continuous motion (pinch, momentum, held pan keys) turns it back on so frames never tear.
 
 ## 5. App & UX
 
@@ -128,7 +134,7 @@ viewers score 21–26 dB and alias 10–25× more.
 | Path | Target |
 |---|---|
 | Prefetch hit: key → frame submitted (CPU encode + GPU) | ≤ 1 ms (measured encode 0.05–0.09 ms, GPU 0.3–0.5 ms) |
-| Prefetch hit: key → on glass | ≤ present latency (measured CAMetalLayer → glass 24.9 ms = 3 vsyncs @120 Hz, 13.8 ms @144 Hz); keep the drawable queue short |
+| Prefetch hit: key → on glass | ≤ 1 refresh: present → glass 5.9 ms median with display sync off (13.6 ms with it on) |
 | Miss, embedded preview available: first pixel | ≤ 12 ms after the key |
 | Cold launch (Finder) → first pixel | ≤ 250 ms (measured skeleton-equivalent 258 ms; remove the ~70 ms main-thread stall before the first present) |
 | Resident re-open → first pixel | ≤ 80 ms |
