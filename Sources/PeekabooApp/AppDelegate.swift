@@ -13,6 +13,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var lastKeymap: Keymap?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
+        // The View menu carries its own full-screen items (instant and native); stop AppKit
+        // from inserting a second "Enter Full Screen".
+        UserDefaults.standard.register(defaults: ["NSFullScreenMenuItemEverywhere": false])
         configStore.load()
         rebuildMenu(configStore.config.keymap)
         // Build the window now so its creation overlaps the wait for the open-documents event.
@@ -111,7 +114,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private func rebuildMenu(_ keymap: Keymap) {
         guard keymap != lastKeymap else { return }
         lastKeymap = keymap
-        NSApp.mainMenu = MainMenu.make(keymap: keymap, target: self)
+        let menu = MainMenu.make(keymap: keymap, target: self)
+        NSApp.mainMenu = menu
+        if Trace.enabled {
+            for top in menu.items {
+                let items = (top.submenu?.items ?? []).filter { !$0.isSeparatorItem }.map { item -> String in
+                    let mods = item.keyEquivalentModifierMask
+                    let key = item.keyEquivalent.isEmpty ? "" : " [\(mods.contains(.command) ? "⌘" : "")\(mods.contains(.shift) ? "⇧" : "")\(mods.contains(.option) ? "⌥" : "")\(mods.contains(.control) ? "⌃" : "")\(item.keyEquivalent.unicodeScalars.map { $0.value < 0x20 || $0.value > 0xF000 ? String(format: "U+%04X", $0.value) : String($0) }.joined())]"
+                    return item.title + key
+                }
+                Trace.log("menu \(top.submenu?.title ?? "?"): \(items.joined(separator: ", "))")
+            }
+        }
     }
 
     @objc func performMenuAction(_ sender: NSMenuItem) {

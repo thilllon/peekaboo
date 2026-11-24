@@ -23,7 +23,9 @@ struct FileTags: Equatable {
     var names: [String] = []
     var labelNumber = 0
 
+    /// HUD text, e.g. `★★★ ⚑ Pick ● Red` (computed once when the tags are read).
     var summary: String {
+        guard !names.isEmpty || labelNumber != 0 else { return "" }
         var parts: [String] = []
         // Stars are a tag made of 1–5 copies of one symbol (★ by default, configurable).
         if let stars = names.first(where: { name in
@@ -32,7 +34,7 @@ struct FileTags: Equatable {
         }) { parts.append(stars) }
         if names.contains("Pick") { parts.append("⚑ Pick") }
         if names.contains("Reject") { parts.append("✕ Reject") }
-        let labels = NSWorkspace.shared.fileLabels
+        let labels = Self.labelNames
         if labelNumber > 0, labelNumber < labels.count {
             parts.append("● \(labels[labelNumber])")
         } else if let color = names.first(where: { labels.dropFirst().contains($0) }) {
@@ -40,6 +42,9 @@ struct FileTags: Equatable {
         }
         return parts.joined(separator: " ")
     }
+
+    /// Localized Finder label names (index = label number); read once.
+    static let labelNames = NSWorkspace.shared.fileLabels
 }
 
 /// One viewer window: owns the renderer, the pipeline and the browsing state, turns key
@@ -82,6 +87,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private var lastListing: UInt64 = 0
     private var failures: [URL: String] = [:]
     private var tags: [URL: FileTags] = [:]
+    private var tagSummaries: [URL: String] = [:]
     private var loadingWork: DispatchWorkItem?
     private var navigationStart: UInt64 = 0
     private var lastAppliedHUDMode: AppConfig.HUDMode?
@@ -362,6 +368,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.pipeline.currentFile == file, self.shownFile != file else { return }
             self.hud.setLoading(true)
+            Trace.log("progress line: \(file.name) has no pixels 150 ms after navigation")
         }
         loadingWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
@@ -391,7 +398,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             parts.append("\(onScreen.fullWidth)×\(onScreen.fullHeight)")
         }
         if onScreen != nil { parts.append("\(Int((renderer.effectiveScale * 100).rounded())) %") }
-        if let summary = tags[file.url]?.summary, !summary.isEmpty { parts.append(summary) }
+        if let summary = tagSummaries[file.url], !summary.isEmpty { parts.append(summary) }
         if failures[file.url] != nil { parts.append("cannot open") }
         var content = HUDContent(line: parts.joined(separator: "  ·  "))
         if hud.mode == .full { content.details = detailRows(file, info, onScreen) }
@@ -462,9 +469,10 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             let result = FileTags(names: values?.tagNames ?? [], labelNumber: values?.labelNumber ?? 0)
             DispatchQueue.main.async {
                 guard let self else { return }
-                if self.tags.count > 4096 { self.tags.removeAll() }
+                if self.tags.count > 4096 { self.tags.removeAll(); self.tagSummaries.removeAll() }
                 let changed = self.tags[url] != result
                 self.tags[url] = result
+                self.tagSummaries[url] = result.summary
                 if changed, self.pipeline.currentFile?.url == url { self.updateHUD() }
             }
         }
@@ -699,6 +707,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             guard let i = files.firstIndex(of: file) else { return }
             files.remove(at: i)
             tags[file.url] = nil
+            tagSummaries[file.url] = nil
             if files.isEmpty {
                 showEmpty(currentFolder)
                 return
