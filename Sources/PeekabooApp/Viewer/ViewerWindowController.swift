@@ -68,6 +68,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     var onOpenPanel: (() -> Void)?
 
     private var pendingChords: [KeyChord] = []
+    /// Navigation keys are auto-repeating (skimming) until the next key-up.
+    private var skimming = false
     private var keyMonitor: Any?
     /// File currently on screen and the tier shown for it.
     private var shownFile: ImageFile?
@@ -205,7 +207,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         listingPending = true
         // First pixel first: decode the opened file before listing its folder. Decide "file or
         // folder" from the URL alone (no file-system access on the main thread).
-        if urls.count == 1, !first.hasDirectoryPath, FolderScanner.isSupported(first) {
+        let singleFile = urls.count == 1 && !first.hasDirectoryPath && FolderScanner.isSupported(first)
+        if singleFile {
             browseSource = .folder(first.deletingLastPathComponent())
             beginNavigation()
             pipeline.setFiles([ImageFile(url: first, name: first.lastPathComponent, byteSize: 0, modified: 0, fileID: 0)], index: 0)
@@ -221,11 +224,13 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
                 self.listingPending = false
                 self.lastListing = Trace.now()
                 guard let listing, !listing.files.isEmpty else {
-                    self.showEmpty(urls.count == 1 ? first : nil)
+                    // An unreadable parent folder still shows the opened file on its own.
+                    if singleFile {
+                        self.updateHUD()
+                    } else {
+                        self.showEmpty(urls.count == 1 ? first : nil)
+                    }
                     return
-                }
-                if urls.count == 1, !first.hasDirectoryPath, FolderScanner.isSupported(first) {
-                    self.browseSource = .folder(first.deletingLastPathComponent())
                 }
                 let previous = self.pipeline.currentFile
                 self.pipeline.setFiles(listing.files, index: listing.index)
@@ -313,8 +318,6 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         if Trace.enabled {
             Trace.log(String(format: "show main thread: setImage %.3f  render %.3f  hud %.3f ms",
                              Double(t1 &- t0) / 1e6, Double(t2 &- t1) / 1e6, Double(Trace.now() &- t2) / 1e6))
-        }
-        if Trace.enabled {
             Trace.log("shown \(file.name) tier=\(image.tier) \(image.pixels.width)x\(image.pixels.height) decode=\(String(format: "%.1f", Double(image.decodeNanos) / 1e6)) ms\(wasNewFile ? String(format: " +%.2f ms after nav", Trace.ms(since: navigationStart)) : "")")
         }
     }
@@ -470,6 +473,10 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     // MARK: Rendering
 
     private func setNeedsRender() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.setNeedsRender() }
+            return
+        }
         guard !renderScheduled else { return }
         renderScheduled = true
         DispatchQueue.main.async { [weak self] in
@@ -519,7 +526,10 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private func installKeyMonitor() {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
             guard let self, event.window === self.window else { return event }
-            if event.type == .keyUp { return self.motion.releasePanKey(event.keyCode) ? nil : event }
+            if event.type == .keyUp {
+                if self.skimming { self.endSkim() }
+                return self.motion.releasePanKey(event.keyCode) ? nil : event
+            }
             return self.handleKey(event) ? nil : event
         }
     }
@@ -544,12 +554,32 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
                 return true
             }
             for action in actions { perform(action, isRepeat: event.isARepeat) }
+            if event.isARepeat, actions.contains(where: Self.isNavigation) { skimming = true }
             return true
         case .pending:
             return true
         case .unbound:
             pendingChords.removeAll()
             return false
+        }
+    }
+
+    private static func isNavigation(_ action: Action) -> Bool {
+        switch action {
+        case .next, .previous, .jump: return true
+        default: return false
+        }
+    }
+
+    /// Key-up after auto-repeat navigation: once the user has dwelt 90 ms, tell the pipeline the
+    /// current image is no longer being skimmed so its screen tier is decoded.
+    private func endSkim() {
+        skimming = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) { [weak self] in
+            guard let self, !self.skimming, let file = self.pipeline.currentFile,
+                  (self.pipeline.best(for: file)?.tier ?? .preview) < .screen else { return }
+            self.pipeline.navigate(to: self.pipeline.index, isRepeat: false)
+            self.presentCurrent()
         }
     }
 
@@ -759,18 +789,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// takes effect on the next frame.
     private func toggleInstantFullscreen() {
         guard let window else { return }
-        if let saved = instantFullscreen {
-            instantFullscreen = nil
-            NSApp.presentationOptions = []
-            window.styleMask = saved.style
-            window.titlebarAppearsTransparent = true
-            window.titleVisibility = .hidden
-            window.setFrame(saved.frame, display: true)
-            window.setFrameAutosaveName("PeekabooViewer")
-            rootView.topInset = 0
-            window.makeKeyAndOrderFront(nil)
-            window.makeFirstResponder(viewerView)
-            showChrome()
+        if instantFullscreen != nil {
+            exitInstantFullscreen(reorder: true)
         } else {
             if window.styleMask.contains(.fullScreen) { window.toggleFullScreen(nil); return }
             guard let screen = window.screen ?? NSScreen.main else { return }
@@ -785,6 +805,24 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             lastPointerMove = Trace.now()
             scheduleIdleCheck()
         }
+    }
+
+    /// Restore the window's style and frame. `reorder` is false while the window is closing.
+    private func exitInstantFullscreen(reorder: Bool) {
+        guard let window, let saved = instantFullscreen else { return }
+        instantFullscreen = nil
+        NSApp.presentationOptions = []
+        window.styleMask = saved.style
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.setFrame(saved.frame, display: reorder)
+        window.setFrameAutosaveName("PeekabooViewer")
+        rootView.topInset = 0
+        if reorder {
+            window.makeKeyAndOrderFront(nil)
+            window.makeFirstResponder(viewerView)
+        }
+        showChrome()
     }
 
     private func toggleNativeFullscreen() {
@@ -848,7 +886,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     // MARK: NSWindowDelegate
 
     func windowWillClose(_ notification: Notification) {
-        if instantFullscreen != nil { toggleInstantFullscreen() }
+        exitInstantFullscreen(reorder: false)
         motion.releaseAllKeys()
         motion.stopMomentum()
         hud.setHelp(nil)
