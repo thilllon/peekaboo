@@ -200,9 +200,9 @@ final class ConfigFileOpsTests: XCTestCase {
         XCTAssertEqual(FileOperations.rating(3, star: "*", in: FileOperations.Tags(names: ["***", "★"])).names, ["***"])
 
         tags = FileOperations.label("red", in: tags)
-        XCTAssertEqual(tags, FileOperations.Tags(names: ["Project", "Red"], label: 6))
+        XCTAssertEqual(tags, FileOperations.Tags(names: ["Project", "Red"], label: 6, colors: ["Red": 6]))
         tags = FileOperations.label("blue", in: tags, labelNames: ["없음", "회색", "초록색", "보라색", "파란색", "노란색", "빨간색", "주황색"])
-        XCTAssertEqual(tags, FileOperations.Tags(names: ["Project", "파란색"], label: 4))
+        XCTAssertEqual(tags, FileOperations.Tags(names: ["Project", "파란색"], label: 4, colors: ["파란색": 4]))
         tags = FileOperations.label("none", in: tags, labelNames: ["없음", "회색", "초록색", "보라색", "파란색", "노란색", "빨간색", "주황색"])
         XCTAssertEqual(tags, FileOperations.Tags(names: ["Project"], label: 0))
 
@@ -222,7 +222,11 @@ final class ConfigFileOpsTests: XCTestCase {
         var tags = FileOperations.tags(of: URL(fileURLWithPath: photo.path))
         guard !tags.names.isEmpty else { throw XCTSkip("volume does not store Finder tags") }
         XCTAssertEqual(Set(tags.names), ["★★★", "Pick", "Green"])
+        XCTAssertEqual(tags.colors, ["Green": 2])
         XCTAssertEqual(tags.label, 2)
+        // Finder's own API agrees on the names.
+        XCTAssertEqual(Set(try URL(fileURLWithPath: photo.path).resourceValues(forKeys: [.tagNamesKey]).tagNames ?? []),
+                       ["★★★", "Pick", "Green"])
         _ = try ops.undo()
         tags = FileOperations.tags(of: URL(fileURLWithPath: photo.path))
         XCTAssertEqual(tags, FileOperations.Tags())
@@ -239,6 +243,21 @@ final class ConfigFileOpsTests: XCTestCase {
         let names = FileOperations.tags(of: photo).names
         guard !names.isEmpty else { throw XCTSkip("volume does not store Finder tags") }
         XCTAssertEqual(Set(names), ["★★★", "Pick"])
+    }
+
+    func testKeepsTheColoursOfOtherTags() throws {
+        let photo = try make("shoot/colours.jpg")
+        let entries = ["Project\n3", "Draft"]
+        let data = try PropertyListSerialization.data(fromPropertyList: entries, format: .binary, options: 0)
+        let written = data.withUnsafeBytes { setxattr(photo.path, FileOperations.tagAttribute, $0.baseAddress, data.count, 0, 0) }
+        guard written == 0 else { throw XCTSkip("volume does not store extended attributes") }
+        let ops = FileOperations()
+        try ops.setTags(FileOperations.rating(2, star: "★", in: FileOperations.tags(of: photo)), of: photo)
+        let tags = FileOperations.tags(of: photo)
+        XCTAssertEqual(tags.names, ["Project", "Draft", "★★"])
+        XCTAssertEqual(tags.colors, ["Project": 3])
+        _ = try ops.undo()
+        XCTAssertEqual(FileOperations.tags(of: photo), FileOperations.Tags(names: ["Project", "Draft"], colors: ["Project": 3]))
     }
 
     func testImageFileStat() throws {

@@ -21,9 +21,12 @@ public final class FileOperations {
     public struct Tags: Equatable, Sendable {
         public var names: [String]
         public var label: Int
-        public init(names: [String] = [], label: Int = 0) {
+        /// Finder colour (label number) of the tags that have one, e.g. `["Red": 6]`.
+        public var colors: [String: Int]
+        public init(names: [String] = [], label: Int = 0, colors: [String: Int] = [:]) {
             self.names = names
             self.label = label
+            self.colors = colors
         }
     }
 
@@ -260,20 +263,56 @@ public final class FileOperations {
     public static let pickTag = "Pick"
     public static let rejectTag = "Reject"
 
+    /// Finder keeps tags in this extended attribute: a binary plist of `"name\n<colour>"` strings.
+    static let tagAttribute = "com.apple.metadata:_kMDItemUserTags"
+
+    /// Tags with their colours (read from the attribute: `URLResourceValues.tagNames` drops colours)
+    /// plus the legacy Finder label number.
     public static func tags(of url: URL) -> Tags {
+        var tags = Tags()
+        let path = url.path
+        let size = getxattr(path, tagAttribute, nil, 0, 0, 0)
+        if size > 0 {
+            var buffer = [UInt8](repeating: 0, count: size)
+            if getxattr(path, tagAttribute, &buffer, size, 0, 0) == size,
+               let entries = try? PropertyListSerialization.propertyList(from: Data(buffer), format: nil) as? [String] {
+                for entry in entries {
+                    let parts = entry.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+                    let name = String(parts[0])
+                    guard !name.isEmpty, !tags.names.contains(name) else { continue }
+                    tags.names.append(name)
+                    if parts.count > 1, let color = Int(parts[1]), color > 0 { tags.colors[name] = color }
+                }
+            }
+        }
         var fresh = url
         fresh.removeAllCachedResourceValues() // URLs cache resource values within a run-loop pass
-        let values = try? fresh.resourceValues(forKeys: [.tagNamesKey, .labelNumberKey])
-        return Tags(names: values?.tagNames ?? [], label: values?.labelNumber ?? 0)
+        tags.label = (try? fresh.resourceValues(forKeys: [.labelNumberKey]))?.labelNumber ?? 0
+        return tags
     }
 
+    /// Write the tag attribute the way Finder does (so colour tags show their colour), then the label number.
     static func write(_ tags: Tags, to url: URL) throws {
-        // Writing the names resets the colour label, so the label goes second.
+        let path = url.path
+        if tags.names.isEmpty {
+            if removexattr(path, tagAttribute, 0) != 0, errno != ENOATTR {
+                throw Failure("Cannot tag \(url.lastPathComponent): \(String(cString: strerror(errno)))")
+            }
+        } else {
+            let entries = tags.names.map { "\($0)\n\(tags.colors[$0] ?? 0)" }
+            let data: Data
+            do {
+                data = try PropertyListSerialization.data(fromPropertyList: entries, format: .binary, options: 0)
+            } catch {
+                throw Failure("Cannot tag \(url.lastPathComponent): \(reason(error))")
+            }
+            let result = data.withUnsafeBytes { setxattr(path, tagAttribute, $0.baseAddress, data.count, 0, 0) }
+            if result != 0 { throw Failure("Cannot tag \(url.lastPathComponent): \(String(cString: strerror(errno)))") }
+        }
         do {
-            try (url as NSURL).setResourceValue(tags.names, forKey: .tagNamesKey)
             try (url as NSURL).setResourceValue(tags.label, forKey: .labelNumberKey)
         } catch {
-            throw Failure("Cannot tag \(url.lastPathComponent): \(reason(error))")
+            throw Failure("Cannot label \(url.lastPathComponent): \(reason(error))")
         }
     }
 
@@ -299,8 +338,13 @@ public final class FileOperations {
         var out = tags
         let colorNames = Set((labelNames.dropFirst() + englishLabelNames.dropFirst()).map { $0.lowercased() })
         out.names.removeAll { colorNames.contains($0.lowercased()) }
+        out.colors = out.colors.filter { out.names.contains($0.key) }
         let number = labelNumbers[color] ?? 0
-        if number > 0 { out.names.append(number < labelNames.count ? labelNames[number] : englishLabelNames[number]) }
+        if number > 0 {
+            let name = number < labelNames.count ? labelNames[number] : englishLabelNames[number]
+            out.names.append(name)
+            out.colors[name] = number
+        }
         out.label = number
         return out
     }
