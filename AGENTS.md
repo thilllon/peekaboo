@@ -32,6 +32,8 @@ brew install jpeg-turbo   # static libturbojpeg linked into PeekabooCore
 | Unit tests | `swift test` (`mise run test`) |
 | Release app bundle | `mise run app` → `build/Peekaboo.app` |
 | Install locally | `mise run install` → `~/Applications/Peekaboo.app` + `peekaboo` CLI in `~/.local/bin` |
+| DMG (drag-to-Applications) | `mise run dmg` → `build/Peekaboo.dmg` |
+| Release | `mise run release <version>`: tag on `main`, build the DMG, publish a GitHub Release |
 | Secret scan (history + tree) | `mise run secrets` |
 | Latency trace | `PEEKABOO_TRACE=1 build/Peekaboo.app/Contents/MacOS/Peekaboo <image>` |
 | Benchmarks | `swift run -c release peekaboo-bench <suite>` |
