@@ -25,7 +25,11 @@ struct FileTags: Equatable {
 
     var summary: String {
         var parts: [String] = []
-        if let stars = names.first(where: { !$0.isEmpty && $0.allSatisfy { $0 == "★" } }) { parts.append(stars) }
+        // Stars are a tag made of 1–5 copies of one symbol (★ by default, configurable).
+        if let stars = names.first(where: { name in
+            guard let c = name.first, name.count <= 5, !c.isLetter, !c.isNumber else { return false }
+            return name.allSatisfy { $0 == c }
+        }) { parts.append(stars) }
         if names.contains("Pick") { parts.append("⚑ Pick") }
         if names.contains("Reject") { parts.append("✕ Reject") }
         let labels = NSWorkspace.shared.fileLabels
@@ -419,10 +423,9 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         }
         add("Camera", exif["camera"])
         add("Lens", exif["lens"])
-        add("Focal", exif["focal"])
-        add("Aperture", exif["aperture"])
-        add("Shutter", exif["shutter"])
-        add("ISO", exif["iso"])
+        // The decoder formats each value ("35 mm", "f/2.8", "1/250 s", "ISO 100"): one exposure row.
+        let exposure = ["focal", "aperture", "shutter", "iso"].compactMap { exif[$0] }.filter { !$0.isEmpty }
+        if !exposure.isEmpty { add("Exposure", exposure.joined(separator: "  ")) }
         add("Date", exif["date"])
         add("Profile", exif["profile"] ?? info?.colorProfileName)
         var format = exif["format"] ?? info.map { Self.formatName($0.typeIdentifier) }
