@@ -93,7 +93,11 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private var browseSource = BrowseSource.none
     private var openGeneration = 0
     private var listingPending = false
-    private var lastListing: UInt64 = 0
+    /// One folder rescan at a time (concurrent ones could finish out of order); changes meanwhile list again after it.
+    private var rescanInFlight = false
+    private var rescanQueued = false
+    /// Bumped when a file action changes the browsing set here: a listing started before it is stale.
+    private var listingEpoch = 0
     /// Files without pixels whose decode failed (the pipeline never retries them), for the version that failed.
     private var failures: [URL: Failure] = [:]
     private struct Failure {
@@ -294,7 +298,6 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
 
     private func applyListing(_ listing: (files: [ImageFile], index: Int)?, urls: [URL], singleFile: Bool, opened: UInt64) {
         listingPending = false
-        lastListing = Trace.now()
         guard let listing, !listing.files.isEmpty else {
             // An unreadable parent folder still shows the opened file on its own.
             if singleFile {
@@ -931,6 +934,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         case .removed(let file):
             var files = pipeline.files
             guard let i = files.firstIndex(of: file) else { return }
+            listingEpoch &+= 1
             files.remove(at: i)
             tags[file.url] = nil
             tagSummaries[file.url] = nil
@@ -944,6 +948,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             updateHUD()
         case .restored(let file):
             var files = pipeline.files
+            listingEpoch &+= 1
             if !files.contains(file) {
                 files.append(file)
                 files = NaturalSort.sort(files, by: \.name)
@@ -1193,31 +1198,51 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// versions, keeping the current file (a `FolderWatcher` callback can call this directly).
     func rescanFolder() {
         guard case .folder(let folder) = browseSource, !listingPending else { return }
+        guard !rescanInFlight else {
+            rescanQueued = true
+            return
+        }
+        rescanInFlight = true
         let generation = openGeneration
-        lastListing = Trace.now()
+        let epoch = listingEpoch
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let files = try? FolderScanner.scan(folder) else { return }
+            let files = try? FolderScanner.scan(folder)
             DispatchQueue.main.async {
-                guard let self, generation == self.openGeneration, !self.listingPending else { return }
-                self.lastListing = Trace.now()
-                let fingerprint = { (list: [ImageFile]) in list.map { $0.url.path + "|" + $0.version } }
-                guard fingerprint(files) != fingerprint(self.pipeline.files) else { return }
-                if files.isEmpty {
-                    self.showEmpty(folder)
-                    return
+                guard let self else { return }
+                self.rescanInFlight = false
+                let session = generation == self.openGeneration && !self.listingPending
+                if session, epoch == self.listingEpoch, let files { self.applyRescan(files, of: folder) }
+                // A file action during the scan (the listing may still hold a file just moved away), or changes
+                // that arrived meanwhile: list again.
+                if self.rescanQueued || (session && epoch != self.listingEpoch) {
+                    self.rescanQueued = false
+                    self.rescanFolder()
                 }
-                let current = self.pipeline.currentFile
-                let index = current.flatMap { files.firstIndex(of: $0) } ?? min(self.pipeline.index, files.count - 1)
-                self.pipeline.setFiles(files, index: index)
-                if self.pipeline.currentFile != current { self.beginNavigation() }
-                // The message was about the previous state (an empty folder, a removed file's error); `presentCurrent`
-                // shows the current file's error again if it still has one.
-                self.hud.setMessage(nil)
-                self.presentCurrent()
-                self.updateHUD()
-                Trace.log("folder rescanned: \(files.count) files")
             }
         }
+    }
+
+    private func applyRescan(_ files: [ImageFile], of folder: URL) {
+        let fingerprint = { (list: [ImageFile]) in list.map { $0.url.path + "|" + $0.version } }
+        guard fingerprint(files) != fingerprint(pipeline.files) else { return }
+        if files.isEmpty {
+            showEmpty(folder)
+            return
+        }
+        let current = pipeline.currentFile
+        var index = current.flatMap { files.firstIndex(of: $0) }
+        if index == nil, let current, current.fileID != 0 {
+            // Renamed (in Finder, by another app): the same file under its new name stays on screen.
+            index = files.firstIndex { $0.fileID == current.fileID && $0.byteSize == current.byteSize }
+        }
+        pipeline.setFiles(files, index: index ?? min(pipeline.index, files.count - 1))
+        if pipeline.currentFile != current { beginNavigation() }
+        // The message was about the previous state (an empty folder, a removed file's error); `presentCurrent`
+        // shows the current file's error again if it still has one.
+        hud.setMessage(nil)
+        presentCurrent()
+        updateHUD()
+        Trace.log("folder rescanned: \(files.count) files")
     }
 
     // MARK: System events
