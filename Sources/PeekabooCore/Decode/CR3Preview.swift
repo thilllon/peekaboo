@@ -140,8 +140,10 @@ enum CR3Preview {
         var extents = [(0, hevc.count)]
         var tile = (width: width, height: height)
         if let grid {
+            guard (1...256).contains(grid.rows), (1...256).contains(grid.columns), grid.rows * grid.columns <= 4096 else {
+                return nil
+            }
             let count = grid.rows * grid.columns
-            guard (1...256).contains(grid.rows), (1...256).contains(grid.columns), count <= 4096 else { return nil }
             extents = []
             var at = 0
             while extents.count < count, hevc.count - at >= 4 {

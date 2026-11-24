@@ -270,8 +270,10 @@ final class DecodeCR3Tests: XCTestCase {
             let (url, found) = try candidates(sample: sample)
             XCTAssertNil(CR3Preview.bytes(url: url, try XCTUnwrap(found.first)))
         }
-        let grid = CR3Preview.Grid(rows: 0, columns: 2, tileWidth: 256, tileHeight: 128)
-        XCTAssertNil(CR3Preview.heif(hevc: Data(good), properties: [hvcC], width: 500, height: 250, grid: grid))
+        for (rows, columns) in [(0, 2), (Int.max, Int.max), (257, 1), (128, 64)] {
+            let grid = CR3Preview.Grid(rows: rows, columns: columns, tileWidth: 256, tileHeight: 128)
+            XCTAssertNil(CR3Preview.heif(hevc: Data(good), properties: [hvcC], width: 500, height: 250, grid: grid), "\(rows)x\(columns)")
+        }
         XCTAssertNil(CR3Preview.heif(hevc: Data(good), properties: [], width: 500, height: 250))
         XCTAssertNil(CR3Preview.heif(hevc: Data(good), properties: [hvcC], width: 1 << 16, height: 250))
     }
