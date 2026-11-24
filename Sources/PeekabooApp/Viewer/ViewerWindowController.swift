@@ -113,6 +113,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private var navigationStart: UInt64 = 0
     private var lastAppliedHUDMode: AppConfig.HUDMode?
     private var lastAppliedBackground: String?
+    private var lastAppliedKeepZoom: Bool?
     /// Re-lists the browsed folder when Finder (or anything else) adds, removes or renames files.
     private var folderWatcher: FolderWatcher?
 
@@ -212,8 +213,11 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
 
     /// Apply a (re)loaded configuration.
     func apply(_ config: AppConfig) {
-        renderer.keepZoom = config.keepZoom
-        // Only a changed value overrides what the user picked at run time (`view.background`, `view.hud`).
+        // Only a changed value overrides what the user picked at run time (`zoom.keep`, `view.background`, `view.hud`).
+        if lastAppliedKeepZoom != config.keepZoom {
+            lastAppliedKeepZoom = config.keepZoom
+            renderer.keepZoom = config.keepZoom
+        }
         if lastAppliedBackground != config.background {
             lastAppliedBackground = config.background
             renderer.settings.background = Background(rawValue: config.background) ?? .black
@@ -927,8 +931,9 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         case .redo: handle(fileActions.redo())
         case .config: openConfigFile()
         case .reloadConfig:
+            // With no file open (FileActions reports it otherwise): the error, or the skipped keys, not a success.
             configStore.load()
-            hud.showToast("Config reloaded")
+            hud.showToast(configStore.lastError ?? configStore.lastWarning.map { "Config reloaded · \($0)" } ?? "Config reloaded")
         case .none: break
         default:
             hud.showToast("\(KeyLabels.title(action)): not available")
