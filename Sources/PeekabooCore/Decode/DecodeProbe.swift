@@ -5,7 +5,7 @@ import UniformTypeIdentifiers
 
 /// What the decoder needs to know about a file to route it, gathered in one pass over its
 /// metadata (ImageIO properties 0.07–0.6 ms, RAW 1.3–2.6 ms; JPEG marker scan ~20 µs).
-struct ImageProbe {
+struct DecodeProbe {
     enum Kind: Equatable {
         case jpeg(JPEGScan)
         /// HEIC / HEIF / AVIF: hardware HEVC/AV1 through ImageIO.
@@ -107,15 +107,15 @@ struct ImageProbe {
     /// Probe through `cache`: ImageIO's metadata parse (`CopyPropertiesAtIndex`, 0.1–3 ms on XMP-heavy
     /// files) then runs once per file version instead of once per tier; the decode paths themselves
     /// only need a fresh source.
-    static func make(url: URL, cache: ProbeCache) throws -> ImageProbe {
-        let key = ProbeCache.key(url)
+    static func make(url: URL, cache: DecodeProbeCache) throws -> DecodeProbe {
+        let key = DecodeProbeCache.key(url)
         if let key, let facts = cache[key] {
             guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions) else {
                 throw DecodeError.unreadable(url.lastPathComponent)
             }
-            return ImageProbe(source: source, facts: facts)
+            return DecodeProbe(source: source, facts: facts)
         }
-        let probe = try ImageProbe(url: url)
+        let probe = try DecodeProbe(url: url)
         if let key { cache[key] = probe.facts }
         return probe
     }

@@ -22,7 +22,7 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     public init() {}
 
     /// Parsed metadata per file version: `probe` and the decodes of every tier share one parse.
-    let probes = ProbeCache()
+    let probes = DecodeProbeCache()
 
     /// Decode gain-map images (`hasGainMap`) to HDR (`kCGImageSourceDecodeToHDR`, extended-linear
     /// Display P3 `.rgba16f`, `isHDR = true`) for `.screen`/`.full`. Off by default: the HDR rendition
@@ -41,7 +41,7 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     static let previewAspectTolerance = 0.01
 
     public func probe(_ url: URL) throws -> ImageInfo {
-        try autoreleasepool { try ImageProbe.make(url: url, cache: probes).info }
+        try autoreleasepool { try DecodeProbe.make(url: url, cache: probes).info }
     }
 
     public func lane(for url: URL, info: ImageInfo?, tier: Tier) -> DecodeLane {
@@ -72,7 +72,7 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     public func decode(_ url: URL, tier: Tier, targetLongSide: Int, pool: PixelBufferPool) throws -> DecodedImage {
         let start = Trace.now()
         return try autoreleasepool {
-            let probe = try ImageProbe.make(url: url, cache: probes)
+            let probe = try DecodeProbe.make(url: url, cache: probes)
             let target = tier == .full ? 0 : max(16, targetLongSide)
             let output = try decode(probe, url: url, tier: tier, target: target, pool: pool)
             let nanos = Trace.now() - start
@@ -116,7 +116,7 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
         let path: String
     }
 
-    private func decode(_ probe: ImageProbe, url: URL, tier: Tier, target: Int, pool: PixelBufferPool) throws -> Output {
+    private func decode(_ probe: DecodeProbe, url: URL, tier: Tier, target: Int, pool: PixelBufferPool) throws -> Output {
         let info = probe.info
         if Self.decodeHDR, info.hasGainMap, tier != .preview, let hdr = hdrDecode(probe, target: target, pool: pool) {
             return hdr
@@ -141,7 +141,7 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
         }
     }
 
-    private func subsample(_ probe: ImageProbe, _ target: Int, maxFactor: Int = 8) -> Int {
+    private func subsample(_ probe: DecodeProbe, _ target: Int, maxFactor: Int = 8) -> Int {
         Self.coveringSubsample(long: max(probe.info.pixelWidth, probe.info.pixelHeight), target: target,
                                maxFactor: maxFactor)
     }
@@ -149,7 +149,7 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     // MARK: JPEG
 
     /// `data`: in-memory JPEG (CR3 previews); nil reads `url`.
-    private func decodeJPEG(_ probe: ImageProbe, scan: JPEGScan, url: URL, data: Data?, tier: Tier, target: Int,
+    private func decodeJPEG(_ probe: DecodeProbe, scan: JPEGScan, url: URL, data: Data?, tier: Tier, target: Int,
                             pool: PixelBufferPool) throws -> Output {
         let route = Self.jpegRoute(scan)
         if tier == .preview, scan.hasEXIFThumbnail, let thumb = embeddedThumbnail(probe, maxPixel: target, pool: pool) {
@@ -187,7 +187,7 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
 
     // MARK: RAW
 
-    private func decodeRAW(_ probe: ImageProbe, cr3: Bool, url: URL, tier: Tier, target: Int,
+    private func decodeRAW(_ probe: DecodeProbe, cr3: Bool, url: URL, tier: Tier, target: Int,
                            pool: PixelBufferPool) throws -> Output {
         let info = probe.info
         let long = max(info.pixelWidth, info.pixelHeight)
@@ -217,8 +217,8 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
         let need = min(target, max(info.pixelWidth, info.pixelHeight))
         guard let pick = candidates.first(where: { max($0.width, $0.height) >= need }) ?? (tier == .preview ? candidates.last : nil),
               let data = CR3Preview.bytes(url: url, pick),
-              let source = CGImageSourceCreateWithData(data as CFData, ImageProbe.sourceOptions) else { return nil }
-        guard let probe = try? data.withUnsafeBytes({ try ImageProbe(source: source, url: url, jpegBytes: $0) }) else {
+              let source = CGImageSourceCreateWithData(data as CFData, DecodeProbe.sourceOptions) else { return nil }
+        guard let probe = try? data.withUnsafeBytes({ try DecodeProbe(source: source, url: url, jpegBytes: $0) }) else {
             return nil
         }
         let decoded: Output?
@@ -250,11 +250,11 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     }
 
     /// The embedded thumbnail / preview (`MaxPixelSize` without `…Always`), oriented by ImageIO.
-    private func embeddedThumbnail(_ probe: ImageProbe, maxPixel: Int, pool: PixelBufferPool) -> Output? {
+    private func embeddedThumbnail(_ probe: DecodeProbe, maxPixel: Int, pool: PixelBufferPool) -> Output? {
         thumbnail(probe, maxPixel: maxPixel, always: false, pool: pool, path: "embedded")
     }
 
-    private func thumbnail(_ probe: ImageProbe, maxPixel: Int, always: Bool, pool: PixelBufferPool, path: String) -> Output? {
+    private func thumbnail(_ probe: DecodeProbe, maxPixel: Int, always: Bool, pool: PixelBufferPool, path: String) -> Output? {
         var options: [CFString: Any] = [
             kCGImageSourceThumbnailMaxPixelSize: max(1, maxPixel),
             kCGImageSourceCreateThumbnailWithTransform: true,
@@ -268,7 +268,7 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     }
 
     /// IOSurface SPI decode, nil when the symbol is missing or ImageIO declines.
-    private func surface(_ probe: ImageProbe, subsample: Int) -> Output? {
+    private func surface(_ probe: DecodeProbe, subsample: Int) -> Output? {
         guard let surface = IOSurfaceSPI.surface(probe.source, index: probe.index, subsample: subsample),
               let layout = IOSurfaceSPI.layout(of: surface) else { return nil }
         let (space, alpha) = traits(probe)
@@ -281,7 +281,7 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     /// Colour space and alpha semantics of the source pixels, without decoding. The SPI keeps the
     /// file's alpha as stored (PNG: straight, measured), so it is read from the lazy, header-only
     /// CGImage; opaque images with a well-known profile skip even that.
-    private func traits(_ probe: ImageProbe) -> (CGColorSpace, AlphaMode) {
+    private func traits(_ probe: DecodeProbe) -> (CGColorSpace, AlphaMode) {
         if !probe.info.hasAlpha {
             switch probe.info.colorProfileName {
             case "sRGB IEC61966-2.1": return (TurboJPEG.sRGB, .opaque)
@@ -289,7 +289,7 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
             default: break
             }
         }
-        guard let image = CGImageSourceCreateImageAtIndex(probe.source, probe.index, ImageProbe.sourceOptions) else {
+        guard let image = CGImageSourceCreateImageAtIndex(probe.source, probe.index, DecodeProbe.sourceOptions) else {
             return (TurboJPEG.sRGB, probe.info.hasAlpha ? .straight : .opaque)
         }
         let alpha: AlphaMode
@@ -301,14 +301,14 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
         return (NativeImage.rgbSpace(image), alpha)
     }
 
-    private func surfaceOrPublic(_ probe: ImageProbe, subsample: Int, pool: PixelBufferPool) throws -> Output {
+    private func surfaceOrPublic(_ probe: DecodeProbe, subsample: Int, pool: PixelBufferPool) throws -> Output {
         if let output = surface(probe, subsample: subsample) { return output }
         return try publicImage(probe, subsample: subsample, pool: pool)
     }
 
     /// Public fallback: a lazy CGImage (parallel-safe, unlike `ShouldCacheImmediately`) decoded by a
     /// same-format draw into a pooled buffer.
-    private func publicImage(_ probe: ImageProbe, subsample: Int, pool: PixelBufferPool,
+    private func publicImage(_ probe: DecodeProbe, subsample: Int, pool: PixelBufferPool,
                              extra: [CFString: Any] = [:]) throws -> Output {
         var options: [CFString: Any] = extra
         options[kCGImageSourceShouldCache] = false
@@ -324,7 +324,7 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     static let extendedLinearDisplayP3 = CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)!
 
     /// Gain-map HDR rendition as extended-linear Display P3 half floats (behind `decodeHDR`).
-    private func hdrDecode(_ probe: ImageProbe, target: Int, pool: PixelBufferPool) -> Output? {
+    private func hdrDecode(_ probe: DecodeProbe, target: Int, pool: PixelBufferPool) -> Output? {
         let factor = subsample(probe, target)
         var options: [CFString: Any] = [kCGImageSourceShouldCache: false,
                                         kCGImageSourceDecodeRequest: kCGImageSourceDecodeToHDR]

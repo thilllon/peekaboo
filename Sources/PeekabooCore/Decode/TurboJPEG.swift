@@ -95,14 +95,14 @@ enum TurboJPEG {
         var size = 0
         guard tj3GetICCProfile(handle, &buffer, &size) == 0, let buffer, size > 0 else { return nil }
         defer { tj3Free(buffer) }
-        return ColorSpaceCache.shared.space(icc: UnsafeRawBufferPointer(start: buffer, count: size))
+        return ICCColorSpaceCache.shared.space(icc: UnsafeRawBufferPointer(start: buffer, count: size))
     }
 }
 
 /// Interns colour spaces by ICC bytes: parsing a profile costs more than hashing it, and most
 /// folders use one or two profiles.
-final class ColorSpaceCache: @unchecked Sendable {
-    static let shared = ColorSpaceCache()
+final class ICCColorSpaceCache: @unchecked Sendable {
+    static let shared = ICCColorSpaceCache()
     private var spaces: [Data: CGColorSpace] = [:]
     private let lock = NSLock()
 

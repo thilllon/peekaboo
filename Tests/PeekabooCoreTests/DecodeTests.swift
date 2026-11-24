@@ -204,14 +204,14 @@ final class DecodeTests: XCTestCase {
     }
 
     func testFormatting() {
-        XCTAssertEqual(ImageProbe.shutter(1.0 / 250), "1/250 s")
-        XCTAssertEqual(ImageProbe.shutter(0.5), "1/2 s")
-        XCTAssertEqual(ImageProbe.shutter(2), "2 s")
-        XCTAssertEqual(ImageProbe.shutter(1.3), "1.3 s")
-        XCTAssertEqual(ImageProbe.trim(8.0), "8")
-        XCTAssertEqual(ImageProbe.trim(4.5), "4.5")
-        XCTAssertEqual(ImageProbe.formatDate("2026:05:01 14:03:22"), "2026-05-01 14:03")
-        XCTAssertNil(ImageProbe.formatDate("0000:00:00 00:00:00"))
+        XCTAssertEqual(DecodeProbe.shutter(1.0 / 250), "1/250 s")
+        XCTAssertEqual(DecodeProbe.shutter(0.5), "1/2 s")
+        XCTAssertEqual(DecodeProbe.shutter(2), "2 s")
+        XCTAssertEqual(DecodeProbe.shutter(1.3), "1.3 s")
+        XCTAssertEqual(DecodeProbe.trim(8.0), "8")
+        XCTAssertEqual(DecodeProbe.trim(4.5), "4.5")
+        XCTAssertEqual(DecodeProbe.formatDate("2026:05:01 14:03:22"), "2026-05-01 14:03")
+        XCTAssertNil(DecodeProbe.formatDate("0000:00:00 00:00:00"))
         XCTAssertEqual(ImageIODecoder.coveringSubsample(long: 5947, target: 3456), 1)
         XCTAssertEqual(ImageIODecoder.coveringSubsample(long: 8688, target: 3456), 2)
         XCTAssertEqual(ImageIODecoder.coveringSubsample(long: 22705, target: 3456), 4)

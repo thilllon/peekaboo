@@ -3,7 +3,7 @@ import Foundation
 /// Probe results keyed by file identity and version (path, size, modification time), so the
 /// pipeline's `probe` and the following `decode` calls of every tier parse metadata once.
 /// A changed file has a new key; entries are small (~1 KB), the cache is bounded.
-final class ProbeCache: @unchecked Sendable {
+final class DecodeProbeCache: @unchecked Sendable {
     struct Key: Hashable {
         let path: String
         let size: Int64
@@ -11,7 +11,7 @@ final class ProbeCache: @unchecked Sendable {
         let nanoseconds: Int
     }
 
-    private var entries: [Key: ImageProbe.Facts] = [:]
+    private var entries: [Key: DecodeProbe.Facts] = [:]
     private let lock = NSLock()
     private let capacity: Int
 
@@ -27,7 +27,7 @@ final class ProbeCache: @unchecked Sendable {
                    nanoseconds: st.st_mtimespec.tv_nsec)
     }
 
-    subscript(key: Key) -> ImageProbe.Facts? {
+    subscript(key: Key) -> DecodeProbe.Facts? {
         get {
             lock.lock(); defer { lock.unlock() }
             return entries[key]
