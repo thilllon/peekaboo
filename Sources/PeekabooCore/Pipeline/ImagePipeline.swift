@@ -432,9 +432,9 @@ public final class ImagePipeline {
             stats.wasted += 1
             return
         }
-        if let info = outcome.info ?? (slots[i].info == nil ? infos.get(key.url) : nil) {
+        if slots[i].info == nil, let info = outcome.info ?? infos.get(key.url) {
             slots[i].info = info
-            slots[i].lanes = [nil, nil, nil]
+            slots[i].lanes = [nil, nil, nil]  // lanes may depend on the metadata
         }
         switch outcome.result {
         case .success(let image):

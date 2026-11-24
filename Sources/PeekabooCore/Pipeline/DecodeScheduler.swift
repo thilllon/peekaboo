@@ -24,7 +24,7 @@ struct DecodeJob: Sendable {
 struct DecodeOutcome: Sendable {
     let job: DecodeJob
     let result: Result<DecodedImage, Error>
-    /// Metadata probed alongside the first decode of the file (nil when already known).
+    /// Metadata of the file if known when the decode finished (probed after the first decode of each file).
     let info: ImageInfo?
     let wallMs: Double
     /// Decodes running when this one started, itself included.
@@ -212,6 +212,12 @@ final class DecodeScheduler: @unchecked Sendable {
             condition.broadcast()
             condition.unlock()
             deliver(outcome)
+            // Metadata rides along with the first decode of a file, after its pixels are on their way (cheap:
+            // 0.07–0.6 ms, the file is warm); the main thread picks it up from the shared store.
+            let url = job.key.url
+            if case .success = outcome.result, infos.get(url) == nil, let probed = try? decoder.probe(url) {
+                infos.set(url, probed)
+            }
         }
     }
 
@@ -239,14 +245,8 @@ final class DecodeScheduler: @unchecked Sendable {
             }
         }
         Trace.signposter.endInterval("decode", interval)
-        let wallMs = Trace.ms(since: start)
-        // Metadata rides along with the first decode of a file (cheap: 0.07–0.6 ms; the source is warm).
-        var info: ImageInfo?
-        if infos.get(url) == nil, case .success = result, let probed = try? decoder.probe(url) {
-            infos.set(url, probed)
-            info = probed
-        }
-        return DecodeOutcome(job: job, result: result, info: info, wallMs: wallMs, concurrency: concurrency)
+        return DecodeOutcome(job: job, result: result, info: infos.get(url), wallMs: Trace.ms(since: start),
+                             concurrency: concurrency)
     }
 
     private var foregroundBusyLocked: Bool {
