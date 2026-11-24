@@ -1,5 +1,7 @@
 import CoreGraphics
+import ImageIO
 import Metal
+import UniformTypeIdentifiers
 import XCTest
 @testable import PeekabooCore
 
@@ -97,6 +99,7 @@ class PipelineTestCase: XCTestCase {
         config.readAhead = false
         config.monitorsMemoryPressure = false
         config.sweepLanes = 0
+        config.quickLookSweep = false
         configure(&config)
         return ImagePipeline(decoder: decoder, pool: PixelBufferPool(device: device), config: config)
     }
@@ -362,5 +365,39 @@ final class PipelineTests: PipelineTestCase {
                       "the sweep reaches beyond the prefetch windows")
         spin(for: 0.3)
         XCTAssertLessThanOrEqual(pipeline.cachedBytes(for: .preview), 160 << 20)
+    }
+
+    func testSweepTakesExpensivePreviewsFromQuickLook() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("peekaboo-ql-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        for i in 0..<10 {
+            let context = try XCTUnwrap(CGContext(data: nil, width: 640, height: 480, bitsPerComponent: 8, bytesPerRow: 0,
+                                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+            context.setFillColor(red: CGFloat(i) / 4, green: 0.5, blue: 1, alpha: 1)
+            context.fill(CGRect(x: 0, y: 0, width: 640, height: 480))
+            let url = directory.appendingPathComponent("q\(i).png")
+            let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil))
+            CGImageDestinationAddImage(destination, try XCTUnwrap(context.makeImage()), nil)
+            XCTAssertTrue(CGImageDestinationFinalize(destination))
+        }
+        let files = try FolderScanner.scan(directory)
+        // PNG previews are expensive for our own decoder (≈ 277 ms): only QuickLook may fill them in the background.
+        let decoder = FakeDecoder(latencyMs: [.preview: 300, .screen: 5, .full: 10])
+        let pipeline = makePipeline(decoder) { config in
+            config.sweepLanes = 2
+            config.quickLookSweep = true
+        }
+        pipeline.setFiles(files, index: 0)
+        // Files beyond the screen window keep a preview only.
+        let previewOnly = { files.filter { pipeline.cachedTiers(for: $0) == [.preview] } }
+        let served = spin(timeout: 15) { !previewOnly().isEmpty }
+        guard served else { throw XCTSkip("QuickLook produced no thumbnail in this environment") }
+        let previewed = previewOnly()
+        XCTAssertGreaterThan(pipeline.stats.quickLookPreviews, 0)
+        XCTAssertFalse(decoder.calls(.preview).contains { call in previewed.contains { $0.url == call.url } },
+                       "QuickLook previews must not cost our own preview decode")
+        XCTAssertEqual(pipeline.best(for: previewed[0])?.fullWidth, 4000, "layout size comes from the probed metadata")
     }
 }

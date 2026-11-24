@@ -23,6 +23,9 @@ public struct PipelineConfig: Sendable, Equatable {
     public var sweepLanes = 4
     /// `F_RDADVISE` read-ahead for files entering the prefetch windows.
     public var readAhead = true
+    /// Let the background sweep take previews from QuickLook's persistent thumbnail cache for files whose own
+    /// preview decode is expensive.
+    public var quickLookSweep = true
     /// Listen to system memory pressure (`DispatchSource`) and trim automatically.
     public var monitorsMemoryPressure = true
     /// Scheduler constants (windows, skim threshold, dwell, horizons, sweep).
@@ -73,6 +76,8 @@ public struct PipelineStats: Sendable, Equatable {
     public var evictions = 0
     /// Decodes done by the background preview sweep.
     public var sweepDecodes = 0
+    /// Sweep previews served by QuickLook's thumbnail cache.
+    public var quickLookPreviews = 0
     public init() {}
 }
 
@@ -112,6 +117,8 @@ public final class ImagePipeline {
         var failed: UInt8 = 0
         /// Read-ahead issued: 1 = head, 2 = whole file.
         var advised: UInt8 = 0
+        /// QuickLook had no thumbnail: the sweep does not ask again.
+        var quickLookMissed = false
         var lanes: [DecodeLane?] = [nil, nil, nil]
 
         subscript(tier: Tier) -> DecodedImage? {
@@ -346,6 +353,7 @@ public final class ImagePipeline {
             },
             estimate: { [unowned self] j, tier in self.estimate(j, tier) },
             cheapPreview: { [unowned self] j in self.isCheapPreview(j) },
+            quickLookSweep: { [unowned self] j in self.config.quickLookSweep && !self.slots[j].quickLookMissed },
             fullRequested: fullRequested == files[index].url,
             runningWorkMs: snapshot.runningWorkMs, decodeBacklog: snapshot.decodeBacklog,
             sweepSlots: sweepSlots, sweepPaused: underPressure,
@@ -367,7 +375,8 @@ public final class ImagePipeline {
             }
             jobs.append(DecodeJob(
                 key: JobKey(url: file.url, tier: planned.tier), file: file, prio: planned.prio, kind: planned.kind,
-                lane: lane(j, planned.tier), targetLongSide: target, estimateMs: estimate(j, planned.tier)))
+                lane: planned.quickLook ? .general : lane(j, planned.tier), targetLongSide: target,
+                estimateMs: estimate(j, planned.tier), quickLook: planned.quickLook))
         }
         scheduler.submit(jobs, visible: visible)
         armWake(afterMs: plan.wakeAfterMs)
@@ -431,11 +440,17 @@ public final class ImagePipeline {
         case .success(let image):
             stats.decodes += 1
             if outcome.job.kind == .sweep { stats.sweepDecodes += 1 }
-            costs.record(family: family(i), megapixels: CostModel.megapixels(slots[i].info), tier: key.tier,
-                         ms: outcome.wallMs, concurrency: outcome.concurrency)
+            // QuickLook's latency is not our decoder's cost: keep it out of the cost model.
+            if !outcome.job.quickLook {
+                costs.record(family: family(i), megapixels: CostModel.megapixels(slots[i].info), tier: key.tier,
+                             ms: outcome.wallMs, concurrency: outcome.concurrency)
+            }
             guard keep(i, key.tier) else { stats.wasted += 1; return }
+            if outcome.job.quickLook { stats.quickLookPreviews += 1 }
             insert(image, at: i, tier: key.tier)
             onDecoded?(file, image)
+        case .failure(_) where outcome.job.quickLook:
+            slots[i].quickLookMissed = true
         case .failure(let error):
             stats.failures += 1
             slots[i].failed |= 1 << key.tier.rawValue

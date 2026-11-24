@@ -17,6 +17,8 @@ struct DecodeJob: Sendable {
     /// Estimated cost (ms), for the feasibility test.
     let estimateMs: Double
     var sequence: UInt64 = 0
+    /// Serve the preview from QuickLook's thumbnail cache (sweep only).
+    var quickLook = false
 }
 
 struct DecodeOutcome: Sendable {
@@ -220,9 +222,20 @@ final class DecodeScheduler: @unchecked Sendable {
         let start = Trace.now()
         let interval = Trace.signposter.beginInterval("decode", id: Trace.signposter.makeSignpostID(),
                                                       "\(url.lastPathComponent) tier \(job.key.tier.rawValue)")
-        let result = Result<DecodedImage, Error> {
-            try autoreleasepool {
-                try decoder.decode(url, tier: job.key.tier, targetLongSide: job.targetLongSide, pool: pool)
+        let result: Result<DecodedImage, Error>
+        if job.quickLook {
+            // Full size for layout comes from the metadata; QuickLook applies the EXIF orientation itself.
+            var known = infos.get(url)
+            if known == nil, let probed = try? decoder.probe(url) { infos.set(url, probed); known = probed }
+            let preview = autoreleasepool {
+                QuickLookPreview.preview(url, longSide: job.targetLongSide, info: known, pool: pool, timeout: 2)
+            }
+            result = preview.map { .success($0) } ?? .failure(QuickLookPreview.Miss())
+        } else {
+            result = Result {
+                try autoreleasepool {
+                    try decoder.decode(url, tier: job.key.tier, targetLongSide: job.targetLongSide, pool: pool)
+                }
             }
         }
         Trace.signposter.endInterval("decode", interval)

@@ -134,6 +134,8 @@ struct PlannedJob: Sendable, Hashable {
     /// Deadline in ms (earliest first); negative for the visible image.
     let prio: Double
     let kind: JobKind
+    /// Sweep job served from QuickLook's thumbnail cache instead of our own (expensive) preview decode.
+    var quickLook = false
 }
 
 struct Plan: Sendable {
@@ -160,6 +162,8 @@ struct PlanContext {
     var busy: (Int, Tier) -> Bool
     var estimate: (Int, Tier) -> Double
     var cheapPreview: (Int) -> Bool
+    /// The sweep may ask QuickLook for this file's preview (its own preview is not cheap).
+    var quickLookSweep: (Int) -> Bool = { _ in false }
     /// The view asked for full resolution of the current image.
     var fullRequested: Bool
     /// Sum of the estimates of decodes running on the decode lanes.
@@ -263,8 +267,13 @@ func planPrefetch(_ nav: NavModel, now: UInt64, tuning t: PrefetchTuning, contex
         while added < limit && r < c.count && r <= radius {
             for j in [i + nav.direction * r, i - nav.direction * r] where inRange(j) && added < limit {
                 if planned.contains(j) || sharp(j) || c.cached(j, .preview) || c.busy(j, .preview) { continue }
-                guard c.cheapPreview(j) else { continue }
-                plan.jobs.append(PlannedJob(index: j, tier: .preview, prio: 1e6 + Double(r), kind: .sweep))
+                if c.cheapPreview(j) {
+                    plan.jobs.append(PlannedJob(index: j, tier: .preview, prio: 1e6 + Double(r), kind: .sweep))
+                } else if c.quickLookSweep(j) {
+                    plan.jobs.append(PlannedJob(index: j, tier: .preview, prio: 1e6 + Double(r), kind: .sweep, quickLook: true))
+                } else {
+                    continue
+                }
                 added += 1
             }
             r += 1
