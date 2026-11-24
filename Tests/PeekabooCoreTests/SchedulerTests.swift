@@ -44,6 +44,31 @@ final class SchedulerTests: XCTestCase {
         XCTAssertEqual(Set(offsets(plan, .preview, cursor: 100)), [1])
     }
 
+    /// An expensive preview (a reduced hardware decode, as costly as the screen tier) is not prefetched for a neighbour
+    /// whose screen tier is planned: it would land after it and take an engine slot. Outside the screen window, and
+    /// while skimming, previews stay; `screenWindowCheapPreviewsOnly = false` restores the old rule.
+    func testExpensivePreviewsAreNotPrefetchedInsideTheScreenWindow() {
+        let (nav, now) = steady(100, steps: 12, intervalMs: 150)
+        var c = context()
+        c.cheapPreview = { _ in false }
+        let plan = planPrefetch(nav, now: now + ms, tuning: PrefetchTuning(), context: c)
+        let screen = Set(offsets(plan, .screen, cursor: 100))
+        let previews = Set(offsets(plan, .preview, cursor: 100))
+        XCTAssertFalse(screen.isEmpty)
+        XCTAssertTrue(previews.isDisjoint(with: screen), "previews \(previews) overlap screen \(screen)")
+        XCTAssertFalse(previews.isEmpty, "previews beyond the screen window are still prefetched")
+
+        var legacy = PrefetchTuning()
+        legacy.screenWindowCheapPreviewsOnly = false
+        let old = planPrefetch(nav, now: now + ms, tuning: legacy, context: c)
+        XCTAssertTrue(Set(offsets(old, .preview, cursor: 100)).isSuperset(of: screen.filter { $0 > 0 }))
+
+        // Skimming: the preview is what will be shown, expensive or not.
+        let (skimNav, skimNow) = steady(100, steps: 12, intervalMs: 33, isRepeat: true)
+        let skim = planPrefetch(skimNav, now: skimNow + ms, tuning: PrefetchTuning(), context: c)
+        XCTAssertTrue(offsets(skim, .preview, cursor: 100).contains(1))
+    }
+
     func testFastWindowsGrowWithVelocity() {
         let (nav, now) = steady(100, steps: 12, intervalMs: 150)
         let plan = planPrefetch(nav, now: now + ms, tuning: PrefetchTuning(), context: context())
