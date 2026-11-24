@@ -947,7 +947,7 @@ public final class Renderer {
         }
         e.endEncoding()
         if Trace.enabled {
-            Trace.log("HQ L\(L) canvas \(cw)x\(ch) taps \(ntapsX)x\(ntapsY) r=\(String(format: "%.3f", rp.sx)) light=\(rp.light) bands=\((ch + rowsPerBand - 1) / rowsPerBand)")
+            Trace.log("HQ L\(L) canvas \(cw)x\(ch) taps \(ntapsX)x\(ntapsY) r=\(String(format: "%.3f", rp.sx)) light=\(rp.light) bands=\((ch + rowsPerBand - 1) / rowsPerBand) h=\(L > 0 ? "level" : fastSource ? "fast" : "general")")
         }
         return canvasTex
     }

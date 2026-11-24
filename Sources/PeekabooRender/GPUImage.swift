@@ -30,7 +30,7 @@ final class GPUImage {
 
     let image: DecodedImage
     let width: Int, height: Int
-    let tiles: [MTLTexture]
+    private(set) var tiles: [MTLTexture]
     let tileCols: Int
     var src: SrcInfo
     private(set) var lut: MTLBuffer
@@ -65,7 +65,7 @@ final class GPUImage {
     private var buildStarted = false
     private var pendingPyramid: RenderContext?
     /// Keeps a bytesNoCopy wrapper of an IOSurface alive for tiled surfaces.
-    private let surfaceBuffer: MTLBuffer?
+    private var surfaceBuffer: MTLBuffer?
 
     var isUsable: Bool { !tiles.isEmpty }
     var isFullResolution: Bool { abs(scaleX - 1) < 1e-9 && abs(scaleY - 1) < 1e-9 }
@@ -83,14 +83,13 @@ final class GPUImage {
         hasAlpha = px.alpha != .opaque
 
         // Uncommon profiles are probed on a background queue (1–3 ms of CoreGraphics work that used to run here,
-        // on the main thread). Probed profiles never use the sRGB curve, so their textures are plain unorm views and
-        // the fallback applies the sRGB curve in the shader until the real transform lands.
+        // on the main thread). Until the real transform lands the textures are plain unorm views and the fallback
+        // applies the sRGB curve in the shader; `applyColor` swaps in `_srgb` views if the profile has the sRGB curve.
         let space = px.colorSpace
         let cachedTransform = ColorTransform.cached(space)
         let transform = cachedTransform ?? ColorTransform.fallback(for: space)
         colorReady = cachedTransform != nil
-        let srgbFormat = cachedTransform != nil && transform.usesSRGBCurve && px.alpha == .opaque
-            && (px.layout == .rgba8 || px.layout == .bgra8)
+        let srgbFormat = cachedTransform != nil && Self.usesSRGBViews(transform, px)
         var info = SrcInfo()
         info.m0 = SIMD4(transform.rows.0, 0); info.m1 = SIMD4(transform.rows.1, 0); info.m2 = SIMD4(transform.rows.2, 0)
         info.width = Int32(width); info.height = Int32(height)
@@ -107,43 +106,7 @@ final class GPUImage {
         info.tileCols = Int32(cols)
         info.tileCount = Int32(cols * rows)
         info.tileShift = Int32(Self.tileShift)
-        var made: [MTLTexture] = []
-        var wrapper: MTLBuffer?
-        let format: MTLPixelFormat = srgbFormat ? (px.layout == .bgra8 ? .bgra8Unorm_srgb : .rgba8Unorm_srgb) : px.layout.metalFormat
-        if cols * rows <= 16 {
-            var buffer: MTLBuffer?
-            switch px.storage {
-            case .metal(let b): buffer = b
-            case .surface(let surface):
-                if cols * rows > 1 {
-                    let length = IOSurfaceGetAllocSize(surface)
-                    wrapper = device.makeBuffer(bytesNoCopy: IOSurfaceGetBaseAddress(surface), length: length,
-                                                options: .storageModeShared, deallocator: nil)
-                    buffer = wrapper
-                }
-            }
-            for ty in 0..<rows {
-                for tx in 0..<cols {
-                    let x0 = tx * Self.maxTextureSide, y0 = ty * Self.maxTextureSide
-                    let w = min(Self.maxTextureSide, width - x0), h = min(Self.maxTextureSide, height - y0)
-                    let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: w, height: h, mipmapped: false)
-                    d.usage = [.shaderRead]
-                    d.swizzle = px.layout.metalSwizzle
-                    d.storageMode = .shared
-                    var tex: MTLTexture?
-                    if let buffer {
-                        let offset = y0 * px.bytesPerRow + x0 * px.layout.bytesPerPixel
-                        tex = buffer.makeTexture(descriptor: d, offset: offset, bytesPerRow: px.bytesPerRow)
-                    } else if case .surface(let surface) = px.storage {
-                        tex = device.makeTexture(descriptor: d, iosurface: surface, plane: 0)
-                    }
-                    if let tex { made.append(tex) }
-                }
-            }
-            if made.count != cols * rows { made = [] }
-        }
-        tiles = made
-        surfaceBuffer = wrapper
+        (tiles, surfaceBuffer) = Self.makeTiles(px, srgbViews: srgbFormat, device: device)
         src = info
 
         // Pyramid geometry. Levels whose size would exceed the texture limit are skipped: the first built level is
@@ -165,11 +128,66 @@ final class GPUImage {
         }
     }
 
+    private static func usesSRGBViews(_ t: ColorTransform, _ px: PixelBuffer) -> Bool {
+        t.usesSRGBCurve && px.alpha == .opaque && (px.layout == .rgba8 || px.layout == .bgra8)
+    }
+
+    /// Level-0 tiles: views into the decoder's memory, no copies (`_srgb` views decode the curve for free).
+    private static func makeTiles(_ px: PixelBuffer, srgbViews: Bool, device: MTLDevice) -> ([MTLTexture], MTLBuffer?) {
+        let width = px.width, height = px.height
+        let cols = (width + maxTextureSide - 1) / maxTextureSide
+        let rows = (height + maxTextureSide - 1) / maxTextureSide
+        guard cols * rows <= 16 else { return ([], nil) }
+        var made: [MTLTexture] = []
+        var wrapper: MTLBuffer?
+        let format: MTLPixelFormat = srgbViews ? (px.layout == .bgra8 ? .bgra8Unorm_srgb : .rgba8Unorm_srgb) : px.layout.metalFormat
+        var buffer: MTLBuffer?
+        switch px.storage {
+        case .metal(let b): buffer = b
+        case .surface(let surface):
+            if cols * rows > 1 {
+                let length = IOSurfaceGetAllocSize(surface)
+                wrapper = device.makeBuffer(bytesNoCopy: IOSurfaceGetBaseAddress(surface), length: length,
+                                            options: .storageModeShared, deallocator: nil)
+                buffer = wrapper
+            }
+        }
+        for ty in 0..<rows {
+            for tx in 0..<cols {
+                let x0 = tx * maxTextureSide, y0 = ty * maxTextureSide
+                let w = min(maxTextureSide, width - x0), h = min(maxTextureSide, height - y0)
+                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: w, height: h, mipmapped: false)
+                d.usage = [.shaderRead]
+                d.swizzle = px.layout.metalSwizzle
+                d.storageMode = .shared
+                var tex: MTLTexture?
+                if let buffer {
+                    let offset = y0 * px.bytesPerRow + x0 * px.layout.bytesPerPixel
+                    tex = buffer.makeTexture(descriptor: d, offset: offset, bytesPerRow: px.bytesPerRow)
+                } else if case .surface(let surface) = px.storage {
+                    tex = device.makeTexture(descriptor: d, iosurface: surface, plane: 0)
+                }
+                if let tex { made.append(tex) }
+            }
+        }
+        return made.count == cols * rows ? (made, wrapper) : ([], nil)
+    }
+
     /// Main thread: install the probed colour transform.
     private func applyColor(_ t: ColorTransform, device: MTLDevice) {
         guard !colorReady else { return }
         src.m0 = SIMD4(t.rows.0, 0); src.m1 = SIMD4(t.rows.1, 0); src.m2 = SIMD4(t.rows.2, 0)
         src.trc = t.curve.rawValue
+        // An embedded sRGB / Display P3 profile: swap in `_srgb` views so the HQ pass and the pyramid take their
+        // fast paths (texture views only; frames in flight keep the old ones alive).
+        if Self.usesSRGBViews(t, image.pixels) {
+            let (views, wrapper) = Self.makeTiles(image.pixels, srgbViews: true, device: device)
+            if views.count == tiles.count {
+                tiles = views
+                surfaceBuffer = wrapper
+                src.trc = 0
+            }
+        }
         let table = t.lut.isEmpty ? [Float](repeating: 0, count: 2) : t.lut
         src.lutSize = Int32(table.count)
         if let buffer = device.makeBuffer(bytes: table, length: table.count * 4, options: .storageModeShared) { lut = buffer }

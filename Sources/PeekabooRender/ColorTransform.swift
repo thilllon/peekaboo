@@ -120,7 +120,32 @@ struct ColorTransform {
         let rows = (SIMD3<Float>(c0.x, c1.x, c2.x), SIMD3<Float>(c0.y, c1.y, c2.y), SIMD3<Float>(c0.z, c1.z, c2.z))
         // A ramp that is linear to within 1e-3 needs no curve.
         let isLinear = (0..<ramp).allSatisfy { abs(lut[$0] - Float($0) / Float(ramp - 1)) < 1e-3 }
-        return ColorTransform(rows: rows, curve: isLinear ? .linear : .table, lut: isLinear ? [] : lut)
+        if isLinear { return ColorTransform(rows: rows, curve: .linear, lut: []) }
+        // Embedded sRGB / Display P3 profiles (most photos: cameras embed sRGB IEC61966-2.1, phones Display P3) are
+        // unnamed spaces, but their curve is the sRGB curve: say so, so that 8-bit textures use `_srgb` views and the
+        // HQ pass takes its fast path (the LUT path cost 4.1 of the 5.7 ms full-tier fit frame).
+        if matchesSRGBCurve(lut) {
+            func near(_ a: SIMD3<Float>, _ b: SIMD3<Float>) -> Bool { simd_reduce_max(simd_abs(a - b)) < 2e-3 }
+            let srgb = srgbToP3Rows, p3 = identityRows
+            let snapped: (SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)
+            if near(rows.0, srgb.0) && near(rows.1, srgb.1) && near(rows.2, srgb.2) { snapped = srgb }
+            else if near(rows.0, p3.0) && near(rows.1, p3.1) && near(rows.2, p3.2) { snapped = p3 }
+            else { snapped = rows }
+            return ColorTransform(rows: snapped, curve: .srgb, lut: [])
+        }
+        return ColorTransform(rows: rows, curve: .table, lut: lut)
+    }
+
+    /// Whether a probed ramp (values at i / (n − 1)) is the IEC 61966-2-1 curve: within 0.2 % relative error plus
+    /// 2·10⁻⁵ absolute (well under half an 8-bit step anywhere on the curve).
+    static func matchesSRGBCurve(_ lut: [Float]) -> Bool {
+        let n = lut.count
+        guard n > 1 else { return false }
+        return (0..<n).allSatisfy { i in
+            let v = Double(i) / Double(n - 1)
+            let s = v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
+            return abs(Double(lut[i]) - s) <= 2e-5 + 2e-3 * s
+        }
     }
 
     /// Whether the transfer curve is the sRGB curve (then 8-bit textures can use `_srgb` formats for free decoding).

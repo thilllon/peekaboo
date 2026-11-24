@@ -508,6 +508,53 @@ final class PeekabooRenderTests: XCTestCase {
         print(String(format: "setImage with an unprobed profile: %.3f ms on the main thread", setMs))
     }
 
+    /// Embedded sRGB and Display P3 profiles (unnamed ICC spaces, as decoded from most photos) are recognised as the
+    /// sRGB curve with snapped primaries, so 8-bit tiers use `_srgb` views and the fast HQ path; Adobe RGB is not.
+    func testEmbeddedSRGBProfilesUseTheSRGBCurve() throws {
+        for name in [CGColorSpace.sRGB, CGColorSpace.displayP3] {
+            let data = try XCTUnwrap(CGColorSpace(name: name)?.copyICCData())
+            let embedded = try XCTUnwrap(CGColorSpace(iccData: data))
+            let t = try XCTUnwrap(ColorTransform.probe(embedded))
+            XCTAssertEqual(t.curve, .srgb, "\(name)")
+            let expected = name == CGColorSpace.sRGB ? ColorTransform.srgbToP3Rows : ColorTransform.identityRows
+            XCTAssertEqual(t.rows.0, expected.0)
+            XCTAssertEqual(t.rows.1, expected.1)
+            XCTAssertEqual(t.rows.2, expected.2)
+        }
+        let adobe = try XCTUnwrap(ColorTransform.probe(XCTUnwrap(CGColorSpace(name: CGColorSpace.adobeRGB1998))))
+        XCTAssertNotEqual(adobe.curve, .srgb)
+        // Gamma 2.2 is close to, but not, the sRGB curve.
+        var gamma = [Float](repeating: 0, count: 1024)
+        for i in 0..<1024 { gamma[i] = Float(pow(Double(i) / 1023, 2.2)) }
+        XCTAssertFalse(ColorTransform.matchesSRGBCurve(gamma))
+    }
+
+    /// The first image with an embedded sRGB profile (probed off the main thread) ends up on the `_srgb` fast path
+    /// with the same pixels as a named sRGB image.
+    func testFirstSightEmbeddedSRGBMatchesNamedSRGB() throws {
+        // No other test shows an embedded sRGB profile, so this is its first sight in the process.
+        let data = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB)?.copyICCData())
+        let embedded = try XCTUnwrap(CGColorSpace(iccData: data))
+        let image = makeImage(width: 400, height: 300, space: embedded, fill: pattern)
+        let reference = makeImage(width: 400, height: 300, fill: pattern)
+        let r = makeRenderer(width: 230, height: 170)
+        r.setImage(image, key: "embedded")
+        let deadline = Date().addingTimeInterval(5)
+        while !r.isColorReady(for: image) && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.002)) }
+        XCTAssertTrue(r.isColorReady(for: image))
+        waitForPyramid(r, image)
+        let a = render(r)
+        r.setImage(reference, key: "named")
+        waitForPyramid(r, reference)
+        let b = render(r)
+        var maxDiff = 0.0
+        for i in 0..<a.px.count {
+            let p = a.px[i], q = b.px[i]
+            maxDiff = max(maxDiff, abs(p.x - q.x), abs(p.y - q.y), abs(p.z - q.z))
+        }
+        XCTAssertLessThan(maxDiff, 2e-3, "embedded sRGB renders like named sRGB")
+    }
+
     // MARK: Robustness
 
     func testHugeImageDoesNotCrash() {

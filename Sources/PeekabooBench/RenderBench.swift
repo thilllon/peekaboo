@@ -165,10 +165,7 @@ func runRenderBench(_ args: ArraySlice<String>) throws {
         let t0 = Trace.now()
         viewer.setImage(probeImage, key: "adobe")
         let setMs = Trace.ms(since: t0)
-        let t1 = Trace.now()
-        viewer.render()
-        let renderCPU = Trace.ms(since: t1)
-        print(String(format: "setImage, Adobe RGB (1998) first sight: main thread %.3f ms (+ render encode %.3f ms)", setMs, renderCPU))
+        print(String(format: "setImage, Adobe RGB (1998) first sight: main thread %.3f ms (ICC probe runs off the main thread)", setMs))
     }
 }
 
