@@ -341,6 +341,49 @@ final class DecodeTests: XCTestCase {
         }
     }
 
+    /// Gray and CMYK JPEG (ImageIO route), 16-bit PNG, GIF and TIFF decode at every tier with a usable layout.
+    func testUnusualFormats() throws {
+        let rgb = try quadrants(640, 480)
+        func redraw(_ space: CGColorSpace, bits: Int, info: UInt32) throws -> CGImage {
+            let ctx = try XCTUnwrap(CGContext(data: nil, width: 640, height: 480, bitsPerComponent: bits, bytesPerRow: 0,
+                                              space: space, bitmapInfo: info))
+            ctx.draw(rgb, in: CGRect(x: 0, y: 0, width: 640, height: 480))
+            return try XCTUnwrap(ctx.makeImage())
+        }
+        let gray = try redraw(CGColorSpaceCreateDeviceGray(), bits: 8, info: CGImageAlphaInfo.none.rawValue)
+        let cmyk = try redraw(CGColorSpaceCreateDeviceCMYK(), bits: 8, info: CGImageAlphaInfo.none.rawValue)
+        let deep = try redraw(try XCTUnwrap(CGColorSpace(name: CGColorSpace.displayP3)), bits: 16,
+                              info: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder16Little.rawValue)
+        let files = [
+            try write(gray, "gray.jpg", type: .jpeg),
+            try write(cmyk, "cmyk.jpg", type: .jpeg),
+            try write(deep, "deep.png", type: .png),
+            try write(rgb, "image.gif", type: .gif),
+            try write(rgb, "image.tiff", type: .tiff),
+        ]
+        for url in files {
+            let info = try decoder.probe(url)
+            XCTAssertEqual(info.pixelWidth, 640, url.lastPathComponent)
+            for (tier, target) in [(Tier.preview, 160), (.screen, 320), (.full, 0)] {
+                let image = try decoder.decode(url, tier: tier, targetLongSide: target, pool: pool)
+                let p = image.pixels
+                XCTAssertEqual(Double(p.width) / Double(p.height), 640.0 / 480.0, accuracy: 0.02, "\(url.lastPathComponent) \(tier)")
+                XCTAssertGreaterThanOrEqual(p.width, tier == .full ? 640 : target, "\(url.lastPathComponent) \(tier)")
+                XCTAssertEqual(p.colorSpace.model, .rgb, "\(url.lastPathComponent) \(tier): the renderer samples RGB only")
+                XCTAssertNotNil(p.makeTexture(device: pool.device))
+                if url.pathExtension == "gif" || url.pathExtension == "tiff" { assertQuadrants(p) }
+                if url.lastPathComponent.hasPrefix("cmyk") || url.lastPathComponent.hasPrefix("deep") {
+                    // Gamut mapping (CMYK) and P3 encoding change the values; channel order must still hold.
+                    let red = pixel(p, p.width / 4, p.height / 4), green = pixel(p, p.width * 3 / 4, p.height / 4)
+                    XCTAssert(red.0 > red.1 + 100 && red.0 > red.2 + 100, "\(url.lastPathComponent) \(tier) red \(red)")
+                    XCTAssert(green.1 > green.0 + 40 && green.1 > green.2 + 40, "\(url.lastPathComponent) \(tier) green \(green)")
+                }
+            }
+        }
+        XCTAssertTrue(try decoder.probe(files[1]).exif["format"]?.contains("CMYK") ?? false)
+        XCTAssertEqual(decoder.lane(for: files[1], info: try decoder.probe(files[1]), tier: .screen), .general)
+    }
+
     func testUnreadableFileThrows() throws {
         let url = dir.appendingPathComponent("garbage.jpg")
         try Data("not an image".utf8).write(to: url)
