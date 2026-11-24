@@ -200,8 +200,9 @@ func planPrefetch(_ nav: NavModel, now: UInt64, tuning t: PrefetchTuning, contex
         }
     }
     if skim && since.isFinite { plan.wake(after: t.skimIntervalMs - since) }
+    // Zoom intent: full resolution first among prefetch work (it does not gate the neighbours).
     if c.fullRequested && !c.cached(i, .full) && !c.busy(i, .full) {
-        plan.jobs.append(PlannedJob(index: i, tier: .full, prio: -1, kind: .visible))
+        plan.jobs.append(PlannedJob(index: i, tier: .full, prio: -1, kind: .prefetch))
     }
     guard c.listingReady else { return plan }
 

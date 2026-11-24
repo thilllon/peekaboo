@@ -242,6 +242,7 @@ final class PipelineTests: PipelineTestCase {
             spin(for: 0.1)
             pipeline.navigate(to: i, isRepeat: false)
         }
+        XCTAssertTrue(spin { self.has(pipeline, files[110], .screen) })
         pipeline.requestFullResolution()
         XCTAssertTrue(spin { self.has(pipeline, files[110], .full) })
         spin(for: 0.2)
@@ -315,6 +316,7 @@ final class PipelineTests: PipelineTestCase {
         let pipeline = makePipeline(decoder)
         let files = makeFiles(5, ext: "png")  // 48 MP PNG: full resolution is expensive, never speculative
         pipeline.setFiles(files, index: 0)
+        pipeline.requestFullResolution()  // a preview on screen: ignored until the screen tier is there
         XCTAssertTrue(spin { self.has(pipeline, files[0], .screen) })
         spin(for: 0.5)
         XCTAssertFalse(has(pipeline, files[0], .full))

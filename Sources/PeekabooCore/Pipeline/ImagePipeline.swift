@@ -228,9 +228,11 @@ public final class ImagePipeline {
         replan()
     }
 
-    /// The view needs more than the screen tier (zoom beyond fit) for the current image.
+    /// The view needs more than the screen tier (zoom beyond fit) for the current image: decode `.full` next, ahead of
+    /// all prefetch. Ignored until the screen tier is cached (a preview on screen always "wants" more pixels; the view
+    /// asks again when the screen tier is shown).
     public func requestFullResolution() {
-        guard let file = currentFile, !isCached(index, .full), fullRequested != file.url else { return }
+        guard let file = currentFile, isCached(index, .screen), !isCached(index, .full), fullRequested != file.url else { return }
         fullRequested = file.url
         replan()
     }
@@ -353,8 +355,7 @@ public final class ImagePipeline {
         var jobs: [DecodeJob] = []
         jobs.reserveCapacity(plan.jobs.count)
         let current = files[index].url
-        var visible: Set<JobKey> = [JobKey(url: current, tier: .preview), JobKey(url: current, tier: .screen)]
-        if fullRequested == current { visible.insert(JobKey(url: current, tier: .full)) }
+        let visible: Set<JobKey> = [JobKey(url: current, tier: .preview), JobKey(url: current, tier: .screen)]
         for planned in plan.jobs {
             let j = planned.index
             let file = files[j]
