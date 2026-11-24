@@ -112,6 +112,35 @@ final class KeymapTests: XCTestCase {
         XCTAssertEqual(map.sequences(for: .zoomToggle).map { KeyChord.spec(of: $0) }, ["space", "z"])
     }
 
+    func testActionKeyedEntriesBindSeveralKeys() throws {
+        let map = try config("""
+        [keys]
+        "nav.next" = ["n", "ctrl+f"]
+        "file.trash" = "d d"
+        "none" = ["tab", "b"]
+        "exec:open -R {path}" = "ctrl+r"
+        [keys.zoomed]
+        "pan.left" = "a"
+        """).keymap
+        XCTAssertEqual(resolve(map, "n"), .actions([.next]))
+        XCTAssertEqual(resolve(map, "ctrl+f"), .actions([.next]))
+        XCTAssertEqual(resolve(map, "d"), .pending)
+        XCTAssertEqual(resolve(map, "d d"), .actions([.trash]))
+        XCTAssertEqual(resolve(map, "tab"), .unbound)
+        XCTAssertEqual(resolve(map, "b"), .unbound)
+        XCTAssertEqual(resolve(map, "ctrl+r"), .actions([.exec("open -R {path}")]))
+        XCTAssertEqual(resolve(map, "a", .zoomed), .actions([.pan(.left)]))
+        XCTAssertThrowsError(try config("[keys]\n\"nav.next\" = [\"n\", \"bogus\"]\n")) { error in
+            XCTAssertEqual((error as! ConfigError).messages, ["config.toml:2: \"bogus\": unknown key \"bogus\""])
+        }
+        XCTAssertThrowsError(try config("[keys]\n\"n\" = \"nav.next\"\n\"nav.prev\" = \"n\"\n")) { error in
+            XCTAssertEqual((error as! ConfigError).messages, ["config.toml:3: \"n\" is already bound on line 2"])
+        }
+        XCTAssertThrowsError(try config("[keys]\n\"file.move:keep\" = \"k\"\n")) { error in
+            XCTAssertEqual((error as! ConfigError).messages, ["config.toml:2: unknown slot \"keep\" (add it under [slots])"])
+        }
+    }
+
     func testDefaultsOffStartsEmpty() throws {
         let map = try config("[keymap]\ndefaults = false\n[keys]\n\"n\" = \"nav.next\"\n").keymap
         XCTAssertEqual(resolve(map, "n"), .actions([.next]))

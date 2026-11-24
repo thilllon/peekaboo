@@ -194,8 +194,8 @@ final class ConfigTests: XCTestCase {
             wait(for: [changed], timeout: 3)
         }
 
-        // Give the watcher a moment to arm on its queue.
-        Thread.sleep(forTimeInterval: 0.05)
+        // `load()` runs on the store's serial queue, so once it returns the watcher is armed.
+        store.load()
         // Atomic save: a new inode renamed over the old file (vim, VS Code, …).
         try expectChange({ $0.hud == .full }) {
             try Data("[hud]\nmode = \"full\"\n".utf8).write(to: url, options: .atomic)

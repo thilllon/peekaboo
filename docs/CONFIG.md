@@ -86,6 +86,18 @@ of the default keymap: binding a chord the defaults use replaces it, and `"none"
 (`"tab" = "none"`). In `[keys.zoomed]`, `"none"` removes the zoomed binding, so the key falls back to
 `[keys]`.
 
+**One action, several keys.** An entry may also be written the other way round, with the action as the
+key and one chord or a list of chords as the value:
+
+```toml
+[keys]
+"nav.next" = ["n", "ctrl+f"]        # same as "n" = "nav.next" and "ctrl+f" = "nav.next"
+"file.trash" = "d d"
+"none" = ["tab", "b"]               # unbind both
+```
+
+A chord may be bound only once per table, whichever spelling you use.
+
 **Sequences.** A binding may be a sequence of chords separated by spaces: `"g g"`, `"ctrl+x o"`. A key
 cannot both be bound and start a sequence: with `z` bound to `zoom.toggle`, `"z z"` is reported as
 `"z z" conflicts with "z"`. Unbind the single key first (`"z" = "none"`). There is no timeout, so single

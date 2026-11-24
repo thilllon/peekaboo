@@ -139,18 +139,33 @@ private struct ConfigReader {
         var keymap = Keymap.build(defaults: defaults, vim: vim, autoAdvance: autoAdvance)
         var lineOf: [KeyContext: [[KeyChord]: Int]] = [:]
         for (entry, context, spec) in entries {
-            let sequence: [KeyChord]
-            do {
-                sequence = try KeyChord.parseSequence(spec)
-            } catch {
-                fail(entry, "\"\(spec)\": \(error)"); continue
+            // Two spellings: "chord" = action(s), or "action" = chord(s) to give one action several keys.
+            var bindings: [(sequence: [KeyChord], actions: [Action])] = []
+            if let action = Action(id: spec) {
+                guard validate(action, entry), let specs = keySpecs(entry) else { continue }
+                for keys in specs {
+                    do {
+                        bindings.append((try KeyChord.parseSequence(keys), [action]))
+                    } catch {
+                        fail(entry, "\"\(keys)\": \(error)")
+                    }
+                }
+            } else {
+                do {
+                    let sequence = try KeyChord.parseSequence(spec)
+                    guard let actions = actions(entry) else { continue }
+                    bindings.append((sequence, actions))
+                } catch {
+                    fail(entry, "\"\(spec)\": \(error)"); continue
+                }
             }
-            if let earlier = lineOf[context]?[sequence] {
-                fail(entry, "\"\(KeyChord.spec(of: sequence))\" is already bound on line \(earlier)"); continue
+            for (sequence, actions) in bindings {
+                if let earlier = lineOf[context]?[sequence] {
+                    fail(entry, "\"\(KeyChord.spec(of: sequence))\" is already bound on line \(earlier)"); continue
+                }
+                lineOf[context, default: [:]][sequence] = entry.line
+                keymap.bind(sequence, to: actions, context: context)
             }
-            guard let actions = actions(entry) else { continue }
-            lineOf[context, default: [:]][sequence] = entry.line
-            keymap.bind(sequence, to: actions, context: context)
         }
         for conflict in keymap.conflicts() {
             let line = [conflict.sequence, conflict.prefix].compactMap { lineOf[.normal]?[$0] ?? lineOf[.zoomed]?[$0] }.first ?? 0
@@ -180,17 +195,41 @@ private struct ConfigReader {
             guard let action = Action(id: id) else {
                 fail(entry, "unknown action \"\(id)\"\(Self.suggestion(for: id))"); return nil
             }
-            switch action {
-            case .move(let target), .copy(let target):
-                if !FileOperations.isPathLike(target), target != "ask", target != "last", config.slots[target] == nil {
-                    fail(entry, "unknown slot \"\(target)\" (add it under [slots])"); return nil
-                }
-            default: break
-            }
+            guard validate(action, entry) else { return nil }
             actions.append(action)
         }
         if actions.count > 1, actions.contains(.none) { fail(entry, "\"none\" cannot be part of an action list"); return nil }
         return actions
+    }
+
+    /// Move/copy targets must be a path, `ask`, `last` or a slot defined under `[slots]`.
+    private mutating func validate(_ action: Action, _ entry: TOMLEntry) -> Bool {
+        switch action {
+        case .move(let target), .copy(let target):
+            if !FileOperations.isPathLike(target), target != "ask", target != "last", config.slots[target] == nil {
+                fail(entry, "unknown slot \"\(target)\" (add it under [slots])")
+                return false
+            }
+        default: break
+        }
+        return true
+    }
+
+    /// The value of an `"action" = …` entry: one chord (sequence) or a list of them.
+    private mutating func keySpecs(_ entry: TOMLEntry) -> [String]? {
+        switch entry.value {
+        case .string(let keys): return [keys]
+        case .array(let items) where !items.isEmpty:
+            var specs: [String] = []
+            for item in items {
+                guard case .string(let keys) = item else { fail(entry, "keys must be strings"); return nil }
+                specs.append(keys)
+            }
+            return specs
+        default:
+            fail(entry, "expected a key or a list of keys for \"\(entry.path.last ?? "")\"")
+            return nil
+        }
     }
 
     /// ` (did you mean "nav.next"?)` for near misses of parameterless ids.
