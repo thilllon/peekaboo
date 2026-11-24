@@ -135,6 +135,15 @@ class ViewerTestCase: XCTestCase {
         return (layer.string as? NSAttributedString)?.string
     }
 
+    /// A key-down event for `viewer`'s window (`keyCode` from Carbon's `kVK_*`).
+    func keyDown(_ viewer: ViewerWindowController, keyCode: Int, characters: String, isRepeat: Bool = false,
+                 modifiers: NSEvent.ModifierFlags = []) -> NSEvent {
+        NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers,
+                         timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: viewer.window?.windowNumber ?? 0,
+                         context: nil, characters: characters, charactersIgnoringModifiers: characters,
+                         isARepeat: isRepeat, keyCode: UInt16(keyCode))!
+    }
+
     /// Stored property `label` of `object` (any access level), through `Mirror`.
     func property<T>(_ object: Any, _ label: String) -> T? {
         var mirror: Mirror? = Mirror(reflecting: object)

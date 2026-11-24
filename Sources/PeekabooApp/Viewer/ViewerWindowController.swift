@@ -815,12 +815,27 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         }
     }
 
-    private func handleKey(_ event: NSEvent) -> Bool {
+    /// A key-down from the local monitor (internal for tests); true when it was handled.
+    func handleKey(_ event: NSEvent) -> Bool {
         // A held pan key moves at display rate from key state; its auto-repeats are noise.
         if event.isARepeat, motion.isHolding(keyCode: event.keyCode) { return true }
         guard let chord = KeyChord(event: event) else { return false }
-        pendingChords.append(chord)
         let context: KeyContext = renderer.isZoomedBeyondFit ? .zoomed : .normal
+        if event.isARepeat {
+            // Auto-repeat repeats what is meant to be held (navigation, zoom steps) and never completes or starts a
+            // sequence: holding ⌘⌫ must not trash a run of images, nor Esc leave full screen and then close the window.
+            guard pendingChords.isEmpty else { return true }
+            switch config.keymap.resolve([chord], context: context) {
+            case .actions(let actions):
+                if actions.allSatisfy(Self.repeats) { for action in actions { perform(action, isRepeat: true) } }
+                return true
+            case .pending:
+                return true
+            case .unbound:
+                return false
+            }
+        }
+        pendingChords.append(chord)
         var result = config.keymap.resolve(pendingChords, context: context)
         if case .unbound = result, pendingChords.count > 1 {
             // A broken sequence: the last chord may still be a binding on its own.
@@ -831,16 +846,24 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         case .actions(let actions):
             pendingChords.removeAll()
             if actions.count == 1, case .pan(let direction) = actions[0] {
-                if !event.isARepeat { motion.pressPanKey(event.keyCode, direction: direction) }
+                motion.pressPanKey(event.keyCode, direction: direction)
                 return true
             }
-            for action in actions { perform(action, isRepeat: event.isARepeat) }
+            for action in actions { perform(action) }
             return true
         case .pending:
             return true
         case .unbound:
             pendingChords.removeAll()
             return false
+        }
+    }
+
+    /// Actions that run again on key auto-repeat (a held pan key moves from key state instead).
+    private static func repeats(_ action: Action) -> Bool {
+        switch action {
+        case .next, .previous, .jump, .zoomIn, .zoomOut: return true
+        default: return false
         }
     }
 
