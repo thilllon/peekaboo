@@ -84,7 +84,8 @@ final class HUD {
 
     private var size = CGSize(width: 100, height: 100)
     private var topInset: CGFloat = 0
-    private var scale: CGFloat = 2
+    /// 0 until the first layout, so the text layers always receive the real backing scale.
+    private var scale: CGFloat = 0
     private var content = HUDContent()
     private var toastGeneration = 0
     private var messageText: String?
@@ -123,6 +124,7 @@ final class HUD {
 
     func layout(size: CGSize, topInset: CGFloat, scale: CGFloat) {
         let scaleChanged = scale != self.scale
+        let widthChanged = abs(size.width - self.size.width) >= 1
         self.size = size
         self.topInset = topInset
         self.scale = scale
@@ -138,6 +140,8 @@ final class HUD {
             layoutMessage()
             layoutToast()
         }
+        // Re-measure so the info line truncates to the new width (and re-rasterises at a new scale).
+        if widthChanged || scaleChanged { refreshInfo() }
         if helpSections != nil { renderHelp() }
     }
 
