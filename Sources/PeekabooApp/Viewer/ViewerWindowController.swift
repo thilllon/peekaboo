@@ -344,8 +344,15 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         return [direction, -direction, 2 * direction]
     }
 
+    /// Neighbours are prepared only once the current image shows a sharp tier: until then the renderer's LRU still
+    /// holds the current preview, which it draws while the screen tier's pyramid builds.
+    private var currentIsSharp: Bool {
+        guard let file = pipeline.currentFile, shownFile == file, let tier = shownTier else { return false }
+        return tier >= .screen
+    }
+
     private func prepareIfNeighbour(_ image: DecodedImage, for file: ImageFile) {
-        guard image.tier != .preview, shownFile != nil, !pipeline.isSkimming else { return }
+        guard image.tier != .preview, currentIsSharp, !pipeline.isSkimming else { return }
         let files = pipeline.files
         let isNeighbour = neighbourOffsets().contains { offset in
             let j = pipeline.index + offset
@@ -359,7 +366,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// After the current image is shown: prepare the sharp tiers of the neighbours that are already decoded (the
     /// farthest first, so the next image is the most recently used entry of the renderer's LRU).
     private func prepareNeighbours() {
-        guard !pipeline.isSkimming else { return }
+        guard currentIsSharp, !pipeline.isSkimming else { return }
         let files = pipeline.files
         for offset in neighbourOffsets().reversed() {
             let j = pipeline.index + offset
