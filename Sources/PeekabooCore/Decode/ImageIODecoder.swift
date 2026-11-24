@@ -8,8 +8,8 @@ import IOSurface
 ///
 /// | Source | `.preview` | `.screen` | `.full` |
 /// |---|---|---|---|
-/// | baseline JPEG | EXIF thumbnail, else IOSurface SPI /≤4 | IOSurface SPI, power-of-two subsample (≤ 4) covering the target | IOSurface SPI |
-/// | progressive JPEG | EXIF thumbnail, else ImageIO /8 (DC-only) | libjpeg-turbo, DCT scale covering the target | libjpeg-turbo |
+/// | baseline JPEG | MPF large thumbnail, else EXIF thumbnail, else IOSurface SPI /≤4 | IOSurface SPI, power-of-two subsample (≤ 4) covering the target | IOSurface SPI |
+/// | progressive JPEG | MPF large thumbnail, else EXIF thumbnail, else ImageIO /8 (DC-only) | libjpeg-turbo, DCT scale covering the target | libjpeg-turbo |
 /// | HEIC / HEIF / AVIF | thumbnail item, else IOSurface SPI /≤4 | IOSurface SPI /≤4 | IOSurface SPI |
 /// | camera RAW | embedded preview (CR3: own ISO-BMFF parse) | embedded preview at the target size if it covers it, else RAW decode /n | RAW decode (16-bit) |
 /// | PNG, WebP, TIFF, … | thumbnail (`Always`) | IOSurface SPI /n | IOSurface SPI |
@@ -36,6 +36,16 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     /// 16384…65000 px wide images are all hardware-decoded; larger ones are unverified and go to
     /// libjpeg-turbo. (Progressive JPEGs are never hardware-decoded, whatever their size.)
     public static let hardwareJPEGMaxPixels = 102_000_000
+
+    /// Fraction of the `.screen` target a progressive JPEG's libjpeg-turbo DCT scale must cover. At 1 (default)
+    /// the screen tier covers the target (24 MP on a 3456 px screen: full size, 273 ms). At 0.85 it may stop at
+    /// 1/2 (2974 px, 86 %: 255 ms, a quarter of the memory; 101 MP: 1/4, 616 vs 617 ms). That only pays off once
+    /// the renderer accepts such a tier at fit: `Renderer.wantsFullResolution` asks for `.full` above 1.01×,
+    /// which would decode the whole image again. Set with `PEEKABOO_PROGRESSIVE_COVERAGE=0.85` or directly.
+    nonisolated(unsafe) public static var progressiveScreenCoverage: Double = {
+        let value = ProcessInfo.processInfo.environment["PEEKABOO_PROGRESSIVE_COVERAGE"].flatMap(Double.init) ?? 1
+        return min(1, max(0.5, value))
+    }()
 
     /// Embedded previews whose aspect ratio differs from the image by more than this are ignored
     /// (cropped or letterboxed camera thumbnails would shift the picture when the next tier lands).
@@ -132,6 +142,10 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
             }
             // HEVC/AV1 decode the whole image whatever the factor, and /8 is slower than /4
             // (HEIC 12 MP 36 vs 29 ms, 44 MP 122 vs 60 ms; AVIF 24 MP 52 vs 40 ms): cap at /4.
+            // Previews without a thumbnail item: /4 is also cheaper than a resampled ImageIO thumbnail
+            // (`CreateThumbnailAtIndex`, `…Always`, 1024 px) and /8, and still ≥ 512 px for ≥ 2048 px images
+            // (M4 Pro, macOS 26.6, /4 vs thumbnail vs /8: HEIC 12 MP 28.9 / 32.3 / 37.0 ms, 44 MP 55.3 / 68.0 / 63.1,
+            // 50 MP 65.6 / 71.7 / 72.7; AVIF 24 MP 39.2 / 45.0 / 46.2).
             return try surfaceOrPublic(probe, subsample: subsample(probe, target, maxFactor: 4), pool: pool)
         case .raw(let cr3):
             return try decodeRAW(probe, cr3: cr3, url: url, tier: tier, target: target, pool: pool)
@@ -154,8 +168,10 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     private func decodeJPEG(_ probe: DecodeProbe, scan: JPEGScan, url: URL, data: Data?, tier: Tier, target: Int,
                             pool: PixelBufferPool) throws -> Output {
         let route = Self.jpegRoute(scan)
-        if tier == .preview, scan.hasEXIFThumbnail, let thumb = embeddedThumbnail(probe, maxPixel: target, pool: pool) {
-            return thumb
+        if tier == .preview {
+            // The largest embedded preview first: an MPF large thumbnail (640–1920 px) beats the 160 px EXIF one.
+            if let preview = mpfPreview(probe, scan: scan, url: url, data: data, target: target, pool: pool) { return preview }
+            if scan.hasEXIFThumbnail, let thumb = embeddedThumbnail(probe, maxPixel: target, pool: pool) { return thumb }
         }
         let long = max(scan.width, scan.height)
         // Baseline JPEG: never /8 — it leaves the hardware path on the public CGImage route
@@ -171,8 +187,17 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
                 let factor = scan.coding == .progressive ? 8 : baselineFactor
                 if let output = try? surfaceOrPublic(probe, subsample: factor, pool: pool) { return output }
             }
+            // `.screen` of a progressive JPEG is a covering libjpeg-turbo decode unless `progressiveScreenCoverage`
+            // relaxes it (DCT scales are 1/2, 1/4, 1/8 only; see `TurboJPEG.coveringScale`). Measured alternatives
+            // (24 MP 5947×3964, 3456 px screen, M4 Pro, macOS 26.6): ImageIO /2 305.6 ms (IOSurface SPI) /
+            // 307.9 ms (CGImage), /4 301.1 / 311.7 ms — every AC scan is still entropy-decoded; only /8 is
+            // DC-only (31 ms) but covers 21 % of the screen. libjpeg-turbo full 273 ms, 1/2 (2974 px, 86 % of
+            // the screen) 255 ms; 101 MP 1/4 616 ms vs 1/2 617 ms. Entropy decoding dominates, so a
+            // sub-covering screen tier saves ≤ 7 % yet looks softer, and the renderer then asks for `.full`
+            // at fit (it wants a tier ≥ 1.01× the displayed size), which costs the whole decode again.
             do {
-                let pixels = try turbo(url: url, data: data, target: target, pool: pool)
+                let coverage = tier == .screen && scan.coding == .progressive ? Self.progressiveScreenCoverage : 1
+                let pixels = try turbo(url: url, data: data, target: Int((Double(target) * coverage).rounded(.up)), pool: pool)
                 return Output(pixels: pixels, orientation: probe.info.orientation, path: "libjpeg-turbo")
             } catch TurboJPEG.Failure.memory {
                 throw DecodeError.outOfMemory
@@ -180,6 +205,52 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
                 return try surfaceOrPublic(probe, subsample: Self.coveringSubsample(long: long, target: target), pool: pool)
             }
         }
+    }
+
+    /// The largest MPF large thumbnail whose aspect ratio matches the image (±1 %), decoded like a baseline
+    /// JPEG: IOSurface SPI (hardware), power-of-two subsample ≤ 4 covering `target`. The preview is stored
+    /// like the primary image, so the primary's EXIF orientation and colour space apply.
+    private func mpfPreview(_ probe: DecodeProbe, scan: JPEGScan, url: URL, data: Data?, target: Int,
+                            pool: PixelBufferPool) -> Output? {
+        let info = probe.info
+        let want = aspect(info.pixelWidth, info.pixelHeight)
+        guard let pick = scan.mpfPreviews
+            .filter({ abs(aspect($0.width, $0.height) - want) <= Self.previewAspectTolerance * want })
+            .max(by: { $0.width * $0.height < $1.width * $1.height }),
+            let bytes = Self.read(url: url, data: data, offset: pick.offset, length: pick.length),
+            let source = CGImageSourceCreateWithData(bytes as CFData, DecodeProbe.sourceOptions) else { return nil }
+        let factor = Self.coveringSubsample(long: max(pick.width, pick.height), target: target,
+                                            maxFactor: pick.coding == .baseline ? 4 : 8)
+        let path = "mpf \(pick.width)x\(pick.height)"
+        if let surface = IOSurfaceSPI.surface(source, index: 0, subsample: factor), let layout = IOSurfaceSPI.layout(of: surface) {
+            let (space, alpha) = traits(probe)
+            let pixels = PixelBuffer(width: IOSurfaceGetWidth(surface), height: IOSurfaceGetHeight(surface),
+                                     bytesPerRow: IOSurfaceGetBytesPerRow(surface), layout: layout, alpha: alpha,
+                                     colorSpace: space, storage: .surface(surface))
+            return Output(pixels: pixels, orientation: info.orientation, path: "\(path) iosurface /\(factor)")
+        }
+        var options: [CFString: Any] = [kCGImageSourceShouldCache: false]
+        if factor > 1 { options[kCGImageSourceSubsampleFactor] = factor }
+        guard let image = CGImageSourceCreateImageAtIndex(source, 0, options as CFDictionary),
+              let pixels = try? NativeImage.pixels(image, pool: pool, opaque: true) else { return nil }
+        return Output(pixels: pixels, orientation: info.orientation, path: "\(path) cgimage /\(factor)")
+    }
+
+    /// `length` bytes at `offset` of `data`, or of the file at `url` (bounds-checked against its size).
+    static func read(url: URL, data: Data?, offset: Int, length: Int) -> Data? {
+        guard offset >= 0, length > 0, length <= 64 << 20 else { return nil }
+        if let data {
+            guard offset + length <= data.count else { return nil }
+            return data.subdata(in: data.startIndex + offset..<data.startIndex + offset + length)
+        }
+        let fd = open(url.path, O_RDONLY)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        var st = stat()
+        guard fstat(fd, &st) == 0, offset + length <= Int(st.st_size) else { return nil }
+        var bytes = Data(count: length)
+        let n = bytes.withUnsafeMutableBytes { pread(fd, $0.baseAddress, length, off_t(offset)) }
+        return n == length ? bytes : nil
     }
 
     private func turbo(url: URL, data: Data?, target: Int, pool: PixelBufferPool) throws -> PixelBuffer {
