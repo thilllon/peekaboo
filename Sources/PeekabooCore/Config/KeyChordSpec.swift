@@ -23,10 +23,10 @@ extension KeyChord {
 
     /// Like `sequence(spec:)`, with a message such as `unknown key "foo"`.
     public static func parseSequence(_ spec: String) throws -> [KeyChord] {
-        let parts = spec.split(whereSeparator: { $0 == " " || $0 == "\t" })
-        guard !parts.isEmpty else { throw KeySpecError("empty key") }
         // A lone space means the space bar.
         if spec == " " { return [KeyChord(key: "space")] }
+        let parts = spec.split(whereSeparator: { $0 == " " || $0 == "\t" })
+        guard !parts.isEmpty else { throw KeySpecError("empty key") }
         return try parts.map { try parse(String($0)) }
     }
 
@@ -63,7 +63,7 @@ extension KeyChord {
         }
         if token.contains("+") {
             let mod = token.split(separator: "+").first.map(String.init) ?? token
-            throw KeySpecError("unknown modifier \"\(mod)\" in \"\(raw)\" (use cmd, opt, ctrl, shift)")
+            throw KeySpecError("unknown modifier \"\(mod)\" (use cmd, opt, ctrl or shift)")
         }
         throw KeySpecError("unknown key \"\(token)\"")
     }

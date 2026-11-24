@@ -125,7 +125,7 @@ private struct ConfigReader {
             do {
                 sequence = try KeyChord.parseSequence(spec)
             } catch {
-                fail(entry, "\(error) in \"\(spec)\""); continue
+                fail(entry, "\"\(spec)\": \(error)"); continue
             }
             if let earlier = lineOf[context]?[sequence] {
                 fail(entry, "\"\(KeyChord.spec(of: sequence))\" is already bound on line \(earlier)"); continue

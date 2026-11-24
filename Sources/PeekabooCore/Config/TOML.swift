@@ -184,8 +184,14 @@ private struct TOMLParser {
         let keyLine = line
         let column = error("", at: start).column
         let key = try parseKey()
+        let keyEnd = i
         skipSpaces()
-        guard peek == UInt8(ascii: "=") else { throw error("expected '=' after the key") }
+        guard peek == UInt8(ascii: "=") else {
+            if i == keyEnd, let c = peek, c != 0x0A, c != 0x0D {
+                throw error("invalid character '\(Character(Unicode.Scalar(c)))' in key (quote keys such as \"cmd+k\" = …)")
+            }
+            throw error("expected '=' after the key")
+        }
         i += 1
         skipSpaces()
         let path = currentTable + key
