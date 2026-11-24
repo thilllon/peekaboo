@@ -205,6 +205,7 @@ final class HUD {
 
     /// Show `text` for 1.2 s at the same spot (replaces the previous toast).
     func showToast(_ text: String) {
+        Trace.log("toast: \(text)")
         toastGeneration += 1
         let generation = toastGeneration
         transaction {
