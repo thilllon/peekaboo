@@ -137,6 +137,9 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     var tracksFrames = false { didSet { configureFrameTracking() } }
 
     private var memoryPressure: DispatchSourceMemoryPressure?
+    /// The window is closed and the app stays resident: the pipeline keeps a small cache and decodes nothing ahead
+    /// until the next open (`pipelineConfig(_:base:closed:)`).
+    private var isClosed = false
     private var observers: [NSObjectProtocol] = []
     private var lastTitle = ""
     private var pendingTitle: String?
@@ -214,8 +217,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             hud.mode = config.hud
             lastAppliedHUDMode = config.hud
         }
-        let pipelineConfig = Self.pipelineConfig(config, base: pipeline.config)
-        if pipelineConfig != pipeline.config { pipeline.updateConfig(pipelineConfig) }
+        applyPipelineConfig(config)
         if hud.isHelpVisible { hud.setHelp(KeyLabels.helpSections(config.keymap)) }
         if instantFullscreen != nil, let screen = window?.screen { rootView.topInset = notchInset(screen) }
         updateHUD()
@@ -224,11 +226,29 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// Show a toast (e.g. a config error).
     func toast(_ text: String) { hud.showToast(text) }
 
+    /// The pipeline configuration for `config` and the window state.
+    private func applyPipelineConfig(_ config: AppConfig) {
+        let pipelineConfig = Self.pipelineConfig(config, base: pipeline.config, closed: isClosed)
+        if pipelineConfig != pipeline.config { pipeline.updateConfig(pipelineConfig) }
+    }
+
+    /// The window is showing again: back to the full cache budgets and prefetch.
+    private func wakeFromClosed() {
+        guard isClosed else { return }
+        isClosed = false
+        applyPipelineConfig(config)
+    }
+
     // MARK: Opening
 
     /// Show `urls`: one file browses its folder, a folder browses its images, several files browse that set.
     func open(_ urls: [URL]) {
         guard let first = urls.first else { return }
+        wakeFromClosed()
+        if urls.count == 1, let index = indexInBrowsingSet(first) {
+            openWithinBrowsingSet(index)
+            return
+        }
         let opened = Trace.now()
         openGeneration += 1
         let generation = openGeneration
@@ -249,7 +269,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         if singleFile {
             browseSource = .folder(first.deletingLastPathComponent())
             beginNavigation()
-            pipeline.setFiles([ImageFile(url: first, name: first.lastPathComponent, byteSize: 0, modified: 0, fileID: 0)], index: 0)
+            replaceFiles([ImageFile(url: first, name: first.lastPathComponent, byteSize: 0, modified: 0, fileID: 0)], index: 0)
             presentCurrent()
             if synchronous { presentFirstFrameNow() }
         } else {
@@ -286,7 +306,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             return
         }
         let previous = pipeline.currentFile
-        pipeline.setFiles(listing.files, index: listing.index)
+        replaceFiles(listing.files, index: listing.index)
         if let file = pipeline.currentFile, let version = Self.knownVersion(file) {
             // The opened file was shown (or failed) before its version was known; the pipeline keeps its tiers as
             // that version, and so does the view.
@@ -300,6 +320,45 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         updateHUD()
         watchFolder()
         Trace.log("folder listed: \(listing.files.count) files, \(String(format: "%.1f", Trace.ms(since: opened))) ms after open")
+    }
+
+    /// Index of `url` in the browsing set when it is a listed file of the folder being browsed.
+    private func indexInBrowsingSet(_ url: URL) -> Int? {
+        guard !listingPending, !url.hasDirectoryPath, let folder = currentFolder,
+              url.deletingLastPathComponent().standardizedFileURL.path == folder.standardizedFileURL.path else { return nil }
+        let name = url.lastPathComponent
+        return pipeline.files.firstIndex { $0.name == name }
+    }
+
+    /// Finder (or a drop) opened another file of the folder being browsed: navigate to it and keep the listing and
+    /// the cache, instead of starting over (which would free the cache on the main thread and decode it all again).
+    private func openWithinBrowsingSet(_ index: Int) {
+        showWindow(nil)
+        window?.makeKeyAndOrderFront(nil)
+        if index != pipeline.index {
+            navigate(to: index, isRepeat: false)
+        } else {
+            presentCurrent()
+            renderFrame()
+            updateHUD()
+        }
+        // Pick up what the folder watcher cannot see (in-place edits while the window was closed).
+        rescanFolder()
+        Trace.log("opened \(pipeline.currentFile?.name ?? "?") within the browsed folder")
+    }
+
+    /// Replace the whole browsing set. The pixels it drops are freed off the main thread, after the new set is shown.
+    private func replaceFiles(_ files: [ImageFile], index: Int) {
+        let dropped = DeferredRelease(cachedImages())
+        pipeline.setFiles(files, index: index)
+        dropped.release(after: 0.25)
+    }
+
+    /// The best tier of every cached file: what replacing the set or trimming the cache may free (worth collecting
+    /// only for a large cache; a lower tier of the same file is small or rare).
+    private func cachedImages() -> [DecodedImage] {
+        guard pipeline.stats.cachedBytes >= 64 << 20 else { return [] }
+        return pipeline.files.compactMap { pipeline.best(for: $0) }
     }
 
     /// Launch fast path: wait (bounded) for the first tier of the current file and present it in this run-loop turn.
@@ -316,7 +375,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
 
     /// Nothing to show: an empty folder, or no file opened yet.
     func showEmpty(_ folder: URL?) {
-        pipeline.setFiles([], index: 0)
+        replaceFiles([], index: 0)
         shownFile = nil
         shownTier = nil
         shownVersion = nil
@@ -334,6 +393,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
 
     /// Re-show the window (Dock click) with the last image.
     func reopen() {
+        wakeFromClosed()
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
         if pipeline.currentFile == nil, shownFile == nil { showEmpty(nil) } else { renderFrame() }
@@ -1084,8 +1144,12 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         motion.releaseAllKeys()
         motion.stopMomentum()
         hud.setHelp(nil)
-        // Stay resident but give back the big caches; the current image stays for a Dock reopen.
-        pipeline.handleMemoryPressure(critical: false)
+        // Stay resident but give back the big caches; the current image stays for a Dock reopen. Not through
+        // `handleMemoryPressure`, which would halve the budgets and pause the preview sweep of the next session.
+        isClosed = true
+        let trimmed = DeferredRelease(cachedImages())
+        applyPipelineConfig(config)
+        trimmed.release(drainingPool: pipeline.pool)
     }
 
     func windowDidResignKey(_ notification: Notification) {
@@ -1271,20 +1335,34 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
 
     /// `base` with the cache budgets of `config`: `cache_budget_mb` sets the total and scales the per-tier budgets
     /// with it (so a larger budget is not capped by the automatic tier sizes); no value restores the automatic sizes.
-    static func pipelineConfig(_ config: AppConfig, base: PipelineConfig) -> PipelineConfig {
+    ///
+    /// `closed` (the window is closed, the app stays resident): keep the current image, the previews and a quarter
+    /// of the screen tiers (the nearest by ETA), no other full resolution, and decode nothing ahead until the window
+    /// opens again. Unlike memory pressure this leaves no 60 s penalty (halved budgets, paused sweep) for the next open.
+    static func pipelineConfig(_ config: AppConfig, base: PipelineConfig, closed: Bool = false) -> PipelineConfig {
         let automatic = PipelineConfig(screenLongSide: base.screenLongSide, previewLongSide: base.previewLongSide)
         var result = base
+        result.tuning = automatic.tuning
         result.memoryBudget = automatic.memoryBudget
         result.screenBudget = automatic.screenBudget
         result.previewBudget = automatic.previewBudget
         result.fullBudget = automatic.fullBudget
-        guard let mb = config.cacheBudgetMB, mb > 0 else { return result }
-        let total = mb << 20
-        let factor = Double(total) / Double(max(automatic.memoryBudget, 1))
-        result.memoryBudget = total
-        result.screenBudget = Int(Double(automatic.screenBudget) * factor)
-        result.previewBudget = Int(Double(automatic.previewBudget) * factor)
-        result.fullBudget = Int(Double(automatic.fullBudget) * factor)
+        if let mb = config.cacheBudgetMB, mb > 0 {
+            let total = mb << 20
+            let factor = Double(total) / Double(max(automatic.memoryBudget, 1))
+            result.memoryBudget = total
+            result.screenBudget = Int(Double(automatic.screenBudget) * factor)
+            result.previewBudget = Int(Double(automatic.previewBudget) * factor)
+            result.fullBudget = Int(Double(automatic.fullBudget) * factor)
+        }
+        if closed {
+            result.screenBudget /= 4
+            result.fullBudget = 0  // the current image (pinned) keeps its own
+            result.tuning.screenHorizonMs = 0
+            result.tuning.previewHorizonMs = 0
+            result.tuning.fullMaxCostMs = 0
+            result.tuning.sweepEnabled = false
+        }
         return result
     }
 
@@ -1295,5 +1373,22 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             return Int(max(size.width, size.height) * screen.backingScaleFactor)
         }
         return max(sides.max() ?? 3456, 1024)
+    }
+}
+
+/// Keeps decoded images alive past a cache replacement or trim and frees them on a utility queue: releasing a warm
+/// cache (gigabytes of IOSurfaces and buffers) costs 13–23 ms, which must not stall the main thread on an open.
+private final class DeferredRelease: @unchecked Sendable {
+    private var images: [DecodedImage]
+
+    init(_ images: [DecodedImage]) { self.images = images }
+
+    /// Free the images `delay` seconds from now (after the next frames), then drain `pool` (its buffers too).
+    func release(after delay: TimeInterval = 0, drainingPool pool: PixelBufferPool? = nil) {
+        guard !images.isEmpty || pool != nil else { return }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) {
+            self.images.removeAll()
+            pool?.drain()
+        }
     }
 }
