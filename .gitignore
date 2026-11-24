@@ -10,3 +10,21 @@ target/
 *.app
 *.zip
 *.dSYM
+
+# Secrets & credentials — never commit (gitleaks also blocks these)
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+*.mobileprovision
+*.provisionprofile
+client_secret*.json
+credentials*.json
+service-account*.json
+.netrc
+id_rsa*
+id_ed25519*
