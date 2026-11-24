@@ -327,8 +327,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
 
     /// Index of `url` in the browsing set when it is a listed file of the folder being browsed.
     private func indexInBrowsingSet(_ url: URL) -> Int? {
-        guard !listingPending, !url.hasDirectoryPath, let folder = currentFolder,
-              url.deletingLastPathComponent().standardizedFileURL.path == folder.standardizedFileURL.path else { return nil }
+        guard !listingPending, isInBrowsedFolder(url) else { return nil }
         let name = url.lastPathComponent
         return pipeline.files.firstIndex { $0.name == name }
     }
@@ -942,11 +941,17 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
                 showEmpty(currentFolder)
                 return
             }
-            beginNavigation()
-            pipeline.setFiles(files, index: min(i, files.count - 1))
+            // The file on screen went: show the one that took its place. Another one (a redo, a background move
+            // that finished late): stay on the image being viewed.
+            let current = pipeline.index
+            if current == i { beginNavigation() }
+            pipeline.setFiles(files, index: current == i ? min(i, files.count - 1) : current > i ? current - 1 : current)
             presentCurrent()
             updateHUD()
         case .restored(let file):
+            // Back where it was, but only into the set it belongs to: an undo after opening another folder (or a
+            // background move failing after the user moved on) must not inject a file of another folder.
+            guard isInBrowsingSet(file) else { return }
             var files = pipeline.files
             listingEpoch &+= 1
             if !files.contains(file) {
@@ -969,6 +974,18 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private var currentFolder: URL? {
         if case .folder(let url) = browseSource { return url }
         return nil
+    }
+
+    /// `url` is a file of the folder being browsed.
+    private func isInBrowsedFolder(_ url: URL) -> Bool {
+        guard let folder = currentFolder, !url.hasDirectoryPath else { return false }
+        return url.deletingLastPathComponent().standardizedFileURL.path == folder.standardizedFileURL.path
+    }
+
+    /// `file` belongs to what is browsed: a file of its folder, or any file of an explicitly opened set.
+    private func isInBrowsingSet(_ file: ImageFile) -> Bool {
+        if case .files = browseSource { return true }
+        return isInBrowsedFolder(file.url)
     }
 
     // MARK: Zoom & pan
