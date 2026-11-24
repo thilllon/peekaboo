@@ -26,8 +26,9 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
 
     /// Decode gain-map images (`hasGainMap`) to HDR (`kCGImageSourceDecodeToHDR`, extended-linear
     /// Display P3 `.rgba16f`, `isHDR = true`) for `.screen`/`.full`. Off by default: the HDR rendition
-    /// costs 10–15× the SDR decode (1.4 vs 21 ms on a 384×512 Apple gain-map JPEG: gain-map application plus a converting draw; see
-    /// `peekaboo-bench decode`), above the 2× budget. Enable with `PEEKABOO_HDR=1` or by setting it.
+    /// costs 10–15× the SDR decode (1.4–2.1 vs 21–27 ms on a 384×512 Apple gain-map JPEG: gain-map
+    /// application plus a converting draw; see `peekaboo-bench decode`), above the 2× budget.
+    /// Enable with `PEEKABOO_HDR=1` or by setting it.
     nonisolated(unsafe) public static var decodeHDR = ProcessInfo.processInfo.environment["PEEKABOO_HDR"] != nil
 
     /// Baseline JPEGs up to this many pixels go to the hardware JPEG engines. Measured on M4 Pro /
@@ -56,8 +57,9 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
             switch Self.jpegRoute(format: format, pixels: info.pixelWidth * info.pixelHeight) {
             case .hardware: return .hardware
             case .turbo:
-                // Progressive previews use ImageIO's DC-only /8 path; everything else is libjpeg-turbo.
-                return tier == .preview && format.hasPrefix("JPEG progressive") ? .general : .cpu
+                // Previews go through ImageIO (progressive: DC-only /8; beyond the hardware limit: /4);
+                // larger tiers are libjpeg-turbo.
+                return tier == .preview ? .general : .cpu
             case .imageIO: return .general
             }
         }
