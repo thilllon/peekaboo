@@ -11,7 +11,9 @@ import Foundation
 /// and failure messages name files, not their full paths.
 ///
 /// Not thread-safe: use it from one thread (the main thread in the app). Every operation is a
-/// rename, a copy or one `setxattr`, so it returns quickly on the same volume.
+/// rename, a copy or one `setxattr`, so it returns quickly on the same volume; what copies across
+/// volumes runs elsewhere through `transfer` + `record`, and `takeSlowUndo`/`takeSlowRedo` + `perform` +
+/// `finish`.
 public final class FileOperations {
     /// One undoable change.
     public enum Change: Equatable, Sendable {
@@ -37,7 +39,13 @@ public final class FileOperations {
 
     public struct Failure: Error, Equatable, CustomStringConvertible {
         public let message: String
-        public init(_ message: String) { self.message = message }
+        /// Trying again cannot succeed (the file is gone, or was replaced or edited): undo and redo drop the change.
+        let permanent: Bool
+        public init(_ message: String) { self.init(message, permanent: false) }
+        init(_ message: String, permanent: Bool) {
+            self.message = message
+            self.permanent = permanent
+        }
         public var description: String { message }
     }
 
@@ -47,17 +55,26 @@ public final class FileOperations {
     public var redoStack: [Change] { redoEntries.map(\.change) }
     /// Undoing a copy moves the copy to the Trash, as Finder does; false deletes it (tests).
     public var trashesUndoneCopies = true
+    /// How undo puts a copy in the Trash (tests stand in a volume without one).
+    var trashCopy: (URL) throws -> Void = { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) }
+    /// Tests: runs right after a move across volumes copied `source`, before the original is checked and
+    /// removed (stands in for another app saving the file meanwhile).
+    nonisolated(unsafe) static var afterCopyingForMove: ((_ source: URL) -> Void)?
+    /// Tests: every move, undo and redo included, copies and then deletes, as across volumes.
+    nonisolated(unsafe) static var movesByCopying = false
     private let fm = FileManager.default
 
     /// A change plus the identity of the item that its undo (or redo) acts on, so that neither touches a
     /// file that was replaced or edited since.
-    private struct Entry {
+    fileprivate struct Entry: Sendable {
         let change: Change
         let stamp: Stamp?
     }
 
     private var undoEntries: [Entry] = []
     private var redoEntries: [Entry] = []
+    /// How many changes `record(_:)` has pushed (`finish(_:with:)` tells which came while it ran).
+    private var recordedCount = 0
 
     public init() {}
 
@@ -99,11 +116,12 @@ public final class FileOperations {
 
     /// Undo the most recent change. Returns the change as it now sits on the redo stack, with the
     /// restored location (a "name 2.ext" if the old name was taken meanwhile); nil when there is nothing
-    /// to undo. Throws, keeping the change, when the item is gone (e.g. the Trash was emptied) or was
-    /// replaced or edited since the action.
+    /// to undo. Throws when it cannot: a change whose item is gone (e.g. the Trash was emptied) or was
+    /// replaced or edited since the action is dropped, so that the next undo reaches the older changes;
+    /// any other failure (a read-only folder, a full disk) keeps it for another try.
     public func undo() throws -> Change? {
         guard let entry = undoEntries.popLast() else { return nil }
-        do {
+        let result = Result<Entry, Error> {
             let redo: Change
             switch entry.change {
             case .trashed(let original, let trashed):
@@ -112,50 +130,40 @@ public final class FileOperations {
                 let restored = try Self.restore(trashed, to: original)
                 redo = .trashed(original: restored, trashed: trashed)
             case .moved(let from, let to):
-                try Self.check(entry.stamp, at: to, missing: "is no longer in \(to.deletingLastPathComponent().lastPathComponent)",
-                               since: "moved")
-                let back = try Self.restore(to, to: from)
-                redo = .moved(from: back, to: to)
+                redo = try Self.undoMove(from: from, to: to, stamp: entry.stamp)
             case .copied(let from, let to):
                 try removeCopy(to, stamp: entry.stamp)
                 redo = .copied(from: from, to: to)
             case .tagged(let url, let before, let after):
+                try Self.requireItem(url)
                 try Self.write(before, to: url)
                 redo = .tagged(url, before: before, after: after)
             }
-            redoEntries.append(Entry(change: redo, stamp: Self.stamp(redoing: redo)))
-            return redo
-        } catch {
-            undoEntries.append(entry)
-            throw error
+            return Entry(change: redo, stamp: Self.stamp(redoing: redo))
         }
+        return try settle(entry, undo: true, result)
     }
 
-    /// Redo the most recently undone change; returns the change as redone. Throws, keeping the change,
-    /// when the file was replaced or edited since it was put back.
+    /// Redo the most recently undone change; returns the change as redone. Throws when it cannot, dropping
+    /// the change when its file is gone or was replaced or edited since it was put back (as `undo()` does).
     public func redo() throws -> Change? {
         guard let entry = redoEntries.popLast() else { return nil }
-        do {
+        let result = Result<Entry, Error> {
             let redone: Change
             switch entry.change {
             case .trashed(let original, _):
                 try Self.check(entry.stamp, at: original, missing: "is no longer there", since: "put back")
                 redone = try performTrash(original)
-            case .moved(let from, let to):
-                try Self.check(entry.stamp, at: from, missing: "is no longer there", since: "moved back")
-                redone = try Self.transfer(from, toFolder: to.deletingLastPathComponent(), copy: false)
-            case .copied(let from, let to):
-                redone = try Self.transfer(from, toFolder: to.deletingLastPathComponent(), copy: true)
+            case .moved, .copied:
+                redone = try Self.redoTransfer(entry.change, stamp: entry.stamp)
             case .tagged(let url, let before, let after):
+                try Self.requireItem(url)
                 try Self.write(after, to: url)
                 redone = .tagged(url, before: before, after: after)
             }
-            undoEntries.append(Entry(change: redone, stamp: Self.stamp(undoing: redone)))
-            return redone
-        } catch {
-            redoEntries.append(entry)
-            throw error
+            return Entry(change: redone, stamp: Self.stamp(undoing: redone))
         }
+        return try settle(entry, undo: false, result)
     }
 
     /// Push a change made elsewhere (e.g. a cross-volume move finished on a background queue) onto the
@@ -163,10 +171,118 @@ public final class FileOperations {
     public func record(_ change: Change) {
         undoEntries.append(Entry(change: change, stamp: Self.stamp(undoing: change)))
         redoEntries.removeAll()
+        recordedCount += 1
+    }
+
+    /// The file work of undoing a move (thread-safe: no stacks).
+    private static func undoMove(from: URL, to: URL, stamp: Stamp?) throws -> Change {
+        try check(stamp, at: to, missing: "is no longer in \(to.deletingLastPathComponent().lastPathComponent)", since: "moved")
+        let back = try restore(to, to: from)
+        return .moved(from: back, to: to)
+    }
+
+    /// The file work of redoing a move or a copy (thread-safe: no stacks).
+    private static func redoTransfer(_ change: Change, stamp: Stamp?) throws -> Change {
+        switch change {
+        case .moved(let from, let to):
+            try check(stamp, at: from, missing: "is no longer there", since: "moved back")
+            return try transfer(from, toFolder: to.deletingLastPathComponent(), copy: false)
+        case .copied(let from, let to):
+            return try transfer(from, toFolder: to.deletingLastPathComponent(), copy: true)
+        case .trashed, .tagged:
+            throw Failure("Cannot redo this change here")
+        }
+    }
+
+    /// Put the result of undoing (or redoing) `entry` where it belongs: the resulting entry on the other
+    /// stack, or `entry` back on its own after a failure that may pass. A change that can never be undone
+    /// (its file is gone, or was replaced or edited) is dropped instead, so that the next undo reaches the
+    /// older changes rather than failing on it for the rest of the session. `recordedSince` changes were
+    /// recorded while the work ran (`finish(_:with:)`): they stay above it, and an undone change can no
+    /// longer be redone.
+    private func settle(_ entry: Entry, undo: Bool, _ result: Result<Entry, Error>, recordedSince: Int = 0) throws -> Change {
+        switch result {
+        case .success(let done):
+            if !undo {
+                undoEntries.insert(done, at: max(0, undoEntries.count - recordedSince))
+            } else if recordedSince == 0 {
+                redoEntries.append(done)
+            }
+            return done.change
+        case .failure(let error):
+            if let failure = error as? Failure, failure.permanent { throw failure }
+            if undo {
+                undoEntries.insert(entry, at: max(0, undoEntries.count - recordedSince))
+            } else if recordedSince == 0 {
+                redoEntries.append(entry)
+            }
+            throw error
+        }
+    }
+
+    // MARK: Undo and redo off the main thread
+
+    /// An undo or redo that copies a file across volumes (seconds for a large file on a card or a network
+    /// share), taken off its stack so that it can run off the main thread: `perform(_:)` it on any thread,
+    /// then hand the result to `finish(_:with:)` on the owning one.
+    public struct SlowChange: Sendable {
+        fileprivate let entry: Entry
+        public let isUndo: Bool
+        fileprivate let recordedBefore: Int
+        /// The change as it stood on its stack.
+        public var change: Change { entry.change }
+    }
+
+    /// Take the next undo off the stack if it copies the file back across volumes; nil when the next
+    /// undo is quick (use `undo()`) or there is none.
+    public func takeSlowUndo() -> SlowChange? {
+        guard let entry = undoEntries.last, case .moved(let from, let to) = entry.change,
+              Self.movesByCopying || Self.crossesVolumes(to, from.deletingLastPathComponent()) else { return nil }
+        undoEntries.removeLast()
+        return SlowChange(entry: entry, isUndo: true, recordedBefore: recordedCount)
+    }
+
+    /// Take the next redo off the stack if it copies (a move across volumes, or a copy); nil otherwise.
+    public func takeSlowRedo() -> SlowChange? {
+        guard let entry = redoEntries.last else { return nil }
+        switch entry.change {
+        case .moved(let from, let to):
+            guard Self.movesByCopying || Self.crossesVolumes(from, to.deletingLastPathComponent()) else { return nil }
+        case .copied: break
+        case .trashed, .tagged: return nil
+        }
+        redoEntries.removeLast()
+        return SlowChange(entry: entry, isUndo: false, recordedBefore: recordedCount)
+    }
+
+    /// What `perform(_:)` did, for `finish(_:with:)`.
+    public struct SlowResult: Sendable {
+        /// The entry for the other stack, with the identity of the item that its next undo or redo acts on,
+        /// read off the main thread too (a lookup on a card or a share can take milliseconds).
+        fileprivate let result: Result<Entry, Error>
+    }
+
+    /// The file work of a taken undo or redo. Thread-safe: it touches no stack.
+    public static func perform(_ slow: SlowChange) -> SlowResult {
+        SlowResult(result: Result {
+            if slow.isUndo, case .moved(let from, let to) = slow.entry.change {
+                let redo = try undoMove(from: from, to: to, stamp: slow.entry.stamp)
+                return Entry(change: redo, stamp: stamp(redoing: redo))
+            }
+            let redone = try redoTransfer(slow.entry.change, stamp: slow.entry.stamp)
+            return Entry(change: redone, stamp: stamp(undoing: redone))
+        })
+    }
+
+    /// Settle a taken undo or redo as `undo()` and `redo()` do, on the owning thread. Changes recorded while
+    /// it ran stay above it on the undo stack.
+    @discardableResult
+    public func finish(_ slow: SlowChange, with done: SlowResult) throws -> Change {
+        try settle(slow.entry, undo: slow.isUndo, done.result, recordedSince: recordedCount - slow.recordedBefore)
     }
 
     private func performTrash(_ url: URL) throws -> Change {
-        guard Self.itemExists(url) else { throw Failure("\(url.lastPathComponent) is no longer there") }
+        try Self.requireItem(url)
         var resulting: NSURL?
         do {
             // Moves the directory entry itself: a symbolic link goes to the Trash, its target stays.
@@ -182,6 +298,11 @@ public final class FileOperations {
     /// Never replaces an existing item (a taken name becomes "name 2.ext"), never follows a symbolic link
     /// (a link is moved or copied as a link), and a move to another volume removes the original only
     /// once the copy is complete, putting things back as they were when it cannot.
+    ///
+    /// A move to another volume removes the original only if it is still the file that was copied. When
+    /// another app replaced it meanwhile (saved a new version over it) or it was renamed or removed, the
+    /// result is `.copied`: the copy holds the version that was copied and the original is left as it is.
+    /// When it was edited in place, the copy may be torn: it is removed again, and the move fails.
     public static func transfer(_ url: URL, toFolder folder: URL, copy: Bool) throws -> Change {
         try transfer(url, toFolder: folder, mode: copy ? .copy : .move)
     }
@@ -197,7 +318,7 @@ public final class FileOperations {
         let verb = copy ? "copy" : "move"
         let name = url.lastPathComponent
         let folder = folder.standardizedFileURL
-        guard itemExists(url) else { throw Failure("\(name) is no longer there") }
+        try requireItem(url)
         if !copy, isSameDirectory(folder, url.deletingLastPathComponent()) {
             throw Failure("\(name) is already in \(folder.lastPathComponent)")
         }
@@ -207,23 +328,33 @@ public final class FileOperations {
             throw Failure("Cannot \(verb) \(name): cannot create the folder \(folder.lastPathComponent) (\(reason(error)))")
         }
         do {
-            let target = try place(url, as: name, in: folder, mode: mode)
-            return copy ? .copied(from: url, to: target) : .moved(from: url, to: target)
+            switch try place(url, as: name, in: folder, mode: mode) {
+            case .moved(let target): return .moved(from: url, to: target)
+            case .copied(let target): return .copied(from: url, to: target)
+            }
         } catch let failure as PlaceFailure {
-            throw Failure("Cannot \(verb) \(name): \(failure.reason)")
+            throw Failure("Cannot \(verb) \(name): \(failure.reason)", permanent: failure.changed)
         }
     }
 
     /// Put `url` back at `original` (or "name 2.ext" next to it if that name was taken meanwhile).
     private static func restore(_ url: URL, to original: URL) throws -> URL {
         let folder = original.deletingLastPathComponent()
+        let name = original.lastPathComponent
+        let placed: Placed
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            return try place(url, as: original.lastPathComponent, in: folder, mode: .move)
+            placed = try place(url, as: name, in: folder, mode: .move)
         } catch let failure as PlaceFailure {
-            throw Failure("Cannot restore \(original.lastPathComponent): \(failure.reason)")
+            throw Failure("Cannot restore \(name): \(failure.reason)", permanent: failure.changed)
         } catch {
-            throw Failure("Cannot restore \(original.lastPathComponent): \(reason(error))")
+            throw Failure("Cannot restore \(name): \(reason(error))")
+        }
+        switch placed {
+        case .moved(let back): return back
+        case .copied:
+            // Changed by another app while it was copied back across volumes: both versions are kept.
+            throw Failure("\(name) changed while it was being moved back: both versions kept", permanent: true)
         }
     }
 
@@ -231,11 +362,24 @@ public final class FileOperations {
         guard Self.itemExists(url) else { return }
         // Never trash or delete a file that replaced the copy, or the copy after it was edited.
         try Self.check(stamp, at: url, missing: "is no longer there", since: "copied")
+        // The copy of a locked file is locked too: unlock it to remove it, and lock it again if that fails.
+        let flags = Self.flags(url) ?? 0
+        let locked = flags & Self.lockFlags != 0
+        if locked { lchflags(url.path, flags & ~Self.lockFlags) }
         do {
-            guard trashesUndoneCopies else { throw Failure("delete") }
-            try fm.trashItem(at: url, resultingItemURL: nil)
+            if trashesUndoneCopies {
+                do {
+                    try trashCopy(url)
+                } catch {
+                    // Never delete it instead (a network share has no Trash): the copy may be the only one left.
+                    throw Failure("Cannot move the copy to the Trash: \(Self.reason(error))")
+                }
+            } else {
+                do { try fm.removeItem(at: url) } catch { throw Failure("Cannot remove the copy: \(Self.reason(error))") }
+            }
         } catch {
-            do { try fm.removeItem(at: url) } catch { throw Failure("Cannot remove the copy: \(Self.reason(error))") }
+            if locked { lchflags(url.path, flags) }
+            throw error
         }
     }
 
@@ -252,19 +396,33 @@ public final class FileOperations {
 
     private struct PlaceFailure: Error {
         let reason: String
+        /// The item changed while it was being moved: trying again cannot move the version that was meant.
+        var changed = false
         init(_ code: Int32, hint: String = "") { reason = String(cString: strerror(code)) + hint }
+        init(changed reason: String) {
+            self.reason = reason
+            changed = true
+        }
+    }
+
+    /// Where `place` put the item.
+    private enum Placed {
+        case moved(URL)
+        /// Copied (a copy, or a move across volumes whose original changed meanwhile and was left as it is).
+        case copied(URL)
     }
 
     /// Move or copy `source` to `folder/name`, or to the first free "stem N.ext". Exclusive: an existing item
     /// (a dangling symbolic link included) is never replaced, not even one that appears while this runs.
-    private static func place(_ source: URL, as name: String, in folder: URL, mode: Mode) throws -> URL {
+    private static func place(_ source: URL, as name: String, in folder: URL, mode requested: Mode) throws -> Placed {
+        let mode = requested == .move && movesByCopying ? .moveByCopying : requested
         if mode == .move {
             var n = 1
             while true {
                 let target = numberedURL(name, n, in: folder)
                 n += 1
                 if itemExists(target) { continue }
-                if renamex_np(source.path, target.path, UInt32(RENAME_EXCL)) == 0 { return target }
+                if renamex_np(source.path, target.path, UInt32(RENAME_EXCL)) == 0 { return .moved(target) }
                 let code = errno
                 switch code {
                 case EEXIST: continue
@@ -272,11 +430,17 @@ public final class FileOperations {
                 case ENOTSUP, EINVAL:
                     // A file system without exclusive renames (some network volumes): check, then rename.
                     if itemExists(target) { continue }
-                    if rename(source.path, target.path) == 0 { return target }
-                    throw PlaceFailure(errno)
-                default: throw PlaceFailure(code)
+                    if rename(source.path, target.path) == 0 { return .moved(target) }
+                    throw renameFailure(errno, source)
+                default: throw renameFailure(code, source)
                 }
             }
+        }
+        // What a move must find again after the copy before it may remove the original.
+        let original = mode == .moveByCopying ? Snapshot(source) : nil
+        // A locked file cannot be removed, so it cannot be moved (as it cannot be renamed): say so before copying.
+        if let original, original.flags & (lockFlags | systemLockFlags) != 0 {
+            throw PlaceFailure(EPERM, hint: " (it is locked)")
         }
         // Copy to a private name in the destination folder, then rename that exclusively into place: a failed
         // copy leaves nothing behind, and no existing file is ever written to.
@@ -285,9 +449,15 @@ public final class FileOperations {
         // (It is not exclusive by itself, hence the private name.)
         if copyfile(source.path, temporary.path, nil, copyfile_flags_t(COPYFILE_CLONE)) != 0 {
             let code = errno
-            unlink(temporary.path)
+            discard(temporary)
             throw PlaceFailure(code)
         }
+        if mode == .moveByCopying { afterCopyingForMove?(source) }
+        // The copy of a locked file is locked too, and could be neither renamed into place nor removed:
+        // unlock it until it is in place, then lock it like the original.
+        let copiedFlags = flags(temporary) ?? 0
+        let locked = copiedFlags & lockFlags != 0
+        if locked { lchflags(temporary.path, copiedFlags & ~lockFlags) }
         var n = 1
         var target: URL
         while true {
@@ -298,18 +468,54 @@ public final class FileOperations {
             let code = errno
             if code == EEXIST { continue }
             if code == ENOTSUP || code == EINVAL, !itemExists(target), rename(temporary.path, target.path) == 0 { break }
-            unlink(temporary.path)
+            discard(temporary)
             throw PlaceFailure(code)
         }
-        guard mode == .moveByCopying else { return target }
-        // The copy is complete: remove the original (`unlink` removes a link, never its target).
-        if unlink(source.path) != 0 {
+        if locked { lchflags(target.path, copiedFlags) }
+        guard mode == .moveByCopying else { return .copied(target) }
+        // The copy is complete. Remove the original only if it is still the item that was copied, unchanged:
+        // another app may have saved a new version meanwhile (a temporary file renamed over it), and removing
+        // that would lose it. (`unlink` removes a link, never its target.)
+        let now = Snapshot(source)
+        if let original, now == original {
+            if unlink(source.path) == 0 { return .moved(target) }
             let code = errno
-            unlink(target.path)
+            discard(target)
             let readOnly = code == EACCES || code == EPERM || code == EROFS
             throw PlaceFailure(code, hint: readOnly ? " (its folder is read-only: copy it instead)" : "")
         }
-        return target
+        if let original, let now, now.isSameItem(as: original) {
+            // Written to while it was copied: the copy may hold parts of two versions. Keep only the original.
+            discard(target)
+            throw PlaceFailure(changed: "it changed while it was being copied (left as it is)")
+        }
+        // Replaced, renamed or removed meanwhile: the copy holds the version that was copied; leave the rest alone.
+        return .copied(target)
+    }
+
+    /// Finder's "Locked" and append-only: a file with either can be neither renamed nor removed.
+    private static let lockFlags = UInt32(UF_IMMUTABLE | UF_APPEND)
+    /// The same set by the system, which no app can clear.
+    private static let systemLockFlags = UInt32(SF_IMMUTABLE | SF_APPEND)
+
+    /// The BSD flags of the item at `url` (not following a symbolic link).
+    private static func flags(_ url: URL) -> UInt32? {
+        var st = stat()
+        return lstat(url.path, &st) == 0 ? st.st_flags : nil
+    }
+
+    private static func isLocked(_ url: URL) -> Bool { (flags(url) ?? 0) & (lockFlags | systemLockFlags) != 0 }
+
+    /// Remove an item this code made (a temporary file, a copy), unlocking it first: the copy of a locked
+    /// file is locked too, and `unlink` alone would leave it behind.
+    private static func discard(_ url: URL) {
+        if let flags = flags(url), flags & lockFlags != 0 { lchflags(url.path, flags & ~lockFlags) }
+        unlink(url.path)
+    }
+
+    /// The failure of renaming `source`, saying so when it is locked.
+    private static func renameFailure(_ code: Int32, _ source: URL) -> PlaceFailure {
+        PlaceFailure(code, hint: code == EPERM && isLocked(source) ? " (it is locked)" : "")
     }
 
     /// `folder/name` for n = 1, else "stem n.ext".
@@ -347,11 +553,39 @@ public final class FileOperations {
         init?(_ url: URL) {
             var st = stat()
             guard lstat(url.path, &st) == 0 else { return nil }
+            self.init(st)
+        }
+
+        init(_ st: stat) {
             device = Int64(st.st_dev)
             inode = UInt64(st.st_ino)
             size = Int64(st.st_size)
             seconds = st.st_mtimespec.tv_sec
             nanoseconds = st.st_mtimespec.tv_nsec
+        }
+    }
+
+    /// The item at a path exactly as it is: its `Stamp` plus the status-change time, which also moves on a
+    /// write that keeps the size and modification time, and on tag, permission and lock changes.
+    private struct Snapshot: Equatable {
+        let stamp: Stamp
+        let changeSeconds: Int
+        let changeNanoseconds: Int
+        /// BSD file flags (`UF_IMMUTABLE` is Finder's "Locked").
+        let flags: UInt32
+
+        init?(_ url: URL) {
+            var st = stat()
+            guard lstat(url.path, &st) == 0 else { return nil }
+            stamp = Stamp(st)
+            changeSeconds = st.st_ctimespec.tv_sec
+            changeNanoseconds = st.st_ctimespec.tv_nsec
+            flags = st.st_flags
+        }
+
+        /// The same file (volume and inode), whether or not it changed.
+        func isSameItem(as other: Snapshot) -> Bool {
+            stamp.device == other.stamp.device && stamp.inode == other.stamp.inode
         }
     }
 
@@ -374,11 +608,19 @@ public final class FileOperations {
     }
 
     /// Throws unless the item at `url` is the one `stamp` describes. Messages say `name`, never a path.
+    /// The failures are permanent: that item cannot come back.
     private static func check(_ stamp: Stamp?, at url: URL, name: String? = nil, missing: String, since verb: String) throws {
         guard let stamp else { return }
         let name = name ?? url.lastPathComponent
-        guard let now = Stamp(url) else { throw Failure("\(name) \(missing)") }
-        if now != stamp { throw Failure("\(name) was replaced or edited since it was \(verb): left as it is") }
+        guard let now = Stamp(url) else { throw Failure("\(name) \(missing)", permanent: true) }
+        if now != stamp {
+            throw Failure("\(name) was replaced or edited since it was \(verb): left as it is", permanent: true)
+        }
+    }
+
+    /// Throws (permanently) when nothing has the name `url` any more, e.g. before tagging it.
+    private static func requireItem(_ url: URL) throws {
+        guard itemExists(url) else { throw Failure("\(url.lastPathComponent) is no longer there", permanent: true) }
     }
 
     // MARK: Destinations
@@ -567,22 +809,46 @@ public final class FileOperations {
         ]
     }
 
+    /// The placeholders whose values are digits only, so they may stand bare in `$((…))`.
+    private static let numericExecVariables: Set<String> = ["PEEKABOO_INDEX", "PEEKABOO_COUNT"]
+
     /// The shell command for an `exec:` template: each placeholder becomes a reference to its environment
     /// variable, quoted for where it stands — `"${PEEKABOO_PATH}"` in plain text, `${PEEKABOO_PATH}` inside
-    /// `"…"`, `'"${PEEKABOO_PATH}"'` inside `'…'` — so a value is always exactly one word and is never parsed
-    /// as shell code. No file-derived text goes into the command: run it with `execEnvironment(…)`.
-    /// `\{path}` and `${path}` are left alone. The arguments are unused (kept for source compatibility).
+    /// `"…"`, `'"${PEEKABOO_PATH}"'` inside `'…'`, `'"${PEEKABOO_PATH}"$'` inside bash's `$'…'` — so a value is
+    /// always exactly one word and is never parsed as shell code. In `$((…))`, where quotes are a syntax error,
+    /// `{index}` and `{count}` (digits only) stand bare and the others stay quoted, so the shell refuses them
+    /// rather than evaluate file names as arithmetic. No file-derived text goes into the command: run it with
+    /// `execEnvironment(…)`. `\{path}` and `${path}` are left alone. The arguments are unused (kept for source
+    /// compatibility).
     public static func expand(_ template: String, file: URL, index: Int, count: Int) -> String {
         execCommand(template)
     }
 
     /// See `expand(_:file:index:count:)`.
     public static func execCommand(_ template: String) -> String {
-        enum Context: Equatable { case plain, single, double, backtick, command(depth: Int) }
+        enum Context: Equatable {
+            case plain, single, double, backtick, command(depth: Int)
+            /// bash's `$'…'`: `\` escapes the next character, `'` ends it.
+            case ansi
+            /// `$((…))`; `depth` counts the parentheses open inside it.
+            case arithmetic(depth: Int)
+        }
         let chars = Array(template)
         var stack: [Context] = [.plain]
         var out = ""
         var i = 0
+        /// At the "(" after a "$": `$((` opens an arithmetic expansion, `$(` a command substitution.
+        func openSubstitution() {
+            if i + 1 < chars.count, chars[i + 1] == "(" {
+                out += "(("
+                i += 2
+                stack.append(.arithmetic(depth: 0))
+            } else {
+                out.append("(")
+                i += 1
+                stack.append(.command(depth: 0))
+            }
+        }
         while i < chars.count {
             let c = chars[i]
             let context = stack[stack.count - 1]
@@ -591,7 +857,9 @@ public final class FileOperations {
                let variable = execVariables[String(chars[(i + 1)..<close])] {
                 switch context {
                 case .single: out += "'\"${\(variable)}\"'"
+                case .ansi: out += "'\"${\(variable)}\"$'"
                 case .double: out += "${\(variable)}"
+                case .arithmetic where numericExecVariables.contains(variable): out += "${\(variable)}"
                 default: out += "\"${\(variable)}\""
                 }
                 i = close + 1
@@ -602,6 +870,13 @@ public final class FileOperations {
             switch context {
             case .single:
                 if c == "'" { stack.removeLast() }
+            case .ansi:
+                if c == "\\", let next {
+                    out.append(next)
+                    i += 1
+                } else if c == "'" {
+                    stack.removeLast()
+                }
             case .double:
                 if c == "\\", let next {
                     out.append(next)
@@ -609,13 +884,11 @@ public final class FileOperations {
                 } else if c == "\"" {
                     stack.removeLast()
                 } else if c == "$", next == "(" {
-                    out.append("(")
-                    i += 1
-                    stack.append(.command(depth: 0))
+                    openSubstitution()
                 } else if c == "`" {
                     stack.append(.backtick)
                 }
-            case .plain, .backtick, .command:
+            case .plain, .backtick, .command, .arithmetic:
                 if c == "\\", let next {
                     out.append(next)
                     i += 1
@@ -623,16 +896,29 @@ public final class FileOperations {
                     stack.append(.single)
                 } else if c == "\"" {
                     stack.append(.double)
-                } else if c == "$", next == "(" {
-                    out.append("(")
+                } else if c == "$", next == "'" {
+                    out.append("'")
                     i += 1
-                    stack.append(.command(depth: 0))
+                    stack.append(.ansi)
+                } else if c == "$", next == "(" {
+                    openSubstitution()
                 } else if c == "`" {
                     if context == .backtick { stack.removeLast() } else { stack.append(.backtick) }
                 } else if case .command(let depth) = context, c == "(" || c == ")" {
                     stack.removeLast()
                     if c == "(" { stack.append(.command(depth: depth + 1)) }
                     else if depth > 0 { stack.append(.command(depth: depth - 1)) }
+                } else if case .arithmetic(let depth) = context {
+                    if c == "(" || c == ")" { stack.removeLast() }
+                    if c == "(" {
+                        stack.append(.arithmetic(depth: depth + 1))
+                    } else if c == ")", depth > 0 {
+                        stack.append(.arithmetic(depth: depth - 1))
+                    } else if c == ")", next == ")" {
+                        out.append(")")
+                        i += 1
+                    }
+                    // Here `#` separates a base from its digits (16#ff); it never starts a comment.
                 } else if c == "#", i == 1 || " \t\n;&|(".contains(chars[i - 2]) {
                     // A comment runs to the end of the line.
                     while i < chars.count, chars[i] != "\n" {

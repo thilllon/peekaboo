@@ -3,10 +3,10 @@ import Carbon.HIToolbox
 import PeekabooCore
 
 extension KeyChord {
-    /// The physical-key chord of a key event. Printable keys are translated through the current
-    /// ASCII-capable layout (US/ABC under Korean 2-Set), so bindings work whatever the input method.
-    /// The key is the unshifted character with shift as a modifier, which is what `KeyChord(spec:)`
-    /// produces for config strings such as `?` (`shift+/`) or `G` (`shift+g`).
+    /// The chord of a key event. Named keys go by key code; printable keys through the current
+    /// ASCII-capable layout (US/ABC under Korean 2-Set), so bindings work whatever the input method, and
+    /// in the US spelling of `KeyChord(spec:)` (`?` is `shift+/`, `G` is `shift+g`) on any layout: on a
+    /// German keyboard the `+` key is `+` and ⇧ß is `?` (see `KeyboardLayout`).
     init?(event: NSEvent) {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         var modifiers: KeyModifiers = []
@@ -17,8 +17,8 @@ extension KeyChord {
         let code = Int(event.keyCode)
         if let name = KeyChord.namedKeys[code] {
             self.init(key: name, modifiers: modifiers)
-        } else if let character = KeyLayout.shared.character(for: code) {
-            self.init(key: character, modifiers: modifiers)
+        } else if let chord = KeyLayout.shared.layout.chord(keyCode: code, modifiers: modifiers) {
+            self = chord
         } else {
             return nil
         }
@@ -41,10 +41,11 @@ extension KeyChord {
     ]
 }
 
-/// keyCode → unshifted ASCII character of the current ASCII-capable keyboard layout.
+/// What the keys of the current ASCII-capable keyboard layout type, unshifted and with shift.
 final class KeyLayout {
     static let shared = KeyLayout()
-    private var table: [Int: String] = [:]
+    /// US until the current layout has been read.
+    private(set) var layout = KeyboardLayout.us
 
     private init() {
         rebuild()
@@ -53,26 +54,29 @@ final class KeyLayout {
             object: nil, queue: .main) { [weak self] _ in self?.rebuild() }
     }
 
-    func character(for code: Int) -> String? { table[code] }
-
     private func rebuild() {
         guard let source = TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue(),
               let raw = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else { return }
         let data = Unmanaged<CFData>.fromOpaque(raw).takeUnretainedValue() as Data
-        var result: [Int: String] = [:]
+        var keys: [Int: KeyboardLayout.Key] = [:]
         data.withUnsafeBytes { buffer in
-            guard let layout = buffer.baseAddress?.assumingMemoryBound(to: UCKeyboardLayout.self) else { return }
-            for code in 0..<128 {
+            guard let uchr = buffer.baseAddress?.assumingMemoryBound(to: UCKeyboardLayout.self) else { return }
+            /// What `code` types with the Carbon modifier state `state`; a dead key types its accent.
+            func character(_ code: Int, _ state: UInt32) -> Character? {
                 var dead: UInt32 = 0
                 var length = 0
                 var chars = [UniChar](repeating: 0, count: 4)
-                let status = UCKeyTranslate(layout, UInt16(code), UInt16(kUCKeyActionDown), 0, UInt32(LMGetKbdType()),
+                let status = UCKeyTranslate(uchr, UInt16(code), UInt16(kUCKeyActionDown), state, UInt32(LMGetKbdType()),
                                             OptionBits(kUCKeyTranslateNoDeadKeysMask), &dead, 4, &length, &chars)
-                if status == noErr, length == 1, let scalar = Unicode.Scalar(chars[0]), scalar.isASCII, scalar.value > 0x20 {
-                    result[code] = String(Character(scalar)).lowercased()
-                }
+                guard status == noErr, length == 1, let scalar = Unicode.Scalar(chars[0]) else { return nil }
+                return Character(scalar)
+            }
+            let shift = UInt32(shiftKey >> 8) & 0xFF
+            for code in 0..<128 {
+                let key = KeyboardLayout.Key(character(code, 0), shifted: character(code, shift))
+                if key.base != nil || key.shifted != nil { keys[code] = key }
             }
         }
-        table = result
+        layout = KeyboardLayout(keys: keys)
     }
 }

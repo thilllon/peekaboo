@@ -55,7 +55,8 @@ only in a comment, so uncommenting its settings never produces a warning.
 
 The file is standard TOML, limited to what the schema needs: `# comments`, `[table]` headers, bare,
 quoted and dotted keys, basic strings (`"…"` with `\" \\ \n \t \uXXXX` escapes), literal strings
-(`'…'`), integers, floats, booleans and arrays (which may span lines and end with a comma).
+(`'…'`), integers, floats, booleans and arrays (which may span lines and end with a comma, and nest
+up to 32 deep).
 Multi-line strings, inline tables, arrays of tables and dates are not supported and are reported as
 errors. A key made of anything other than letters, digits, `_` and `-` must be quoted:
 `"cmd+," = "app.config"`, `"?" = "view.help"`, `"g g" = "nav.first"`.
@@ -130,9 +131,20 @@ chord   := ( modifier "+" )* key
 - **Shift is a modifier.** An uppercase letter or a shifted symbol means shift plus the key that
   produces it on a US keyboard: `G` = `shift+g`, `?` = `shift+/`, `+` = `shift+=`, `<` = `shift+,`,
   `>` = `shift+.`, `|` = `shift+\`, `_` = `shift+-`, `!` = `shift+1`, `)` = `shift+0`, `cmd++` = `cmd+shift+=`.
-- **Physical keys.** Chords match the key you press, translated through your ASCII-capable keyboard
-  layout, not the character it types. Bindings keep working while a Korean, Japanese or other input
-  method is active, and `opt+1` is the 1 key rather than `¡`.
+- **Keyboard layouts.** Chords are written in US terms and match keys through your ASCII-capable
+  keyboard layout, so bindings keep working while a Korean, Japanese or other input method is active,
+  and on German, French and other keyboards:
+  - Letters are the keys labelled with them: `z` is the Z key on a German or French keyboard.
+  - Digits are the keys that type them, with or without shift: on a French keyboard `1` is the `&` key
+    and `shift+1` that key with shift. Where a layout types digits only with option (Lithuanian,
+    Vietnamese), the number-row keys are the digits.
+  - A symbol is the key that types it: on a German keyboard `+` is the `+` key and `?` is ⇧ß. With
+    shift held, the shifted symbol counts.
+  - A key that types a letter outside a–z (`ü`, `ß`, `é`, `ñ`, `å`, …) or a symbol of the US number
+    row (`$` on a French keyboard, which would otherwise mean `shift+4`) stands for the US key in its
+    place: `ü` on a German keyboard is `[`.
+  - Option and command do not change the key: `opt+1` is the 1 key rather than `¡`, and on a German
+    keyboard `opt+5` is the 5 key (move to slot 5) although it types `[`.
 
 Leave the system shortcuts alone: ⌃Space and ⌘Space (input source, Spotlight), ⌃arrows (Mission
 Control), ⌘Tab, ⌘\`, ⌘H, ⌥⌘H, ⌘M, ⇧⌘3/4/5, ⌃⌘Q, ⌥⌘Esc and ⌃1…9 never reach the app or are best kept free.
@@ -235,6 +247,20 @@ Ids are `namespace.verb`, optionally followed by `:argument`.
 | `app.close` | `cmd+w` `q` |
 | `app.quit` / `app.open` | `cmd+q` / `cmd+o` |
 
+On other keyboard layouts the keys are matched as [above](#chord-syntax). A symbol that a layout
+types only with option has no default key there, because option keeps the physical key: `]`
+(`nav.jump:+10`) and `|` (`view.flip_h`) on German keyboards, `[` and `]` on Spanish ISO ones, `|`
+on Swedish, Danish and French ones. The same goes for the number-row symbols of layouts that type
+their digits with shift, since those keys are the digits (`-` on Lithuanian LST 1582). Bind other
+keys for them if you use them:
+
+```toml
+[keys]
+"shift+pageup" = "nav.jump:-10"
+"shift+pagedown" = "nav.jump:+10"
+"h" = "view.flip_h"
+```
+
 **Zoomed** (`[keys.zoomed]`, while zoomed in beyond fit): `left` `right` `up` `down` pan
 (`pan.*`), `shift+left` `shift+right` `shift+up` `shift+down` jump to that edge (`pan.edge:*`).
 `space`, `backspace` and the page keys keep navigating, so you can pixel-peep a sequence: turn on
@@ -262,7 +288,8 @@ Ids are `namespace.verb`, optionally followed by `:argument`.
 `file.trash` moves the file to the Trash at once (a rename on the same volume) and shows the next image.
 ⌘Z puts it back where it was, for the whole session. Finder's "Put Back" may not know about files
 trashed by apps, so use ⌘Z. A volume without a Trash reports an error; nothing is deleted silently.
-If the Trash was emptied meanwhile, undo says so (`IMG_0042.jpg is no longer in the Trash`).
+If the Trash was emptied meanwhile, undo says so (`IMG_0042.jpg is no longer in the Trash`), and
+the next ⌘Z goes on to the change before it.
 
 ### Move and copy
 
@@ -273,7 +300,8 @@ Missing folders are created. A file never overwrites another one: a name that is
 broken symbolic link) becomes `name 2.jpg`, `name 3.jpg`, … (like Finder's Keep Both), decided by an
 exclusive rename, so a file that appears at the last moment is not replaced either. Undo moves the file
 back (or removes the copy). Copies, and moves to another volume, run in the background: the next image
-shows at once, and a failure brings the file back.
+shows at once, and a failure brings the file back. So do their undo and redo; another ⌘Z or ⇧⌘Z waits
+until the one in progress has finished.
 
 Safety rules:
 
@@ -281,15 +309,27 @@ Safety rules:
 - A move to another volume copies first and removes the original only once the copy is complete. If
   the original cannot be removed (a read-only folder or card), the copy is removed again and the toast
   suggests copying instead.
+- That move removes the original only if it is still the file that was copied. If another app saved
+  a new version over it meanwhile (or renamed or removed it), the move ends as a copy and the original
+  is left as it is (`IMG_0042.jpg changed during the move: copied to Card, original left as it is`).
+  If the file was written to during the copy, the copy may be torn: it is removed again and nothing
+  moves. Undo and redo of a move across volumes follow the same rule.
 - Undo and redo leave a file alone if it was replaced or edited since the action (`IMG_0042.jpg was
   replaced or edited since it was copied: left as it is`). Renames and tag changes do not count as edits.
+  A change that can never be undone (its file was replaced, edited or removed) is dropped after that
+  message, so the next ⌘Z undoes the change before it. A failure that may pass, such as a read-only
+  folder, keeps the change for another try.
 - A read-only source or destination folder fails with a message such as `Cannot move IMG_0042.jpg:
   Permission denied`; nothing is moved or recorded. Messages name files and folders, not full paths.
+- A file locked in Finder (Get Info › Locked) is copied with its lock, and cannot be moved, on the same
+  volume or across volumes (`Cannot move IMG_0042.jpg: Operation not permitted (it is locked)`).
+  Undoing a copy of it unlocks the copy to put it in the Trash.
 
 `file.move:ask` (`m`) and `file.copy:ask` (`c`) open a menu of your slots. A slot whose name is one
 character (`1`…`9`, `k`, …) is chosen with that key. Return picks the previous destination, and `o`
 ("Other Folder…") chooses any folder. `file.move:last` repeats the previous destination without asking.
-Undoing a copy moves the copy to the Trash, as Finder does.
+Undoing a copy moves the copy to the Trash, as Finder does. Where there is no Trash (some network
+shares), undo says so and leaves the copy alone; it never deletes the copy instead.
 
 ### Ratings, labels and flags
 
@@ -332,8 +372,12 @@ one word, spaces and quotes included. You can write placeholders bare or inside 
 | `echo 'x {path}'` | `echo 'x '"${PEEKABOO_PATH}"''` |
 | `cp {path} ~/Desktop/{name}` | `cp "${PEEKABOO_PATH}" ~/Desktop/"${PEEKABOO_NAME}"` |
 | `echo "$(basename {path})"` | `echo "$(basename "${PEEKABOO_PATH}")"` |
+| `printf %s $'{name}\n'` | `printf %s $''"${PEEKABOO_NAME}"$'\n'` |
+| `echo $(({index} + 1))` | `echo $((${PEEKABOO_INDEX} + 1))` |
 
-`\{path}` and `${path}` are left as they are, and so is anything after a `#` comment. You can also use
+Inside `$((…))` quotes are a syntax error, so `{index}` and `{count}` (digits only) stand bare there;
+the other placeholders stay quoted and the shell refuses them, rather than evaluate a file name as
+arithmetic. `\{path}` and `${path}` are left as they are, and so is anything after a `#` comment. You can also use
 the variables directly (`"$PEEKABOO_PATH"`); quote them yourself then. `{name}`, `{stem}` and `{ext}`
 may start with `-`, so put `--` before them for commands that would read them as options; `{path}` and
 `{dir}` always start with `/`. Do not pass placeholders to `eval` or `sh -c`, which would parse the

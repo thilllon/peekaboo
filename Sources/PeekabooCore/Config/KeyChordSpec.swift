@@ -1,8 +1,8 @@
 /// Config-string chords: `"cmd+shift+k"`, `"opt+1"`, `"space"`, `"?"` (= `shift+/`), `"G"` (= `shift+g`),
 /// `"+"` (= `shift+=`) and sequences such as `"g g"`.
 ///
-/// Shifted symbols resolve through a static US-ANSI table, matching how `KeyChord(event:)` reports the
-/// physical key (the unshifted character of the ASCII-capable layout) with `shift` as a modifier.
+/// Shifted symbols resolve through a static US-ANSI table, with `shift` as a modifier; `KeyboardLayout`
+/// turns key presses on any layout into the same spelling.
 public struct KeySpecError: Error, Equatable, Sendable, CustomStringConvertible {
     public let message: String
     public init(_ message: String) { self.message = message }

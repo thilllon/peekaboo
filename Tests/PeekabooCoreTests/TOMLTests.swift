@@ -121,6 +121,32 @@ final class TOMLTests: XCTestCase {
         XCTAssertEqual(error("ok = 1\nbad = nope\n")?.column, 7)
     }
 
+    func testDeeplyNestedArraysAreAnErrorNotACrash() throws {
+        func nested(_ depth: Int) -> String {
+            "x = " + String(repeating: "[", count: depth) + String(repeating: "]", count: depth) + "\n"
+        }
+        XCTAssertEqual(try parse(nested(32)).entries.count, 1)
+        let tooDeep = error(nested(33))
+        XCTAssertEqual(tooDeep?.message, "arrays nested more than 32 deep are not supported")
+        XCTAssertEqual(tooDeep?.column, 37, "at the 33rd [")
+        // 100000 levels (200 KB) overflowed even the main thread's stack; the hot reload parses on a GCD queue,
+        // whose 512 KB stack 2000 levels (4 KB) overflowed.
+        XCTAssertEqual(error("[keys]\n\"x\" = " + String(repeating: "[", count: 100_000) + "\n")?.line, 2)
+        let parsed = expectation(description: "parsed off the main thread")
+        DispatchQueue(label: "toml-test", qos: .utility).async {
+            let failed: Bool
+            do {
+                _ = try TOMLDocument(parsing: nested(2000))
+                failed = false
+            } catch {
+                failed = error is TOMLError
+            }
+            XCTAssertTrue(failed)
+            parsed.fulfill()
+        }
+        wait(for: [parsed], timeout: 10)
+    }
+
     func testParsesFiveKilobytesQuickly() throws {
         var text = "[keys]\n"
         for n in 0..<200 { text += "\"ctrl+x k\(n)\" = [\"meta.rate:\(n % 6)\", \"nav.next\"] # \(n)\n" }

@@ -13,13 +13,22 @@ final class FileOperationsSafetyTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
-        // Read-only folders left by a failed test would stop the removal.
+        FileOperations.afterCopyingForMove = nil
+        FileOperations.movesByCopying = false
+        // Read-only folders and locked files left by a failed test would stop the removal.
         if let walker = fm.enumerator(atPath: root.path) {
             for case let relative as String in walker {
-                try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: root.appendingPathComponent(relative).path)
+                let path = root.appendingPathComponent(relative).path
+                lchflags(path, 0)
+                try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
             }
         }
         try? fm.removeItem(at: root)
+    }
+
+    private func flags(_ url: URL) -> UInt32 {
+        var st = stat()
+        return lstat(url.path, &st) == 0 ? st.st_flags : 0
     }
 
     @discardableResult
@@ -72,6 +81,20 @@ final class FileOperationsSafetyTests: XCTestCase {
         XCTAssertFalse(fm.fileExists(atPath: fm.currentDirectoryPath + "/PWNED"))
     }
 
+    func testExecQuotesPlaceholdersInBashStringsAndArithmetic() throws {
+        let file = try make("shoot/IMG 1 * .jpg")
+        let out = root.appendingPathComponent("out")
+        // The \' in $'…' used to invert the quoting from there on: the name came out unquoted, split into
+        // words, and its * was expanded to the files in the folder.
+        try runExec(#"printf '<%s>' $'it\'s' "{name}" > out"#, file: file)
+        XCTAssertEqual(try String(contentsOf: out, encoding: .utf8), "<it's><IMG 1 * .jpg>")
+        try runExec(#"printf '<%s>' $'a{name}\tb' {stem} > out"#, file: file)
+        XCTAssertEqual(try String(contentsOf: out, encoding: .utf8), "<aIMG 1 * .jpg\tb><IMG 1 * >")
+        // {index} and {count} in arithmetic used to be a syntax error. The file is the 1st of 1.
+        try runExec("echo $(({index}+1)) \"$(( ({count} + {index}) * 2 ))\" > out", file: file)
+        XCTAssertEqual(try String(contentsOf: out, encoding: .utf8), "2 4\n")
+    }
+
     func testExecCommandsHoldNoFileText() {
         XCTAssertEqual(FileOperations.execCommand("open -R {path}"), #"open -R "${PEEKABOO_PATH}""#)
         XCTAssertEqual(FileOperations.execCommand(#"echo "x {path}" > out"#), #"echo "x ${PEEKABOO_PATH}" > out"#)
@@ -88,6 +111,22 @@ final class FileOperationsSafetyTests: XCTestCase {
         // Escaped braces, shell parameters and comments are left alone; `~/` still expands.
         XCTAssertEqual(FileOperations.execCommand(#"echo \{path} ${path} ~/Desktop/{name} # {name}'s"#),
                        #"echo \{path} ${path} ~/Desktop/"${PEEKABOO_NAME}" # {name}'s"#)
+        // In bash's $'…' strings \' is a quote, not the end: the reference is spliced between two such strings.
+        XCTAssertEqual(FileOperations.execCommand(#"printf '<%s>' $'it\'s' "{name}""#),
+                       #"printf '<%s>' $'it\'s' "${PEEKABOO_NAME}""#)
+        XCTAssertEqual(FileOperations.execCommand(#"printf %s $'a{name}\tb' {ext}"#),
+                       #"printf %s $'a'"${PEEKABOO_NAME}"$'\tb' "${PEEKABOO_EXT}""#)
+        XCTAssertEqual(FileOperations.execCommand(#"echo "$'{name}'" \$'{name}'"#), #"echo "$'${PEEKABOO_NAME}'" \$''"${PEEKABOO_NAME}"''"#)
+        // In $((…)) quotes are a syntax error: {index} and {count} (digits) stand bare, the others stay quoted.
+        XCTAssertEqual(FileOperations.execCommand("echo $(({index}+1)) \"$(( ({count} - {index}) * 2 ))\" {name}"),
+                       #"echo $((${PEEKABOO_INDEX}+1)) "$(( (${PEEKABOO_COUNT} - ${PEEKABOO_INDEX}) * 2 ))" "${PEEKABOO_NAME}""#)
+        XCTAssertEqual(FileOperations.execCommand("echo $(( {name} + 16#ff )) # {name}"),
+                       #"echo $(( "${PEEKABOO_NAME}" + 16#ff )) # {name}"#)
+        XCTAssertEqual(FileOperations.execCommand("echo $( (echo {index}) ) $(echo $(({count})))"),
+                       #"echo $( (echo "${PEEKABOO_INDEX}") ) $(echo $((${PEEKABOO_COUNT})))"#)
+        // The examples of docs/CONFIG.md.
+        XCTAssertEqual(FileOperations.execCommand(#"printf %s $'{name}\n'"#), #"printf %s $''"${PEEKABOO_NAME}"$'\n'"#)
+        XCTAssertEqual(FileOperations.execCommand("echo $(({index} + 1))"), "echo $((${PEEKABOO_INDEX} + 1))")
         // The deprecated entry point gives the same command whatever the file.
         XCTAssertEqual(FileOperations.expand("cp {path} x", file: URL(fileURLWithPath: "/a/$(rm -rf ~).jpg"), index: 0, count: 1),
                        #"cp "${PEEKABOO_PATH}" x"#)
@@ -180,7 +219,7 @@ final class FileOperationsSafetyTests: XCTestCase {
             XCTAssertEqual("\(error)", "d.jpg was replaced or edited since it was moved: left as it is")
         }
         XCTAssertFalse(exists(photo))
-        XCTAssertEqual(ops.undoStack.count, 1, "the change stays")
+        XCTAssertEqual(ops.undoStack.count, 0, "a change that can never be undone is dropped")
 
         // A copy edited since: undo leaves it alone instead of deleting the edit.
         let other = try make("shoot/e.jpg", "e")
@@ -206,7 +245,7 @@ final class FileOperationsSafetyTests: XCTestCase {
             XCTAssertEqual("\(error)", "f.jpg was replaced or edited since it was moved back: left as it is")
         }
         XCTAssertTrue(exists(f))
-        XCTAssertEqual(ops2.redoStack.count, 1)
+        XCTAssertEqual(ops2.redoStack.count, 0)
 
         // Renames and tag changes are not edits: undo still works.
         let g = try make("shoot/g.jpg", "g")
@@ -221,7 +260,9 @@ final class FileOperationsSafetyTests: XCTestCase {
     func testUndoTrashAfterTheTrashWasEmptied() throws {
         let name = "emptied-\(UUID().uuidString.prefix(8)).jpg"
         let photo = try make("shoot/\(name)")
+        let earlier = try make("shoot/earlier.jpg")
         let ops = FileOperations()
+        try ops.move(earlier, toFolder: root.appendingPathComponent("keep"))
         let change: FileOperations.Change
         do {
             change = try ops.trash(photo)
@@ -234,7 +275,87 @@ final class FileOperationsSafetyTests: XCTestCase {
             XCTAssertEqual("\(error)", "\(name) is no longer in the Trash")
         }
         XCTAssertFalse(exists(photo))
+        // The trash can never be undone now: the next undo reaches the move before it.
         XCTAssertEqual(ops.undoStack.count, 1)
+        _ = try ops.undo()
+        XCTAssertTrue(exists(earlier))
+    }
+
+    func testUndoDropsChangesThatCanNeverBeUndoneAndKeepsOnesThatMaySucceedLater() throws {
+        let ops = FileOperations()
+        ops.trashesUndoneCopies = false
+        let keep = root.appendingPathComponent("keep")
+        var moved: [URL] = []
+        for n in 1...3 {
+            moved.append(try make("shoot/m\(n).jpg"))
+            try ops.move(moved[n - 1], toFolder: keep)
+        }
+        // Moved, then deleted in Finder; a tag change on a file deleted since; a copy edited since.
+        try ops.move(try make("shoot/gone.jpg"), toFolder: keep)
+        try fm.removeItem(at: keep.appendingPathComponent("gone.jpg"))
+        let tagged = try make("shoot/tagged.jpg")
+        try ops.setTags(FileOperations.Tags(names: ["Pick"]), of: tagged)
+        try fm.removeItem(at: tagged)
+        let copied = try make("shoot/copied.jpg")
+        try ops.copy(copied, toFolder: keep)
+        try Data("edited".utf8).write(to: keep.appendingPathComponent("copied.jpg"))
+        XCTAssertEqual(ops.undoStack.count, 6)
+
+        // Each failure is reported once; then undo goes on to the older changes instead of failing forever.
+        for message in ["copied.jpg was replaced or edited since it was copied: left as it is",
+                        "tagged.jpg is no longer there", "gone.jpg is no longer in keep"] {
+            XCTAssertThrowsError(try ops.undo()) { error in XCTAssertEqual("\(error)", message) }
+        }
+        XCTAssertEqual(ops.undoStack.count, 3)
+        XCTAssertEqual(try String(contentsOf: keep.appendingPathComponent("copied.jpg"), encoding: .utf8), "edited")
+
+        // A failure that may pass later (a read-only folder) keeps the change for another try.
+        guard getuid() != 0 else { throw XCTSkip("root ignores permissions") }
+        let shoot = root.appendingPathComponent("shoot")
+        try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: shoot.path)
+        XCTAssertThrowsError(try ops.undo()) { error in
+            XCTAssertEqual("\(error)", "Cannot restore m3.jpg: Permission denied")
+        }
+        XCTAssertEqual(ops.undoStack.count, 3)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shoot.path)
+        for photo in moved.reversed() {
+            _ = try ops.undo()
+            XCTAssertTrue(exists(photo))
+        }
+        XCTAssertEqual(ops.undoStack.count, 0)
+
+        // Redo drops what can never be redone in the same way.
+        XCTAssertEqual(ops.redoStack.count, 3)
+        try fm.removeItem(at: moved[0])
+        XCTAssertThrowsError(try ops.redo()) { error in XCTAssertEqual("\(error)", "m1.jpg is no longer there") }
+        XCTAssertEqual(ops.redoStack.count, 2)
+        _ = try ops.redo()
+        XCTAssertFalse(exists(moved[1]))
+        XCTAssertTrue(exists(keep.appendingPathComponent("m2.jpg")))
+    }
+
+    func testUndoNeverDeletesACopyWhenTheTrashIsUnavailable() throws {
+        let photo = try make("shoot/backup.jpg", "only copy")
+        let share = root.appendingPathComponent("share")
+        let ops = FileOperations()
+        // A network share without a Trash.
+        ops.trashCopy = { _ in throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOTSUP)) }
+        try ops.copy(photo, toFolder: share)
+        try fm.removeItem(at: photo) // the card is formatted: the copy is the only one left
+        XCTAssertThrowsError(try ops.undo()) { error in
+            XCTAssertEqual("\(error)", "Cannot move the copy to the Trash: Operation not supported")
+        }
+        XCTAssertEqual(try String(contentsOf: share.appendingPathComponent("backup.jpg"), encoding: .utf8), "only copy")
+        XCTAssertEqual(ops.undoStack.count, 1, "the change stays for another try")
+        // Once the Trash can take it, undo goes ahead.
+        var trashed: [String] = []
+        ops.trashCopy = { url in
+            trashed.append(url.lastPathComponent)
+            try FileManager.default.removeItem(at: url)
+        }
+        _ = try ops.undo()
+        XCTAssertEqual(trashed, ["backup.jpg"])
+        XCTAssertEqual(try listing("share"), [])
     }
 
     // MARK: Read-only folders and volumes
@@ -284,6 +405,35 @@ final class FileOperationsSafetyTests: XCTestCase {
         XCTAssertEqual(try listing("readonly"), [])
     }
 
+    func testLockedFilesCopyWithoutLeftoversAndAreNeverHalfMoved() throws {
+        let locked = try make("shoot/locked.jpg", "locked")
+        guard chflags(locked.path, UInt32(UF_IMMUTABLE)) == 0 else { throw XCTSkip("volume does not store file flags") }
+        let keep = root.appendingPathComponent("keep")
+        let ops = FileOperations()
+        ops.trashesUndoneCopies = false
+        // The copy is locked like the original, and no hidden temporary file stays behind.
+        let copy = keep.appendingPathComponent("locked.jpg")
+        XCTAssertEqual(try ops.copy(locked, toFolder: keep), .copied(from: locked, to: copy))
+        XCTAssertEqual(try listing("keep"), ["locked.jpg"])
+        XCTAssertEqual(flags(copy) & UInt32(UF_IMMUTABLE), UInt32(UF_IMMUTABLE))
+        XCTAssertEqual(try String(contentsOf: copy, encoding: .utf8), "locked")
+        // A second copy beside it gets the next name the same way.
+        XCTAssertEqual(try ops.copy(locked, toFolder: keep), .copied(from: locked, to: keep.appendingPathComponent("locked 2.jpg")))
+        // Undo removes the copies (a locked file could not be removed as it is).
+        _ = try ops.undo()
+        _ = try ops.undo()
+        XCTAssertEqual(try listing("keep"), [])
+
+        // A move fails as the rename of a locked file does, across volumes too, before anything is copied.
+        for mode in [FileOperations.Mode.move, .moveByCopying] {
+            XCTAssertThrowsError(try FileOperations.transfer(locked, toFolder: keep, mode: mode)) { error in
+                XCTAssertEqual("\(error)", "Cannot move locked.jpg: Operation not permitted (it is locked)")
+            }
+        }
+        XCTAssertEqual(try listing("keep"), [])
+        XCTAssertEqual(try listing("shoot"), ["locked.jpg"])
+    }
+
     func testMoveAcrossVolumesCopiesThenRemovesTheOriginal() throws {
         let photo = try make("shoot/h.jpg", "h")
         try make("card/h.jpg", "taken")
@@ -298,6 +448,168 @@ final class FileOperationsSafetyTests: XCTestCase {
         _ = try ops.undo()
         XCTAssertEqual(try String(contentsOf: photo, encoding: .utf8), "h")
         XCTAssertEqual(try listing("card"), ["h.jpg"])
+    }
+
+    /// What another app does when it saves a new version of `url`: write a temporary file, rename it over.
+    private func saveNewVersion(_ contents: String, over url: URL) {
+        let saved = url.deletingLastPathComponent().appendingPathComponent(".\(url.lastPathComponent).sb-save")
+        XCTAssertNoThrow(try Data(contents.utf8).write(to: saved))
+        XCTAssertEqual(rename(saved.path, url.path), 0)
+    }
+
+    func testMoveAcrossVolumesNeverRemovesAnOriginalThatChangedDuringTheCopy() throws {
+        let card = root.appendingPathComponent("card")
+        // Replaced by a new version while it was copied: the new version stays, the copy holds the old one.
+        let photo = try make("shoot/a.jpg", "version 1")
+        FileOperations.afterCopyingForMove = { source in
+            if source == photo { self.saveNewVersion("version 2", over: source) }
+        }
+        let change = try FileOperations.transfer(photo, toFolder: card, mode: .moveByCopying)
+        XCTAssertEqual(change, .copied(from: photo, to: card.appendingPathComponent("a.jpg")), "it ends as a copy")
+        XCTAssertEqual(try String(contentsOf: photo, encoding: .utf8), "version 2")
+        XCTAssertEqual(try String(contentsOf: card.appendingPathComponent("a.jpg"), encoding: .utf8), "version 1")
+        // Its undo removes the copy only.
+        let ops = FileOperations()
+        ops.trashesUndoneCopies = false
+        ops.record(change)
+        _ = try ops.undo()
+        XCTAssertEqual(try listing("card"), [])
+        XCTAssertEqual(try String(contentsOf: photo, encoding: .utf8), "version 2")
+
+        // Written to while it was copied: the copy may be torn, so it goes again and nothing moves.
+        let edited = try make("shoot/b.jpg", "b")
+        FileOperations.afterCopyingForMove = { source in
+            guard source == edited, let handle = try? FileHandle(forWritingTo: source) else { return }
+            handle.seekToEndOfFile()
+            handle.write(Data(" more".utf8))
+            try? handle.close()
+        }
+        XCTAssertThrowsError(try FileOperations.transfer(edited, toFolder: card, mode: .moveByCopying)) { error in
+            XCTAssertEqual("\(error)", "Cannot move b.jpg: it changed while it was being copied (left as it is)")
+        }
+        XCTAssertEqual(try String(contentsOf: edited, encoding: .utf8), "b more")
+        XCTAssertEqual(try listing("card"), [], "no copy and no temporary file")
+
+        // Removed meanwhile: the copy stays, as it may now be the only one.
+        let removed = try make("shoot/c.jpg", "c")
+        FileOperations.afterCopyingForMove = { source in
+            if source == removed { try? FileManager.default.removeItem(at: source) }
+        }
+        XCTAssertEqual(try FileOperations.transfer(removed, toFolder: card, mode: .moveByCopying),
+                       .copied(from: removed, to: card.appendingPathComponent("c.jpg")))
+        XCTAssertEqual(try String(contentsOf: card.appendingPathComponent("c.jpg"), encoding: .utf8), "c")
+    }
+
+    func testUndoAndRedoAcrossVolumesNeverRemoveAFileThatChangedDuringTheCopy() throws {
+        FileOperations.movesByCopying = true
+        let card = root.appendingPathComponent("card")
+        let ops = FileOperations()
+        ops.trashesUndoneCopies = false
+        // Undo copies the file back from the card; a version saved on the card meanwhile stays there.
+        let photo = try make("shoot/d.jpg", "d1")
+        try ops.move(photo, toFolder: card)
+        let onCard = card.appendingPathComponent("d.jpg")
+        FileOperations.afterCopyingForMove = { source in
+            if source == onCard { self.saveNewVersion("d2", over: source) }
+        }
+        XCTAssertThrowsError(try ops.undo()) { error in
+            XCTAssertEqual("\(error)", "d.jpg changed while it was being moved back: both versions kept")
+        }
+        XCTAssertEqual(try String(contentsOf: photo, encoding: .utf8), "d1")
+        XCTAssertEqual(try String(contentsOf: onCard, encoding: .utf8), "d2")
+        XCTAssertEqual(ops.undoStack.count, 0, "it cannot be undone any more")
+
+        // Redo copies it to the card again; a version saved in the shoot folder meanwhile stays there.
+        let other = try make("shoot/e.jpg", "e1")
+        FileOperations.afterCopyingForMove = nil
+        try ops.move(other, toFolder: card)
+        _ = try ops.undo()
+        XCTAssertEqual(try String(contentsOf: other, encoding: .utf8), "e1")
+        FileOperations.afterCopyingForMove = { source in
+            if source == other { self.saveNewVersion("e2", over: source) }
+        }
+        XCTAssertEqual(try ops.redo(), .copied(from: other, to: card.appendingPathComponent("e.jpg")))
+        XCTAssertEqual(try String(contentsOf: other, encoding: .utf8), "e2")
+        XCTAssertEqual(try String(contentsOf: card.appendingPathComponent("e.jpg"), encoding: .utf8), "e1")
+        XCTAssertEqual(try listing("card"), ["d.jpg", "e.jpg"])
+    }
+
+    /// `perform` on a background queue, as the app runs it.
+    private func performOffTheMainThread(_ slow: FileOperations.SlowChange) -> FileOperations.SlowResult {
+        final class Box: @unchecked Sendable { var result: FileOperations.SlowResult? }
+        let box = Box()
+        let done = expectation(description: "performed")
+        DispatchQueue.global(qos: .userInitiated).async {
+            XCTAssertFalse(Thread.isMainThread)
+            box.result = FileOperations.perform(slow)
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 10)
+        return box.result!
+    }
+
+    func testUndoAndRedoThatCopyAcrossVolumesRunOffTheMainThreadInOrder() throws {
+        let card = root.appendingPathComponent("card")
+        let ops = FileOperations()
+        ops.trashesUndoneCopies = false
+        // A move on one volume and a tag change are quick: they stay with undo().
+        let quick = try make("shoot/quick.jpg")
+        try ops.move(quick, toFolder: card)
+        XCTAssertNil(ops.takeSlowUndo())
+        try ops.setTags(FileOperations.Tags(names: ["Pick"]), of: card.appendingPathComponent("quick.jpg"))
+        XCTAssertNil(ops.takeSlowUndo())
+        XCTAssertEqual(ops.undoStack.count, 2)
+
+        // Across volumes (stood in for by copy-then-delete) the undo is taken off the stack, its bytes move on
+        // another thread, and finish puts it on the redo stack; the redo goes the same way.
+        FileOperations.movesByCopying = true
+        let photo = try make("shoot/s.jpg", "s")
+        try ops.move(photo, toFolder: card)
+        let undo = try XCTUnwrap(ops.takeSlowUndo())
+        XCTAssertTrue(undo.isUndo)
+        XCTAssertEqual(ops.undoStack.count, 2, "taken off")
+        let undone = try ops.finish(undo, with: performOffTheMainThread(undo))
+        XCTAssertEqual(undone, .moved(from: photo, to: card.appendingPathComponent("s.jpg")))
+        XCTAssertEqual(try String(contentsOf: photo, encoding: .utf8), "s")
+        XCTAssertEqual(ops.redoStack, [undone])
+        let redo = try XCTUnwrap(ops.takeSlowRedo())
+        XCTAssertFalse(redo.isUndo)
+        XCTAssertEqual(try ops.finish(redo, with: performOffTheMainThread(redo)), undone)
+        XCTAssertFalse(exists(photo))
+        XCTAssertEqual(ops.undoStack.count, 3)
+
+        // A change recorded while an undo runs stays on top, and the undone move can no longer be redone.
+        let slow = try XCTUnwrap(ops.takeSlowUndo())
+        let other = try make("other/o.jpg")
+        try ops.setTags(FileOperations.Tags(names: ["Reject"]), of: other)
+        _ = try ops.finish(slow, with: performOffTheMainThread(slow))
+        XCTAssertTrue(exists(photo))
+        XCTAssertEqual(ops.undoStack.last, .tagged(other, before: FileOperations.Tags(), after: FileOperations.Tags(names: ["Reject"])))
+        XCTAssertEqual(ops.redoStack, [])
+
+        // A failure that may pass puts the change back below what was recorded meanwhile.
+        guard getuid() != 0 else { throw XCTSkip("root ignores permissions") }
+        try ops.move(photo, toFolder: card)
+        let failing = try XCTUnwrap(ops.takeSlowUndo())
+        let shoot = root.appendingPathComponent("shoot")
+        try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: shoot.path)
+        let result = performOffTheMainThread(failing)
+        try ops.setTags(FileOperations.Tags(), of: other)
+        XCTAssertThrowsError(try ops.finish(failing, with: result)) { error in
+            XCTAssertEqual("\(error)", "Cannot restore s.jpg: Permission denied")
+        }
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shoot.path)
+        XCTAssertEqual(ops.undoStack.suffix(2).first, .moved(from: photo, to: card.appendingPathComponent("s.jpg")))
+        XCTAssertEqual(ops.undoStack.last, .tagged(other, before: FileOperations.Tags(names: ["Reject"]), after: FileOperations.Tags()))
+
+        // Redoing a copy copies again: always taken.
+        let copied = try make("shoot/c.jpg", "c")
+        try ops.copy(copied, toFolder: card)
+        _ = try ops.undo()
+        let recopy = try XCTUnwrap(ops.takeSlowRedo())
+        XCTAssertEqual(try ops.finish(recopy, with: performOffTheMainThread(recopy)),
+                       .copied(from: copied, to: card.appendingPathComponent("c.jpg")))
+        XCTAssertEqual(try String(contentsOf: card.appendingPathComponent("c.jpg"), encoding: .utf8), "c")
     }
 
     func testMissingSourcesAndSameFolderMoves() throws {

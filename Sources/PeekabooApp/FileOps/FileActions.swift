@@ -67,6 +67,8 @@ final class FileActions {
     }
 
     func undo() -> FileActionResult {
+        if let busy = slowInFlight { return Self.busyResult(busy) }
+        if let slow = operations.takeSlowUndo() { return runInBackground(slow) }
         do {
             guard let change = try operations.undo() else { return FileActionResult(toast: "Nothing to undo") }
             return describe(change, undo: true)
@@ -76,12 +78,71 @@ final class FileActions {
     }
 
     func redo() -> FileActionResult {
+        if let busy = slowInFlight { return Self.busyResult(busy) }
+        if let slow = operations.takeSlowRedo() { return runInBackground(slow) }
         do {
             guard let change = try operations.redo() else { return FileActionResult(toast: "Nothing to redo") }
             return describe(change, undo: false)
         } catch {
             return FileActionResult(toast: "Redo failed: \(error)")
         }
+    }
+
+    /// An undo or redo that copies a file across volumes, running in the background; further undos and redos
+    /// wait for it, so that the stacks stay in order.
+    private var slowInFlight: FileOperations.SlowChange?
+
+    private static func busyResult(_ slow: FileOperations.SlowChange) -> FileActionResult {
+        FileActionResult(toast: "Still \(slow.isUndo ? "undoing" : "redoing") the last change: wait for it to finish")
+    }
+
+    /// Like the forward move and copy: the bytes move off the main thread, the viewer updates at once where it
+    /// can (a redone move takes the file out of the list), the result comes as a late result, and a failure
+    /// puts the file back in the list.
+    private func runInBackground(_ slow: FileOperations.SlowChange) -> FileActionResult {
+        slowInFlight = slow
+        let verb = slow.isUndo ? "Undo" : "Redo"
+        // The file a redone move takes out of the browsing set.
+        let leaving: ImageFile?
+        let started: FileActionResult
+        switch slow.change {
+        case .moved(_, let to) where slow.isUndo:
+            leaving = nil
+            started = FileActionResult(toast: "\(verb): moving \(to.lastPathComponent) back…")
+        case .moved(let from, let to):
+            let file = FileOperations.imageFile(at: from)
+            leaving = file
+            started = FileActionResult(outcome: .removed(file),
+                                       toast: "\(verb): moving to \(to.deletingLastPathComponent().lastPathComponent)…")
+        case .copied(_, let to):
+            leaving = nil
+            started = FileActionResult(toast: "\(verb): copying to \(to.deletingLastPathComponent().lastPathComponent)…")
+        case .trashed, .tagged:
+            leaving = nil
+            started = FileActionResult()
+        }
+        let owner = WeakFileActions(self)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = FileOperations.perform(slow)
+            DispatchQueue.main.async {
+                guard let actions = owner.value else { return }
+                actions.slowInFlight = nil
+                do {
+                    let change = try actions.operations.finish(slow, with: result)
+                    var finished = actions.describe(change, undo: slow.isUndo)
+                    // A redone move that ended as a copy (the file changed meanwhile) left the file where it was.
+                    if let leaving, case .copied = change, FileManager.default.fileExists(atPath: leaving.url.path) {
+                        finished.outcome = .restored(FileOperations.imageFile(at: leaving.url))
+                    }
+                    actions.onLateResult?(finished)
+                } catch {
+                    var outcome = FileActionOutcome.unchanged
+                    if let leaving, FileManager.default.fileExists(atPath: leaving.url.path) { outcome = .restored(leaving) }
+                    actions.onLateResult?(FileActionResult(outcome: outcome, toast: "\(verb) failed: \(error)"))
+                }
+            }
+        }
+        return started
     }
 
     // MARK: Dispatch
@@ -189,13 +250,29 @@ final class FileActions {
         let existed = FileManager.default.fileExists(atPath: folder.path)
         let file = context.file
         func toast(for change: FileOperations.Change) -> String {
-            var text = "\(copy ? "Copied" : "Moved") to \(folder.lastPathComponent)"
+            var renamed = ""
+            var endedAsCopy = false
             switch change {
             case .moved(_, let to), .copied(_, let to):
-                if to.lastPathComponent != file.name { text += " as \(to.lastPathComponent)" }
+                if to.lastPathComponent != file.name { renamed = " as \(to.lastPathComponent)" }
+                // A move whose original another app changed meanwhile (saved a new version) ends as a copy.
+                if case .copied = change { endedAsCopy = !copy }
             default: break
             }
+            let text = endedAsCopy
+                ? "\(file.name) changed during the move: copied to \(folder.lastPathComponent)\(renamed), original left as it is"
+                : "\(copy ? "Copied" : "Moved") to \(folder.lastPathComponent)\(renamed)"
             return text + (existed ? "" : " (new folder)") + " · ⌘Z"
+        }
+        /// The result of a finished move. One that ended as a copy leaves the original in its folder, so the
+        /// viewer keeps its entry (or gets it back, when it dropped the file as the move began).
+        func moved(_ change: FileOperations.Change, viewerDroppedIt: Bool) -> FileActionResult {
+            var stays = false
+            if case .copied = change { stays = FileManager.default.fileExists(atPath: file.url.path) }
+            let outcome: FileActionOutcome = viewerDroppedIt
+                ? (stays ? .restored(FileOperations.imageFile(at: file.url)) : .unchanged)
+                : (stays ? .unchanged : .removed(file))
+            return FileActionResult(outcome: outcome, toast: toast(for: change))
         }
         // A copy, or a move to another volume, moves bytes: do it off the main thread. The viewer advances
         // at once; the change joins the undo stack when it completes, and a failure puts the file back.
@@ -209,7 +286,7 @@ final class FileActions {
                     switch result {
                     case .success(let change):
                         actions.operations.record(change)
-                        if !copy { actions.onLateResult?(FileActionResult(toast: toast(for: change))) }
+                        if !copy { actions.onLateResult?(moved(change, viewerDroppedIt: true)) }
                     case .failure(let error):
                         actions.onLateResult?(FileActionResult(outcome: copy ? .unchanged : .restored(file), toast: "\(error)"))
                     }
@@ -221,7 +298,7 @@ final class FileActions {
         do {
             let change = try operations.move(file.url, toFolder: folder)
             lastDestination = folder
-            return FileActionResult(outcome: .removed(file), toast: toast(for: change))
+            return moved(change, viewerDroppedIt: false)
         } catch {
             return FileActionResult(toast: "\(error)")
         }
