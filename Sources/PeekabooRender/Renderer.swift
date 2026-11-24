@@ -641,7 +641,7 @@ public final class Renderer {
                     q.t = SIMD2(Int32(t.x), Int32(t.y))
                     q.canvasSize = SIMD2(Int32(c.width), Int32(c.height))
                     if c.source != ObjectIdentifier(g) || c.level < wanted { waitingForLevel = true }
-                } else if Trace.now() < cheapUntil || g.bestLevel(atMost: wanted) < wanted && image.tier != .preview && wanted > 0 && canvas == nil {
+                } else if Trace.now() < cheapUntil || g.bestLevel(atMost: wanted) < wanted && image.tier != .preview && wanted > 0 {
                     // Gesture path (or the wanted level is still building): trilinear over the pyramid.
                     mode = .trilinear
                     lastFrameWasCheap = true
