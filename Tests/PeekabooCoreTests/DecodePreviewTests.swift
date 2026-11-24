@@ -158,8 +158,8 @@ final class DecodePreviewTests: XCTestCase {
         let topLeft = pixel(p, p.width / 4, p.height / 4), bottomRight = pixel(p, p.width * 3 / 4, p.height * 3 / 4)
         XCTAssert(topLeft.0 > 230 && topLeft.1 > 230 && topLeft.2 > 230, "MPF preview decoded (white), got \(topLeft)")
         XCTAssert(bottomRight.0 > 230 && bottomRight.1 < 30 && bottomRight.2 < 30, "got \(bottomRight)")
-        if IOSurfaceSPI.isAvailable, case .surface = p.storage {} else if IOSurfaceSPI.isAvailable {
-            XCTFail("MPF previews go through the IOSurface (hardware JPEG) path")
+        if IOSurfaceSPI.isAvailable, case .surface = p.storage {
+            XCTAssertEqual(p.layout, .bgra8, "MPF previews go through the IOSurface (hardware JPEG) path")
         }
         // Larger tiers still come from the primary image.
         let screen = try decoder.decode(url, tier: .screen, targetLongSide: 1200, pool: pool)
