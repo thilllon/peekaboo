@@ -156,7 +156,7 @@ final class SchedulerTests: XCTestCase {
 
     func testSweepRingOrderAndPausedWhileSkimming() {
         let (nav, now) = steady(100, intervalMs: 1000)
-        let plan = planPrefetch(nav, now: now + ms, tuning: PrefetchTuning(), context: context(sweepSlots: 10))
+        let plan = planPrefetch(nav, now: now + 30 * ms, tuning: PrefetchTuning(), context: context(sweepSlots: 10))
         let sweep = plan.jobs.filter { $0.kind == .sweep }
         XCTAssertEqual(sweep.count, 10)
         XCTAssertTrue(sweep.allSatisfy { $0.tier == .preview })
@@ -167,8 +167,25 @@ final class SchedulerTests: XCTestCase {
         XCTAssertTrue(skim.jobs.allSatisfy { $0.kind != .sweep }, "sweep pauses while skimming")
     }
 
-    func testSpeculativeFullAfterDwellWhenCheap() {
+    /// The ring scan visits up to 2×1024 files; the pass that answers a key press leaves it out, a wake runs it.
+    func testSweepWaitsForThePassAfterTheNavigation() {
         let (nav, now) = steady(100, intervalMs: 1000)
+        let tuning = PrefetchTuning()
+        let atKey = planPrefetch(nav, now: now + ms, tuning: tuning, context: context(sweepSlots: 10))
+        XCTAssertTrue(atKey.jobs.allSatisfy { $0.kind != .sweep }, "the key press waits for the sweep's ring scan")
+        XCTAssertFalse(atKey.sweepScanned)
+        XCTAssertEqual(atKey.wakeAfterMs ?? .infinity, tuning.sweepAfterNavMs - 1, accuracy: 0.5)
+        let later = planPrefetch(nav, now: now + UInt64(tuning.sweepAfterNavMs + 1) * ms, tuning: tuning,
+                                 context: context(sweepSlots: 10))
+        XCTAssertEqual(later.jobs.filter { $0.kind == .sweep }.count, 10)
+        XCTAssertTrue(later.sweepScanned)
+    }
+
+    func testSpeculativeFullAfterDwellWhenCheap() {
+        // Just opened (no rhythm yet): the fixed dwell.
+        var nav = NavModel()
+        let now: UInt64 = 10_000 * ms
+        nav.navigate(to: 100, now: now, count: 2000, isRepeat: false)
         let tuning = PrefetchTuning()
         let early = planPrefetch(nav, now: now + 100 * ms, tuning: tuning, context: context(cached: [100]))
         XCTAssertFalse(early.jobs.contains { $0.tier == .full })
@@ -178,6 +195,33 @@ final class SchedulerTests: XCTestCase {
         let costly = planPrefetch(nav, now: now + 401 * ms, tuning: tuning,
                                   context: context(cached: [100], costs: [.preview: 4, .screen: 30, .full: 900]))
         XCTAssertFalse(costly.jobs.contains { $0.tier == .full }, "expensive full resolution waits for zoom intent")
+    }
+
+    /// Stepping at ~420 ms per image, a fixed 400 ms dwell started a full decode just before every key press (all of
+    /// them wasted). While the user steps at a rhythm, the full tier is speculated once they stay clearly longer.
+    func testSpeculativeFullFollowsTheRhythm() {
+        let tuning = PrefetchTuning()
+        let (nav, now) = steady(100, intervalMs: 420)
+        let dwell = tuning.fullDwellMs(for: nav)
+        XCTAssertEqual(dwell, 1.5 * nav.emaIntervalMs, accuracy: 0.001)
+        let usual = planPrefetch(nav, now: now + 401 * ms, tuning: tuning, context: context(cached: [100]))
+        XCTAssertFalse(usual.jobs.contains { $0.tier == .full }, "speculated before the user usually leaves")
+        XCTAssertEqual(usual.wakeAfterMs ?? 0, dwell - 401, accuracy: 0.5)
+        let lingering = planPrefetch(nav, now: now + UInt64((dwell + 1) * 1e6), tuning: tuning, context: context(cached: [100]))
+        XCTAssertTrue(lingering.jobs.contains { $0.tier == .full && $0.index == 100 })
+        // Slow browsing: capped.
+        let (slow, _) = steady(100, intervalMs: 2000)
+        XCTAssertEqual(tuning.fullDwellMs(for: slow), 1500, accuracy: 0.001)
+        // A/B toggling keeps both full tiers pinned: the fixed dwell.
+        var ab = NavModel()
+        var t: UInt64 = 1000 * ms
+        ab.navigate(to: 5, now: t, count: 100, isRepeat: false)
+        for target in [6, 5, 6, 5] {
+            t += 300 * ms
+            ab.navigate(to: target, now: t, count: 100, isRepeat: false)
+        }
+        XCTAssertTrue(ab.isAB)
+        XCTAssertEqual(tuning.fullDwellMs(for: ab), tuning.fullDwellMs)
     }
 
     func testCostModelLearnsAndScales() {

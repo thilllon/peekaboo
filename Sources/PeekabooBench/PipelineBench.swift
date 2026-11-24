@@ -11,8 +11,10 @@ import PeekabooCore
 /// screen-tier window (A/B against the default).
 ///
 /// Replays navigation traces against the real decoder and reports, per trace, the share of navigations that found
-/// the sharp tier cached (hit rate), time-to-first-pixel and time-to-sharp percentiles, decode/waste counts and the
-/// main-thread cost of `navigate`. The corpus defaults to `$PEEKABOO_CORPUS` (its `nav` subfolder when present).
+/// the sharp tier cached (hit rate), time-to-first-pixel and time-to-sharp percentiles, decode/waste counts, the
+/// main-thread cost of `navigate`, and the pipeline's whole main-thread time per navigation with the longest run-loop
+/// iteration (deliveries, evictions, releases, replans: what a key press can queue behind). The corpus defaults to
+/// `$PEEKABOO_CORPUS` (its `nav` subfolder when present).
 func runPipelineBench(_ args: ArraySlice<String>) throws {
     var corpus = ProcessInfo.processInfo.environment["PEEKABOO_CORPUS"]
     var traceName = "all"
@@ -56,7 +58,8 @@ func runPipelineBench(_ args: ArraySlice<String>) throws {
 
     let traces = makeTraces(count: files.count, quick: quick).filter { traceName == "all" || $0.name == traceName }
     guard !traces.isEmpty else { throw BenchError.usage("unknown trace \(traceName)") }
-    print("trace    events  hit%  px@0%  first-pixel p50/p90/p99 ms  sharp p50/p90/p99 ms   decodes wasted  nav() p50/p99 µs")
+    print("trace    events  hit%  px@0%  first-pixel p50/p90/p99 ms  sharp p50/p90/p99 ms   decodes wasted  nav() p50/p99 µs"
+          + "  main ms/nav max")
     for trace in traces {
         let result = replay(trace, files: files, device: device, screen: screen, options: options)
         print(result.line(trace.name))
@@ -129,6 +132,8 @@ private struct ReplayResult {
     var decodes = 0
     var wasted = 0
     var navigateMicros: [Double] = []
+    /// Main-thread busy time of every run-loop iteration during the trace (ms).
+    var mainBusy: [Double] = []
 
     func line(_ name: String) -> String {
         func pct(_ values: [Double]) -> String {
@@ -142,7 +147,8 @@ private struct ReplayResult {
             + pct(firstPixel).padding(toLength: 26, withPad: " ", startingAt: 0)
             + (pct(sharp) + censored).padding(toLength: 23, withPad: " ", startingAt: 0)
             + String(format: "%7d %6d  ", decodes, wasted)
-            + "\(fmt(percentile(navigateMicros, 0.5)))/\(fmt(percentile(navigateMicros, 0.99)))"
+            + "\(fmt(percentile(navigateMicros, 0.5)))/\(fmt(percentile(navigateMicros, 0.99)))".padding(toLength: 16, withPad: " ", startingAt: 0)
+            + String(format: "  %.2f %.2f", events == 0 ? 0 : mainBusy.reduce(0, +) / Double(events), mainBusy.max() ?? 0)
     }
 }
 
@@ -191,11 +197,21 @@ private func replay(_ trace: NavTrace, files: [ImageFile], device: MTLDevice, sc
     if !options.cold { spinRunLoop(until: Date().addingTimeInterval(0.8)) { false } }
     let decodesBefore = pipeline.stats.decodes, wastedBefore = pipeline.stats.wasted
 
+    // Busy time of each main run-loop iteration (woken → about to sleep) while the trace plays.
+    let busy = BusyMeter()
+    let observer = CFRunLoopObserverCreateWithHandler(
+        nil, CFRunLoopActivity.afterWaiting.rawValue | CFRunLoopActivity.beforeWaiting.rawValue, true, 0) { _, activity in
+        if activity == .afterWaiting { busy.woke = Trace.now() } else { busy.sleeping() }
+    }
+    CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .defaultMode)
+    defer { CFRunLoopRemoveObserver(CFRunLoopGetMain(), observer, .defaultMode) }
+
     let origin = Trace.now()
     for event in trace.events {
         let due = origin + UInt64(event.atMs * 1e6)
         while Trace.now() < due {
-            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(min(0.001, Double(due &- Trace.now()) / 1e9)))
+            // Sleep until the event (pipeline work wakes the run loop); polling would count as main-thread time.
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(Double(due &- Trace.now()) / 1e9))
         }
         finish()
         let file = files[event.index]
@@ -221,11 +237,25 @@ private func replay(_ trace: NavTrace, files: [ImageFile], device: MTLDevice, sc
     finish()
     result.decodes = pipeline.stats.decodes - decodesBefore
     result.wasted = pipeline.stats.wasted - wastedBefore
+    result.mainBusy = busy.iterations
     return result
 }
 
+/// Main-thread busy time per run-loop iteration (main thread only).
+private final class BusyMeter {
+    var woke: UInt64 = 0
+    private(set) var iterations: [Double] = []
+
+    func sleeping() {
+        guard woke != 0 else { return }
+        iterations.append(Double(Trace.now() &- woke) / 1e6)
+        woke = 0
+    }
+}
+
 private func spinRunLoop(until deadline: Date, _ done: () -> Bool) {
-    while !done() && Date() < deadline { RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.001)) }
+    // `done` can only change when pipeline work runs, which wakes the run loop.
+    while !done() && Date() < deadline { RunLoop.main.run(mode: .default, before: deadline) }
 }
 
 private func percentile(_ values: [Double], _ p: Double) -> Double {

@@ -8,15 +8,16 @@ struct CostModel {
         case jpeg, heic, avif, png, webp, tiff, gif, raw, other
     }
 
-    private struct Key: Hashable {
-        let family: Family
-        let bucket: Int8
-        let tier: Tier
-    }
-
-    private var ewma: [Key: Double] = [:]
-    private var familyEWMA: [Key: Double] = [:]
+    /// EWMAs per (family, megapixel bucket −1…4, tier) and per (family, tier); NaN = nothing measured yet. Flat
+    /// arrays: the planner asks for thousands of estimates per pass on large folders, a hashed key costs ~10× more.
+    private static let buckets = 6
+    private var ewma = [Double](repeating: .nan, count: Family.allCases.count * buckets * 3)
+    private var familyEWMA = [Double](repeating: .nan, count: Family.allCases.count * 3)
     var alpha = 0.12
+
+    private static func index(_ family: Family, _ bucket: Int8, _ tier: Tier) -> Int {
+        (family.rawValue * buckets + Int(bucket) + 1) * 3 + tier.rawValue
+    }
 
     static let rawExtensions: Set<String> = [
         "arw", "cr2", "cr3", "crw", "nef", "nrw", "raf", "dng", "orf", "rw2", "pef", "srw", "3fr", "iiq",
@@ -74,8 +75,10 @@ struct CostModel {
     }
 
     func estimate(family: Family, megapixels mp: Double?, tier: Tier) -> Double {
-        if let value = ewma[Key(family: family, bucket: Self.bucket(megapixels: mp), tier: tier)] { return value }
-        if let value = familyEWMA[Key(family: family, bucket: -1, tier: tier)] { return value }
+        let measured = ewma[Self.index(family, Self.bucket(megapixels: mp), tier)]
+        if !measured.isNaN { return measured }
+        let familyWide = familyEWMA[family.rawValue * 3 + tier.rawValue]
+        if !familyWide.isNaN { return familyWide }
         let seed = Self.seed(family)
         let base = tier == .preview ? seed.0 : tier == .screen ? seed.1 : seed.2
         // Embedded previews do not scale with the image; decodes do (roughly linearly in pixels).
@@ -90,9 +93,9 @@ struct CostModel {
 
     mutating func record(family: Family, megapixels: Double?, tier: Tier, ms: Double, concurrency: Int) {
         let normalised = ms / (1 + alpha * Double(max(0, concurrency - 1)))
-        let key = Key(family: family, bucket: Self.bucket(megapixels: megapixels), tier: tier)
-        ewma[key] = ewma[key].map { 0.7 * $0 + 0.3 * normalised } ?? normalised
-        let fkey = Key(family: family, bucket: -1, tier: tier)
-        familyEWMA[fkey] = familyEWMA[fkey].map { 0.7 * $0 + 0.3 * normalised } ?? normalised
+        let i = Self.index(family, Self.bucket(megapixels: megapixels), tier)
+        ewma[i] = ewma[i].isNaN ? normalised : 0.7 * ewma[i] + 0.3 * normalised
+        let f = family.rawValue * 3 + tier.rawValue
+        familyEWMA[f] = familyEWMA[f].isNaN ? normalised : 0.7 * familyEWMA[f] + 0.3 * normalised
     }
 }

@@ -24,6 +24,8 @@ final class FakeDecoder: ImageDecoder, @unchecked Sendable {
     var latencyMs: [Tier: Double]
     var lanes: [Tier: DecodeLane]
     var failing: Set<String> = []
+    /// Time a metadata probe takes (a slow volume, a RAW file).
+    var probeDelayMs: Double = 0
     /// Pixel size per tier (the pool rounds every buffer up to 1 MB, so each cached tier costs 1 MB).
     let fullWidth: Int, fullHeight: Int
 
@@ -44,6 +46,7 @@ final class FakeDecoder: ImageDecoder, @unchecked Sendable {
 
     func probe(_ url: URL) throws -> ImageInfo {
         lock.lock(); _probes.append(url); lock.unlock()
+        if probeDelayMs > 0 { usleep(useconds_t(probeDelayMs * 1000)) }
         return ImageInfo(pixelWidth: fullWidth, pixelHeight: fullHeight, orientation: .up, typeIdentifier: "public.jpeg",
                          hasAlpha: false, hasGainMap: false, frameCount: 1, colorProfileName: nil, exif: [:])
     }
@@ -94,14 +97,22 @@ class PipelineTestCase: XCTestCase {
         }
     }
 
-    func makePipeline(_ decoder: FakeDecoder, configure: (inout PipelineConfig) -> Void = { _ in }) -> ImagePipeline {
+    func makePipeline(_ decoder: ImageDecoder, configure: (inout PipelineConfig) -> Void = { _ in }) -> ImagePipeline {
+        makePipeline(decoder, quickLook: nil, configure: configure)
+    }
+
+    /// `quickLook` replaces QuickLook's thumbnail generator (for `quickLookSweep = true`).
+    func makePipeline(_ decoder: ImageDecoder, quickLook: DecodeScheduler.QuickLookSource?,
+                      configure: (inout PipelineConfig) -> Void = { _ in }) -> ImagePipeline {
         var config = PipelineConfig(screenLongSide: 1024, previewLongSide: 256, memoryBudget: 1 << 30)
         config.readAhead = false
         config.monitorsMemoryPressure = false
         config.sweepLanes = 0
         config.quickLookSweep = false
         configure(&config)
-        return ImagePipeline(decoder: decoder, pool: PixelBufferPool(device: device), config: config)
+        let pool = PixelBufferPool(device: device)
+        if let quickLook { return ImagePipeline(decoder: decoder, pool: pool, config: config, quickLook: quickLook) }
+        return ImagePipeline(decoder: decoder, pool: pool, config: config)
     }
 
     @discardableResult
@@ -289,6 +300,28 @@ final class PipelineTests: PipelineTestCase {
         pipeline.setFiles([changed] + Array(survivors.dropFirst()), index: 0)
         XCTAssertFalse(has(pipeline, changed, .screen))
         XCTAssertTrue(spin { self.has(pipeline, changed, .screen) })
+    }
+
+    /// Files are indexed by name (unique within a folder); a set opened from several folders may repeat a name, and
+    /// each file still keeps its own tiers.
+    func testFilesWithTheSameNameInDifferentFoldersStayApart() {
+        let decoder = FakeDecoder()
+        let pipeline = makePipeline(decoder)
+        let files = ["a", "b", "c"].enumerated().map { i, folder in
+            ImageFile(url: URL(fileURLWithPath: "/peekaboo-test/\(folder)/x.jpg"), name: "x.jpg", byteSize: 1000,
+                      modified: 1, fileID: UInt64(i + 1))
+        }
+        pipeline.setFiles(files, index: 1)
+        XCTAssertTrue(spin { files.allSatisfy { self.has(pipeline, $0, .screen) } })
+        spin(for: 0.1)
+        for file in files {
+            XCTAssertEqual(decoder.calls(.screen).filter { $0.url == file.url }.count, 1, file.url.path)
+        }
+        pipeline.setFiles([files[0], files[2]], index: 1)
+        XCTAssertTrue(has(pipeline, files[0], .screen))
+        XCTAssertTrue(has(pipeline, files[2], .screen))
+        XCTAssertTrue(pipeline.cachedTiers(for: files[1]).isEmpty, "a removed file's tiers are dropped")
+        XCTAssertEqual(pipeline.currentFile?.url, files[2].url)
     }
 
     func testOpenedFileSurvivesFolderListing() {

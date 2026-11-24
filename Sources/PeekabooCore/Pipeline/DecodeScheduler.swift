@@ -12,33 +12,34 @@ struct DecodeJob: Sendable {
     let file: ImageFile
     var prio: Double
     var kind: JobKind
-    let lane: DecodeLane
+    /// Resource the job is charged to. Planned from the metadata the pipeline holds (before a file's first decode only
+    /// its extension), then settled by the worker once it has probed the file.
+    var lane: DecodeLane
     let targetLongSide: Int
     /// Estimated cost (ms), for the feasibility test.
     let estimateMs: Double
     var sequence: UInt64 = 0
     /// Serve the preview from QuickLook's thumbnail cache (sweep only).
     var quickLook = false
+    /// Metadata the pipeline already holds for the file; nil before its first decode (the worker probes it).
+    var info: ImageInfo?
 }
 
 struct DecodeOutcome: Sendable {
     let job: DecodeJob
     let result: Result<DecodedImage, Error>
-    /// Metadata of the file if known when the decode finished (probed after the first decode of each file).
+    /// Metadata of the file: the job's, or probed by the worker before the decode (nil only when that probe failed).
     let info: ImageInfo?
+    /// The file as `stat` saw it before and after the decode, when both agreed: what was decoded. Nil when the file
+    /// could not be stat'ed, or changed while it was decoded (see `changedDuringDecode`).
+    let stamp: FileStamp?
+    /// Size or modification time changed while the file was decoded (it is being written): the pixels match no version.
+    let changedDuringDecode: Bool
+    /// When `stamp` was read (`Trace.now()`), to tell whether it is newer than the listing.
+    let stampedAt: UInt64
     let wallMs: Double
     /// Decodes running when this one started, itself included.
     let concurrency: Int
-}
-
-/// Thread-safe metadata cache shared by the main thread and the decode workers.
-final class InfoStore: @unchecked Sendable {
-    private var infos: [URL: ImageInfo] = [:]
-    private let lock = NSLock()
-
-    func get(_ url: URL) -> ImageInfo? { lock.lock(); defer { lock.unlock() }; return infos[url] }
-    func set(_ url: URL, _ info: ImageInfo) { lock.lock(); infos[url] = info; lock.unlock() }
-    func remove(_ url: URL) { lock.lock(); infos[url] = nil; lock.unlock() }
 }
 
 /// Lane limits (docs/DESIGN.md §3 "Lanes").
@@ -67,8 +68,9 @@ struct LaneLimits: Sendable, Equatable {
 /// The main thread replaces the queued set on every replan (`submit`), which cancels queued work instantly;
 /// running decodes cannot be aborted and finish normally. Workers pick the best runnable job under the lock:
 /// - visible jobs may use every decode lane, including the reserved one (and one slot above the CPU/general caps);
-/// - prefetch waits while any visible job is queued or running (foreground gate), never holds the reserved
-///   lane and respects the per-resource caps (hardware engines ≤ 2, general ImageIO ≤ 4, CPU fills the rest);
+/// - prefetch waits while any visible decode is queued or running (foreground gate; QuickLook probes excluded),
+///   never holds the reserved lane and respects the per-resource caps (hardware engines ≤ 2, general ImageIO ≤ 4,
+///   CPU fills the rest);
 /// - sweep jobs run on their own utility lanes only while no decode-lane work is queued or gated.
 final class DecodeScheduler: @unchecked Sendable {
     private struct Active {
@@ -92,14 +94,23 @@ final class DecodeScheduler: @unchecked Sendable {
     private let limits: LaneLimits
     private let decoder: ImageDecoder
     private let pool: PixelBufferPool
-    private let infos: InfoStore
+    private let quickLook: QuickLookSource
     private let deliver: @Sendable (DecodeOutcome) -> Void
 
-    init(decoder: ImageDecoder, pool: PixelBufferPool, infos: InfoStore, limits: LaneLimits,
+    /// Where QuickLook previews come from (`systemQuickLook`; a seam for tests).
+    typealias QuickLookSource = @Sendable (_ url: URL, _ longSide: Int, _ info: ImageInfo?, _ pool: PixelBufferPool,
+                                           _ timeout: TimeInterval) -> DecodedImage?
+
+    static let systemQuickLook: QuickLookSource = { url, longSide, info, pool, timeout in
+        QuickLookPreview.preview(url, longSide: longSide, info: info, pool: pool, timeout: timeout)
+    }
+
+    init(decoder: ImageDecoder, pool: PixelBufferPool, limits: LaneLimits,
+         quickLook: @escaping QuickLookSource = DecodeScheduler.systemQuickLook,
          deliver: @escaping @Sendable (DecodeOutcome) -> Void) {
         self.decoder = decoder
         self.pool = pool
-        self.infos = infos
+        self.quickLook = quickLook
         self.limits = limits
         self.deliver = deliver
         for n in 0..<max(1, limits.decodeLanes) {
@@ -191,51 +202,77 @@ final class DecodeScheduler: @unchecked Sendable {
                 if picked != nil { break }
                 condition.wait()
             }
-            guard !stopped, let job = picked else { condition.unlock(); return }
+            guard !stopped, var job = picked else { condition.unlock(); return }
             queued[job.key] = nil
             active[job.key] = Active(job: job, running: true)
-            if job.kind == .sweep { sweepByLane[job.lane, default: 0] += 1 } else { runningByLane[job.lane, default: 0] += 1 }
+            chargeLocked(job, 1)
             runningTotal += 1
             if job.kind == .prefetch { runningPrefetch += 1 }
             if job.kind == .sweep { runningSweep += 1 }
             let concurrency = runningTotal
             condition.unlock()
 
-            let outcome = run(job, concurrency: concurrency)
+            let outcome = run(&job, concurrency: concurrency)
 
             condition.lock()
             active[job.key]?.running = false
-            if job.kind == .sweep { sweepByLane[job.lane, default: 1] -= 1 } else { runningByLane[job.lane, default: 1] -= 1 }
+            chargeLocked(job, -1)
             runningTotal -= 1
             if job.kind == .prefetch { runningPrefetch -= 1 }
             if job.kind == .sweep { runningSweep -= 1 }
             condition.broadcast()
             condition.unlock()
             deliver(outcome)
-            // Metadata rides along with the first decode of a file, after its pixels are on their way (cheap:
-            // 0.07–0.6 ms, the file is warm); the main thread picks it up from the shared store.
-            let url = job.key.url
-            if case .success = outcome.result, infos.get(url) == nil, let probed = try? decoder.probe(url) {
-                infos.set(url, probed)
-            }
         }
     }
 
-    private func run(_ job: DecodeJob, concurrency: Int) -> DecodeOutcome {
+    /// Count `job` in (`delta` 1) or out of (−1) its lane: the sweep lanes are counted apart.
+    private func chargeLocked(_ job: DecodeJob, _ delta: Int) {
+        if job.kind == .sweep {
+            sweepByLane[job.lane, default: 0] += delta
+        } else {
+            runningByLane[job.lane, default: 0] += delta
+        }
+    }
+
+    /// Move a running job to the lane its decode path uses (it may briefly exceed that lane's cap; later picks
+    /// respect the corrected counts).
+    private func recharge(_ job: inout DecodeJob, to lane: DecodeLane) {
+        condition.lock()
+        chargeLocked(job, -1)
+        job.lane = lane
+        chargeLocked(job, 1)
+        active[job.key]?.job.lane = lane
+        condition.broadcast()  // the lane it left has room now
+        condition.unlock()
+    }
+
+    private func run(_ job: inout DecodeJob, concurrency: Int) -> DecodeOutcome {
         if job.kind == .visible { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) }
         defer { if job.kind == .visible { pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0) } }
         let url = job.key.url
+        // `stat` before and after (~2 µs each): a file written meanwhile, or since it was listed, is caught here.
+        let before = FileStamp.read(url)
+        // First decode of the file: read its metadata before decoding (0.03–0.09 ms; the decode reuses the parse), so
+        // the outcome carries it to the planner, and charge the job to the lane its decode path really takes. The
+        // planner only knew the extension: a progressive JPEG decodes with libjpeg-turbo on a CPU lane, not on the
+        // two hardware engines it would otherwise hold for 300 ms.
+        if job.info == nil, let info = try? decoder.probe(url) {
+            job.info = info
+            if !job.quickLook {
+                let lane = decoder.lane(for: url, info: info, tier: job.key.tier)
+                if lane != job.lane { recharge(&job, to: lane) }
+            }
+        }
         let start = Trace.now()
+        let tier = job.key.tier
         let interval = Trace.signposter.beginInterval("decode", id: Trace.signposter.makeSignpostID(),
-                                                      "\(url.lastPathComponent) tier \(job.key.tier.rawValue)")
+                                                      "\(url.lastPathComponent) tier \(tier.rawValue)")
         let result: Result<DecodedImage, Error>
         if job.quickLook {
             // Full size for layout comes from the metadata; QuickLook applies the EXIF orientation itself.
-            var known = infos.get(url)
-            if known == nil, let probed = try? decoder.probe(url) { infos.set(url, probed); known = probed }
             let preview = autoreleasepool {
-                QuickLookPreview.preview(url, longSide: job.targetLongSide, info: known, pool: pool,
-                                         timeout: job.kind == .visible ? 0.5 : 2)
+                quickLook(url, job.targetLongSide, job.info, pool, job.kind == .visible ? 0.5 : 2)
             }
             result = preview.map { .success($0) } ?? .failure(QuickLookPreview.Miss())
         } else {
@@ -246,13 +283,21 @@ final class DecodeScheduler: @unchecked Sendable {
             }
         }
         Trace.signposter.endInterval("decode", interval)
-        return DecodeOutcome(job: job, result: result, info: infos.get(url), wallMs: Trace.ms(since: start),
+        let wallMs = Trace.ms(since: start)
+        let after = FileStamp.read(url)
+        return DecodeOutcome(job: job, result: result, info: job.info, stamp: before == after ? after : nil,
+                             changedDuringDecode: before != after, stampedAt: Trace.now(), wallMs: wallMs,
                              concurrency: concurrency)
     }
 
+    /// The visible image's own decodes are queued or running. A QuickLook probe does not count: it waits on
+    /// QuickLook's processes (up to 0.5 s) without using a decode resource, and holding prefetch back for it would
+    /// delay the neighbours long after the visible image is sharp.
     private var foregroundBusyLocked: Bool {
-        if queued.values.contains(where: { $0.kind == .visible }) { return true }
-        for key in visibleKeys where active[key]?.running == true { return true }
+        if queued.values.contains(where: { $0.kind == .visible && !$0.quickLook }) { return true }
+        for key in visibleKeys {
+            if let entry = active[key], entry.running, !entry.job.quickLook { return true }
+        }
         return false
     }
 

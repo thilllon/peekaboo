@@ -101,6 +101,20 @@ final class FolderTests: XCTestCase {
         XCTAssertEqual(bulk.count, distinct + 1)
     }
 
+    /// The decode workers' `stat` and the listing agree to the bit (size and modification time), or every rescan
+    /// would take decoded files for changed ones and decode them again.
+    func testListingStampsMatchStat() throws {
+        try touch("a.jpg", bytes: 10)
+        try touch("b.jpg", bytes: 2000)
+        try FileManager.default.createSymbolicLink(at: directory.appendingPathComponent("link.jpg"),
+                                                   withDestinationURL: directory.appendingPathComponent("b.jpg"))
+        let bulk = try XCTUnwrap(FolderScanner.listBulk(directory))
+        for file in bulk + (try FolderScanner.listWithFileManager(directory)) {
+            XCTAssertEqual(FileStamp.read(file.url), FileStamp(file), file.name)
+        }
+        XCTAssertEqual(bulk.count, 3)
+    }
+
     func testScanFiltersAndSortsLikeFinder() throws {
         let names = ["b.jpg", "a10.png", "a9.heic", "notes.txt", "A1.JPG", "clip.mov", "x.webp"]
         for name in names { try touch(name) }
@@ -110,6 +124,34 @@ final class FolderTests: XCTestCase {
         XCTAssertFalse(scanned.contains("notes.txt"))
         let browse = try FolderScanner.browse([directory.appendingPathComponent("a10.png")])
         XCTAssertEqual(browse.files[browse.index].name, "a10.png")
+    }
+
+    /// `Peekaboo ~/Pictures/dsc_0042.jpg` for a file stored as `DSC_0042.JPG` (APFS ignores case): that file is shown,
+    /// not the folder's first image.
+    func testBrowseFindsTheOpenedFileWhateverTheLetterCase() throws {
+        for name in ["a.jpg", "DSC_0042.JPG", "z.jpg"] { try touch(name) }
+        let browse = try FolderScanner.browse([directory.appendingPathComponent("dsc_0042.jpg")])
+        XCTAssertEqual(browse.files.map(\.name), ["a.jpg", "DSC_0042.JPG", "z.jpg"])
+        XCTAssertEqual(browse.files[browse.index].name, "DSC_0042.JPG")
+        let decomposed = "Cafe\u{301} 2.jpg"
+        try touch("Café 2.jpg")
+        let nfd = try FolderScanner.browse([directory.appendingPathComponent(decomposed)])
+        XCTAssertEqual(nfd.files[nfd.index].name.precomposedStringWithCanonicalMapping, "Café 2.jpg")
+    }
+
+    /// An opened file the listing leaves out (hidden) is browsed at its Finder position.
+    func testBrowseKeepsAnOpenedHiddenFile() throws {
+        for name in ["a.jpg", "m.jpg", "z.jpg"] { try touch(name) }
+        let hidden = directory.appendingPathComponent("m2.jpg")
+        try touch(hidden.lastPathComponent)
+        var values = URLResourceValues()
+        values.isHidden = true
+        var mutable = hidden
+        try mutable.setResourceValues(values)
+        let browse = try FolderScanner.browse([hidden])
+        XCTAssertEqual(browse.files.map(\.name), ["a.jpg", "m.jpg", "m2.jpg", "z.jpg"])
+        XCTAssertEqual(browse.index, 2)
+        XCTAssertEqual(browse.files[2].byteSize, 3)
     }
 
     func testScanOfLargeFolderIsFast() throws {
