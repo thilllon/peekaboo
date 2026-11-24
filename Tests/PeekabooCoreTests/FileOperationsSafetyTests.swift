@@ -127,9 +127,6 @@ final class FileOperationsSafetyTests: XCTestCase {
         // The examples of docs/CONFIG.md.
         XCTAssertEqual(FileOperations.execCommand(#"printf %s $'{name}\n'"#), #"printf %s $''"${PEEKABOO_NAME}"$'\n'"#)
         XCTAssertEqual(FileOperations.execCommand("echo $(({index} + 1))"), "echo $((${PEEKABOO_INDEX} + 1))")
-        // The deprecated entry point gives the same command whatever the file.
-        XCTAssertEqual(FileOperations.expand("cp {path} x", file: URL(fileURLWithPath: "/a/$(rm -rf ~).jpg"), index: 0, count: 1),
-                       #"cp "${PEEKABOO_PATH}" x"#)
         let environment = FileOperations.execEnvironment(file: URL(fileURLWithPath: "/Photos/Trip/IMG_0042.HEIC"), index: 41, count: 120)
         XCTAssertEqual(environment, [
             "PEEKABOO_PATH": "/Photos/Trip/IMG_0042.HEIC", "PEEKABOO_DIR": "/Photos/Trip", "PEEKABOO_NAME": "IMG_0042.HEIC",

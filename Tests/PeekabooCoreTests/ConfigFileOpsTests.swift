@@ -162,7 +162,7 @@ final class ConfigFileOpsTests: XCTestCase {
         let file = URL(fileURLWithPath: "/Photos/It's a \"trip\"/IMG $1 `x`.HEIC")
         XCTAssertEqual(FileOperations.shellQuote("it's"), #"'it'\''s'"#)
         // The command never contains the file's text, only quoted variable references.
-        XCTAssertEqual(FileOperations.expand("open -R {path}", file: file, index: 4, count: 120), #"open -R "${PEEKABOO_PATH}""#)
+        XCTAssertEqual(FileOperations.execCommand("open -R {path}"), #"open -R "${PEEKABOO_PATH}""#)
         XCTAssertEqual(FileOperations.execCommand("echo {dir} {name} {stem} {ext} {index}/{count}"),
                        #"echo "${PEEKABOO_DIR}" "${PEEKABOO_NAME}" "${PEEKABOO_STEM}" "${PEEKABOO_EXT}" "${PEEKABOO_INDEX}"/"${PEEKABOO_COUNT}""#)
         XCTAssertEqual(FileOperations.execEnvironment(file: file, index: 4, count: 120)["PEEKABOO_DIR"], #"/Photos/It's a "trip""#)

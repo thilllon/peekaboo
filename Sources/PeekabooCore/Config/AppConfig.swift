@@ -34,12 +34,6 @@ public struct AppConfig: Sendable, Equatable {
     public var ratingStorage: RatingStorage = .finderTags
     /// `rating.star`: a rating of 3 is the Finder tag of three of these.
     public var starCharacter = "★"
-    /// `rating.auto_advance`: plain rating/label/flag keys also advance (already applied to `keymap`).
-    public var autoAdvance = false
-    /// `keymap.vim` (already applied to `keymap`).
-    public var vimKeys = false
-    /// `keymap.defaults` (already applied to `keymap`).
-    public var keymapDefaults = true
 
     public init() {}
     public static let `default` = AppConfig()
@@ -100,16 +94,6 @@ public final class ConfigStore {
     public func load() {
         ConfigStore.current = self
         apply(queue.sync { read(force: true) })
-    }
-
-    /// Re-read the file in the background and apply it on the main thread (`app.reload_config`).
-    public func reload() {
-        ConfigStore.current = self
-        queue.async { [weak self] in
-            guard let self else { return }
-            let outcome = self.read(force: true)
-            DispatchQueue.main.async { self.apply(outcome) }
-        }
     }
 
     /// Reload whenever the file is saved.

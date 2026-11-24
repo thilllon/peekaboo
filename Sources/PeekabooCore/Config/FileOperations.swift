@@ -543,6 +543,7 @@ public final class FileOperations {
 
     /// Identity and version of the item at a path (not following a symbolic link): another file, or the
     /// same file after an edit, has a different stamp. Renames and tag changes keep it.
+    // Every field is read by the synthesized ==, which is all a stamp is for (periphery reports them as assign-only).
     struct Stamp: Equatable {
         let device: Int64
         let inode: UInt64
@@ -567,6 +568,7 @@ public final class FileOperations {
 
     /// The item at a path exactly as it is: its `Stamp` plus the status-change time, which also moves on a
     /// write that keeps the size and modification time, and on tag, permission and lock changes.
+    // Every field is read by the synthesized == (periphery reports them as assign-only).
     private struct Snapshot: Equatable {
         let stamp: Stamp
         let changeSeconds: Int
@@ -818,13 +820,7 @@ public final class FileOperations {
     /// always exactly one word and is never parsed as shell code. In `$((…))`, where quotes are a syntax error,
     /// `{index}` and `{count}` (digits only) stand bare and the others stay quoted, so the shell refuses them
     /// rather than evaluate file names as arithmetic. No file-derived text goes into the command: run it with
-    /// `execEnvironment(…)`. `\{path}` and `${path}` are left alone. The arguments are unused (kept for source
-    /// compatibility).
-    public static func expand(_ template: String, file: URL, index: Int, count: Int) -> String {
-        execCommand(template)
-    }
-
-    /// See `expand(_:file:index:count:)`.
+    /// `execEnvironment(…)`. `\{path}` and `${path}` are left alone.
     public static func execCommand(_ template: String) -> String {
         enum Context: Equatable {
             case plain, single, double, backtick, command(depth: Int)
