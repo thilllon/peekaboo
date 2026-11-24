@@ -98,6 +98,9 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private var rescanQueued = false
     /// Bumped when a file action changes the browsing set here: a listing started before it is stale.
     private var listingEpoch = 0
+    /// The opened file when its folder's listing does not include it (a type the scan skips, a hidden file): it stays
+    /// in the set while it is on screen.
+    private var unlistedFile: ImageFile?
     /// Files without pixels whose decode failed (the pipeline never retries them), for the version that failed.
     private var failures: [URL: Failure] = [:]
     private struct Failure {
@@ -256,14 +259,24 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         let opened = Trace.now()
         openGeneration += 1
         let generation = openGeneration
+        failures.removeAll()
+        unlistedFile = nil
+        listingPending = true
+        // First pixel first: decode the opened file before listing its folder, and submit that decode before the
+        // window is ordered in and flushed (window-server work it can overlap). Decide "file or folder" from the URL
+        // alone (no file-system access on the main thread). A file of a type the folder listing skips (an SVG, a
+        // document) is opened as itself too: it shows its error, not another image of its folder.
+        let singleFile = urls.count == 1 && !first.hasDirectoryPath
+        if singleFile {
+            browseSource = .folder(first.deletingLastPathComponent())
+            beginNavigation()
+            replaceFiles([Self.placeholder(for: first)], index: 0)
+        } else {
+            browseSource = urls.count == 1 ? .folder(first) : .files
+        }
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
-        failures.removeAll()
         hud.setMessage(nil)
-        listingPending = true
-        // First pixel first: decode the opened file before listing its folder. Decide "file or
-        // folder" from the URL alone (no file-system access on the main thread).
-        let singleFile = urls.count == 1 && !first.hasDirectoryPath && FolderScanner.isSupported(first)
         let synchronous = presentsSynchronously
         if synchronous {
             // Hand the window to the window server now, so the first frame can reach the glass before AppKit
@@ -271,20 +284,14 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             CATransaction.flush()
         }
         if singleFile {
-            browseSource = .folder(first.deletingLastPathComponent())
-            beginNavigation()
-            replaceFiles([ImageFile(url: first, name: first.lastPathComponent, byteSize: 0, modified: 0, fileID: 0)], index: 0)
             presentCurrent()
             if synchronous { presentFirstFrameNow() }
-        } else {
-            browseSource = urls.count == 1 ? .folder(first) : .files
-            if synchronous {
-                // Launched with a folder: list it in this turn (getattrlistbulk, ≈ 0.2 ms per 100 files) instead of
-                // in a main-queue turn that AppKit's launch delays by ~70 ms.
-                applyListing(try? FolderScanner.browse(urls), urls: urls, singleFile: false, opened: opened)
-                presentFirstFrameNow()
-                return
-            }
+        } else if synchronous {
+            // Launched with a folder: list it in this turn (getattrlistbulk, ≈ 0.2 ms per 100 files) instead of
+            // in a main-queue turn that AppKit's launch delays by ~70 ms.
+            applyListing(try? FolderScanner.browse(urls), urls: urls, singleFile: false, opened: opened)
+            presentFirstFrameNow()
+            return
         }
         updateHUD()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -308,8 +315,19 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             watchFolder()
             return
         }
+        var files = listing.files
+        var index = listing.index
+        if singleFile, let url = urls.first,
+           !(files.indices.contains(index) && files[index].url.standardizedFileURL == url.standardizedFileURL) {
+            // The opened file is not in its folder's listing (a type the scan skips, a hidden file, a path typed in
+            // another letter case): it stays on screen, among the folder's images.
+            let file = Self.placeholder(for: url)
+            files = NaturalSort.sort(files + [file], by: \.name)
+            index = files.firstIndex(of: file) ?? 0
+            unlistedFile = file
+        }
         let previous = pipeline.currentFile
-        replaceFiles(listing.files, index: listing.index)
+        replaceFiles(files, index: index)
         if let file = pipeline.currentFile, let version = Self.knownVersion(file) {
             // The opened file was shown (or failed) before its version was known; the pipeline keeps its tiers as
             // that version, and so does the view.
@@ -323,6 +341,11 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         updateHUD()
         watchFolder()
         Trace.log("folder listed: \(listing.files.count) files, \(String(format: "%.1f", Trace.ms(since: opened))) ms after open")
+    }
+
+    /// The opened file before its folder is listed (size, date and inode not known yet).
+    private static func placeholder(for url: URL) -> ImageFile {
+        ImageFile(url: url, name: url.lastPathComponent, byteSize: 0, modified: 0, fileID: 0)
     }
 
     /// Index of `url` in the browsing set when it is a listed file of the folder being browsed.
@@ -935,6 +958,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             guard let i = files.firstIndex(of: file) else { return }
             listingEpoch &+= 1
             files.remove(at: i)
+            if file == unlistedFile { unlistedFile = nil }
             tags[file.url] = nil
             tagSummaries[file.url] = nil
             if files.isEmpty {
@@ -1239,7 +1263,15 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         }
     }
 
-    private func applyRescan(_ files: [ImageFile], of folder: URL) {
+    private func applyRescan(_ listed: [ImageFile], of folder: URL) {
+        var files = listed
+        if let unlisted = unlistedFile {
+            if files.contains(unlisted) || unlisted != pipeline.currentFile {
+                unlistedFile = nil  // listed now, or the user moved on: it leaves the set with this listing
+            } else {
+                files = NaturalSort.sort(files + [unlisted], by: \.name)
+            }
+        }
         let fingerprint = { (list: [ImageFile]) in list.map { $0.url.path + "|" + $0.version } }
         guard fingerprint(files) != fingerprint(pipeline.files) else { return }
         if files.isEmpty {
