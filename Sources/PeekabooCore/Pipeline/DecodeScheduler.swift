@@ -234,7 +234,8 @@ final class DecodeScheduler: @unchecked Sendable {
             var known = infos.get(url)
             if known == nil, let probed = try? decoder.probe(url) { infos.set(url, probed); known = probed }
             let preview = autoreleasepool {
-                QuickLookPreview.preview(url, longSide: job.targetLongSide, info: known, pool: pool, timeout: 2)
+                QuickLookPreview.preview(url, longSide: job.targetLongSide, info: known, pool: pool,
+                                         timeout: job.kind == .visible ? 0.5 : 2)
             }
             result = preview.map { .success($0) } ?? .failure(QuickLookPreview.Miss())
         } else {

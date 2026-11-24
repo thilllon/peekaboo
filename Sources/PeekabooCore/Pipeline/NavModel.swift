@@ -162,7 +162,7 @@ struct PlanContext {
     var busy: (Int, Tier) -> Bool
     var estimate: (Int, Tier) -> Double
     var cheapPreview: (Int) -> Bool
-    /// The sweep may ask QuickLook for this file's preview (its own preview is not cheap).
+    /// QuickLook may serve this file's preview (its own preview is not cheap): the sweep and the visible image ask it.
     var quickLookSweep: (Int) -> Bool = { _ in false }
     /// The view asked for full resolution of the current image.
     var fullRequested: Bool
@@ -191,8 +191,14 @@ func planPrefetch(_ nav: NavModel, now: UInt64, tuning t: PrefetchTuning, contex
 
     // Visible image.
     if !sharp(i) {
-        if !c.cached(i, .preview) && !c.busy(i, .preview) && c.cheapPreview(i) {
-            plan.jobs.append(PlannedJob(index: i, tier: .preview, prio: -3, kind: .visible))
+        if !c.cached(i, .preview) && !c.busy(i, .preview) {
+            if c.cheapPreview(i) {
+                plan.jobs.append(PlannedJob(index: i, tier: .preview, prio: -3, kind: .visible))
+            } else if c.quickLookSweep(i) {
+                // Our own preview would cost about as much as the screen tier: probe QuickLook's cache in parallel
+                // (a hit is ≈ 1 ms, for files seen before, even by other apps).
+                plan.jobs.append(PlannedJob(index: i, tier: .preview, prio: -3, kind: .visible, quickLook: true))
+            }
         }
         if !c.busy(i, .screen) && !c.busy(i, .full) {
             let dwell = t.dwellMs(ema: nav.emaIntervalMs)
