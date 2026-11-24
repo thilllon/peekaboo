@@ -108,6 +108,15 @@ public enum DecodeError: Error, Equatable {
     case outOfMemory
 }
 
+/// Which shared resource a decode occupies, so the scheduler can bound concurrency per
+/// resource: the hardware JPEG/HEVC engines (≈2 concurrent jobs), CPU decoders
+/// (libjpeg-turbo, one core each) and everything else ImageIO does.
+public enum DecodeLane: Sendable, Hashable, CaseIterable {
+    case hardware
+    case cpu
+    case general
+}
+
 /// A decoder backend. Implementations must be thread-safe: the scheduler calls
 /// them concurrently from several worker threads. A decode cannot be aborted once
 /// started, so callers cancel before starting rather than during.
@@ -116,4 +125,10 @@ public protocol ImageDecoder: Sendable {
     /// Decode one tier. `targetLongSide` bounds the output long side for `.preview`/`.screen`
     /// (the decoder may return up to ~2x larger when that is cheaper); ignored for `.full`.
     func decode(_ url: URL, tier: Tier, targetLongSide: Int, pool: PixelBufferPool) throws -> DecodedImage
+    /// The lane `decode` would use for this file and tier (cheap; `info` may be nil before probing).
+    func lane(for url: URL, info: ImageInfo?, tier: Tier) -> DecodeLane
+}
+
+public extension ImageDecoder {
+    func lane(for url: URL, info: ImageInfo?, tier: Tier) -> DecodeLane { .general }
 }
