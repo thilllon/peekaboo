@@ -6,10 +6,10 @@ import UniformTypeIdentifiers
 import XCTest
 @testable import PeekabooCore
 
-/// `CR3Preview` on ISO-BMFF containers built in the test: hostile box sizes are rejected without trapping
-/// (overflow traps stay on in release builds, and the parser runs for every CR3 that enters a prefetch
-/// window), while well-formed previews still come out. With `$PEEKABOO_CORPUS`, the same damage applied
-/// to a real CR3.
+/// `CR3Preview` on ISO-BMFF containers built in the test: hostile box sizes and PRVW property lists are
+/// rejected without trapping (overflow and narrowing traps stay on in release builds, and the parser runs
+/// for every CR3 that enters a prefetch window), while well-formed previews still come out. With
+/// `$PEEKABOO_CORPUS`, the same damage applied to a real CR3.
 final class DecodeCR3Tests: XCTestCase {
     private var dir: URL!
 
@@ -123,6 +123,37 @@ final class DecodeCR3Tests: XCTestCase {
                 XCTAssertEqual(CR3Preview.candidates(url: url).map(\.width), [300, 600], "largesize \(largesize)")
             }
         }
+    }
+
+    // MARK: PRVW HEVC property boxes
+
+    /// `hevcPreview` appended every hvcC/colr/pixi box: 300 empty `colr` boxes (2.4 KB, inside the 4 KB window
+    /// the parser reads) made `heif` convert property index 256 to UInt8 and trap. One box per property type
+    /// is kept now, and `heif` refuses lists its 7-bit `ipma` indices cannot address.
+    func testPRVWPropertyBoxesAreBounded() throws {
+        let nal: [UInt8] = be32(12) + [0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00]
+        let colr = (0..<300).flatMap { _ in box("colr", []) }
+        let content = box("hvcC", []) + colr + box("pixi", be32(0)) + box("colr", []) + box("IMGD", be32(nal.count) + nal)
+        let url = try write(ftyp + prvw(width: 810, height: 540, content), "hevc.cr3")
+        let candidate = try XCTUnwrap(CR3Preview.candidates(url: url).first)
+        XCTAssertTrue(candidate.isHEVC)
+        XCTAssertEqual(candidate.length, nal.count)
+        XCTAssertEqual(candidate.hevcProperties?.map { String(decoding: $0[4..<8], as: UTF8.self) }, ["hvcC", "colr", "pixi"])
+
+        let heif = [UInt8](try XCTUnwrap(CR3Preview.bytes(url: url, candidate)))
+        // ipma: version/flags, entry count 1, item 1, then the associations: hvcC (essential), colr, pixi, ispe.
+        let ipma = try XCTUnwrap((0..<heif.count - 4).first { heif[$0..<$0 + 4].elementsEqual("ipma".utf8) })
+        XCTAssertEqual(Array(heif[ipma + 4..<ipma + 15]), [0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 4])
+        XCTAssertEqual(Array(heif[ipma + 15..<ipma + 19]), [0x81, 2, 3, 4])
+        XCTAssertEqual(Array(heif.suffix(nal.count)), nal, "the bitstream closes the mdat")
+
+        let ispe = 1
+        XCTAssertNotNil(CR3Preview.heif(hevc: Data(nal), properties: Array(repeating: box("colr", []), count: 127 - ispe),
+                                        width: 8, height: 8), "property index 127 fits in 7 bits")
+        XCTAssertNil(CR3Preview.heif(hevc: Data(nal), properties: Array(repeating: box("colr", []), count: 128 - ispe),
+                                     width: 8, height: 8))
+        XCTAssertNil(CR3Preview.heif(hevc: Data(nal), properties: Array(repeating: box("colr", []), count: 300),
+                                     width: 8, height: 8))
     }
 
     // MARK: Corpus

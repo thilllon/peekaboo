@@ -83,8 +83,11 @@ enum CR3Preview {
     }
 
     /// PRVW HEVC layout: `CISZ`, `hvcC`, `colr`, `pixi`, then `IMGD` holding length-prefixed NAL units.
+    /// The first box of each property type is kept: cameras write one of each, and the 4 KB window could
+    /// otherwise hold ~500 empty ones, more than the HEIF's 7-bit property indices address.
     private static func hevcPreview(_ body: [UInt8], from start: Int, base: Int, width: Int, height: Int) -> Candidate? {
         var properties: [[UInt8]] = []
+        var types: Set<String> = []
         var offset = start
         while offset + 8 <= body.count {
             let size = be32(body, offset)
@@ -99,15 +102,17 @@ enum CR3Preview {
                                  hevcProperties: properties)
             }
             guard offset + size <= body.count else { return nil }
-            if ["hvcC", "colr", "pixi"].contains(type) { properties.append(Array(body[offset..<offset + size])) }
+            if ["hvcC", "colr", "pixi"].contains(type), types.insert(type).inserted {
+                properties.append(Array(body[offset..<offset + size]))
+            }
             offset += size
         }
         return nil
     }
 
     /// A single-item HEIF (`hvc1` item with the given property boxes plus `ispe`) for ImageIO's
-    /// hardware HEVC decoder.
-    static func heif(hevc: Data, properties: [[UInt8]], width: Int, height: Int) -> Data {
+    /// hardware HEVC decoder; nil when `ipma` (flags 0: 7-bit indices) cannot address every property.
+    static func heif(hevc: Data, properties: [[UInt8]], width: Int, height: Int) -> Data? {
         func u16(_ v: Int) -> [UInt8] { [UInt8(v >> 8 & 0xFF), UInt8(v & 0xFF)] }
         func u32(_ v: Int) -> [UInt8] { [UInt8(v >> 24 & 0xFF), UInt8(v >> 16 & 0xFF), UInt8(v >> 8 & 0xFF), UInt8(v & 0xFF)] }
         func box(_ type: String, _ payload: [UInt8]) -> [UInt8] { u32(8 + payload.count) + Array(type.utf8) + payload }
@@ -119,6 +124,7 @@ enum CR3Preview {
         let iinf = full("iinf", 0, u16(1) + full("infe", 2, u16(1) + u16(0) + Array("hvc1".utf8) + [0]))
         let ispe = full("ispe", 0, u32(width) + u32(height))
         let props = properties + [ispe]
+        guard props.count <= 127 else { return nil }
         let ipco = box("ipco", props.flatMap { $0 })
         let associations = (1...props.count).map { UInt8($0) | ($0 == 1 ? 0x80 : 0) }  // hvcC is essential
         let ipma = full("ipma", 0, u32(1) + u16(1) + [UInt8(props.count)] + associations)
