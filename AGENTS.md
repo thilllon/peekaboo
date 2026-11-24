@@ -31,7 +31,7 @@ brew install jpeg-turbo   # static libturbojpeg linked into PeekabooCore
 | Debug build | `swift build` (`mise run build`) |
 | Unit tests | `swift test` (`mise run test`) |
 | Release app bundle | `mise run app` → `build/Peekaboo.app` |
-| Install locally | `mise run install` → `~/Applications/Peekaboo.app` |
+| Install locally | `mise run install` → `~/Applications/Peekaboo.app` + `peekaboo` CLI in `~/.local/bin` |
 | Secret scan (history + tree) | `mise run secrets` |
 | Latency trace | `PEEKABOO_TRACE=1 build/Peekaboo.app/Contents/MacOS/Peekaboo <image>` |
 | Benchmarks | `swift run -c release peekaboo-bench <suite>` |
@@ -44,7 +44,7 @@ brew install jpeg-turbo   # static libturbojpeg linked into PeekabooCore
   resampling kernels, progressive refinement).
 - `Sources/PeekabooApp` — programmatic AppKit shell (no storyboards, nibs or SwiftUI).
 - `Sources/PeekabooBench` — `peekaboo-bench` performance regression CLI.
-- `Resources/Info.plist` — bundle metadata and document types; `.mise/tasks/` — app bundle and install tasks.
+- `Resources/Info.plist` — bundle metadata and document types; `Resources/peekaboo` — CLI launcher shipped in the bundle; `.mise/tasks/` — app bundle and install tasks.
 
 ## Performance rules
 
