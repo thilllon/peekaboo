@@ -184,9 +184,6 @@ public final class ImagePipeline {
     private static let statQueue = DispatchQueue(label: "peekaboo.recheck", qos: .userInitiated)
     /// Reaches the pipeline from other threads without keeping it alive.
     private let weakSelf = WeakPipeline()
-    /// The last sweep scan that reached its radius: cursor, direction, time and the jobs it found, planned again
-    /// without scanning (up to 2×1024 files) for `sweepRescanMs`.
-    private var sweepMemo: (cursor: Int, direction: Int, at: UInt64, jobs: [PlannedJob])?
 
     public convenience init(decoder: ImageDecoder, pool: PixelBufferPool, config: PipelineConfig = PipelineConfig()) {
         self.init(decoder: decoder, pool: pool, config: config, quickLook: DecodeScheduler.systemQuickLook)
@@ -230,7 +227,6 @@ public final class ImagePipeline {
         slots = [Slot](repeating: Slot(), count: files.count)
         cachedIndices.removeAll(keepingCapacity: true)
         tierBytes = [0, 0, 0]
-        sweepMemo = nil
         for i in oldSlots.indices where oldSlots[i].hasState {
             var slot = oldSlots[i]
             oldSlots[i] = Slot()
@@ -442,7 +438,7 @@ public final class ImagePipeline {
         let previewHeadroom = budget(.preview) - tierBytes[Tier.preview.rawValue]
         let windowReserve = tuning.previewMaxAhead + tuning.previewBehind
         let sweepSlots = config.sweepLanes > 0 ? max(0, previewHeadroom / max(averagePreviewBytes, 1) - windowReserve) : 0
-        var context = PlanContext(
+        let context = PlanContext(
             count: files.count, listingReady: true,
             cached: { [unowned self] j, tier in self.isCached(j, tier) },
             busy: { [unowned self] j, tier in
@@ -456,14 +452,7 @@ public final class ImagePipeline {
             runningWorkMs: snapshot.runningWorkMs, decodeBacklog: snapshot.decodeBacklog,
             sweepSlots: sweepSlots, sweepPaused: underPressure,
             decodeLanes: config.laneLimits.decodeLanes, reservedLanes: config.laneLimits.reservedLanes)
-        if let memo = sweepMemo, memo.cursor == index, memo.direction == navigation.direction,
-           Double(now &- memo.at) / 1e6 < tuning.sweepRescanMs {
-            context.sweepReuse = memo.jobs
-        }
         let plan = planPrefetch(navigation, now: now, tuning: tuning, context: context)
-        if plan.sweepScanned {
-            sweepMemo = plan.sweepExhausted ? (index, navigation.direction, now, plan.jobs.filter { $0.kind == .sweep }) : nil
-        }
 
         var jobs: [DecodeJob] = []
         jobs.reserveCapacity(plan.jobs.count)
