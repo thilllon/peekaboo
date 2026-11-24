@@ -263,8 +263,7 @@ final class FileActions {
         other.target = picker
         other.tag = -1
         guard let view = context.window?.contentView else { return chooseFolder(copy: copy) }
-        menu.popUp(positioning: nil, at: NSPoint(x: view.bounds.midX - 120, y: view.bounds.midY + 80), in: view)
-        guard let tag = picker.chosen else { return nil }
+        guard let tag = picker.run(menu, in: view) else { return nil }
         return tag >= 0 ? choices[tag] : chooseFolder(copy: copy)
     }
 
@@ -377,12 +376,8 @@ final class FileActions {
         let other = menu.addItem(withTitle: "Other…", action: #selector(MenuPicker.pick(_:)), keyEquivalent: "")
         other.target = picker
         other.tag = -1
-        if let view = context.window?.contentView {
-            menu.popUp(positioning: nil, at: NSPoint(x: view.bounds.midX - 120, y: view.bounds.midY + 80), in: view)
-        } else {
-            picker.chosen = -1
-        }
-        guard let tag = picker.chosen else { return FileActionResult() }
+        let chosen = context.window?.contentView.map { picker.run(menu, in: $0) } ?? -1
+        guard let tag = chosen else { return FileActionResult() }
         if tag >= 0 { return open(url, with: apps[tag]) }
         let panel = NSOpenPanel()
         panel.directoryURL = URL(fileURLWithPath: "/Applications")
@@ -462,10 +457,24 @@ private struct WeakFileActions: @unchecked Sendable {
     init(_ value: FileActions) { self.value = value }
 }
 
-/// Target of picker menus: remembers the chosen item's tag.
-private final class MenuPicker: NSObject {
-    var chosen: Int?
+/// Runs a picker menu and reports the chosen item's tag. Items use `pick(_:)` as their action; the
+/// highlighted item is the fallback in case AppKit delivers the action after `popUp` returns.
+private final class MenuPicker: NSObject, NSMenuDelegate {
+    private var chosen: Int?
+    private var highlighted: Int?
+
     @objc func pick(_ sender: NSMenuItem) { chosen = sender.tag }
+
+    func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
+        highlighted = item.flatMap { $0.action == #selector(pick(_:)) ? $0.tag : nil }
+    }
+
+    /// Pop the menu up near the middle of `view`; nil when it was dismissed.
+    func run(_ menu: NSMenu, in view: NSView) -> Int? {
+        menu.delegate = self
+        let selected = menu.popUp(positioning: nil, at: NSPoint(x: view.bounds.midX - 120, y: view.bounds.midY + 80), in: view)
+        return chosen ?? (selected ? highlighted : nil)
+    }
 }
 
 /// Encodes the image only when another app asks for pixels.

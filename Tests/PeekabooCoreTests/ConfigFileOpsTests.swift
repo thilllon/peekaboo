@@ -230,6 +230,17 @@ final class ConfigFileOpsTests: XCTestCase {
         XCTAssertEqual(FileOperations.tags(of: URL(fileURLWithPath: photo.path)).label, 2)
     }
 
+    func testSequentialTagChangesOnTheSameURLSeeEachOther() throws {
+        let photo = try make("shoot/list.jpg")
+        let ops = FileOperations()
+        // An action list such as ["meta.rate:3", "meta.flag:pick"] runs within one run-loop pass.
+        try ops.setTags(FileOperations.rating(3, star: "★", in: FileOperations.tags(of: photo)), of: photo)
+        try ops.setTags(FileOperations.flag("pick", in: FileOperations.tags(of: photo)), of: photo)
+        let names = FileOperations.tags(of: photo).names
+        guard !names.isEmpty else { throw XCTSkip("volume does not store Finder tags") }
+        XCTAssertEqual(Set(names), ["★★★", "Pick"])
+    }
+
     func testImageFileStat() throws {
         let photo = try make("shoot/s.jpg", "12345")
         let file = FileOperations.imageFile(at: photo)

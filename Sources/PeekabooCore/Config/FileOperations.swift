@@ -261,7 +261,9 @@ public final class FileOperations {
     public static let rejectTag = "Reject"
 
     public static func tags(of url: URL) -> Tags {
-        let values = try? url.resourceValues(forKeys: [.tagNamesKey, .labelNumberKey])
+        var fresh = url
+        fresh.removeAllCachedResourceValues() // URLs cache resource values within a run-loop pass
+        let values = try? fresh.resourceValues(forKeys: [.tagNamesKey, .labelNumberKey])
         return Tags(names: values?.tagNames ?? [], label: values?.labelNumber ?? 0)
     }
 
