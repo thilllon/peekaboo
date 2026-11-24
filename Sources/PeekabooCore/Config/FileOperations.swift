@@ -5,6 +5,11 @@ import Foundation
 /// (slots, `~`, paths relative to the image's folder, "name 2.ext" on collisions) and `exec:`
 /// templates. The app's `FileActions` adds the pasteboard, Finder and other-app parts.
 ///
+/// Safety rules: an existing item is never replaced (a taken name becomes "name 2.ext", decided
+/// atomically by an exclusive rename); a symbolic link is moved, copied or trashed as the link, never
+/// its target; undo and redo refuse to touch a file that was replaced or edited since the action;
+/// and failure messages name files, not their full paths.
+///
 /// Not thread-safe: use it from one thread (the main thread in the app). Every operation is a
 /// rename, a copy or one `setxattr`, so it returns quickly on the same volume.
 public final class FileOperations {
@@ -36,17 +41,29 @@ public final class FileOperations {
         public var description: String { message }
     }
 
-    public private(set) var undoStack: [Change] = []
-    public private(set) var redoStack: [Change] = []
+    /// Changes that can be undone, oldest first.
+    public var undoStack: [Change] { undoEntries.map(\.change) }
+    /// Undone changes that can be redone, oldest first.
+    public var redoStack: [Change] { redoEntries.map(\.change) }
     /// Undoing a copy moves the copy to the Trash, as Finder does; false deletes it (tests).
     public var trashesUndoneCopies = true
     private let fm = FileManager.default
+
+    /// A change plus the identity of the item that its undo (or redo) acts on, so that neither touches a
+    /// file that was replaced or edited since.
+    private struct Entry {
+        let change: Change
+        let stamp: Stamp?
+    }
+
+    private var undoEntries: [Entry] = []
+    private var redoEntries: [Entry] = []
 
     public init() {}
 
     // MARK: Operations
 
-    /// Move to the Trash (undo moves it back).
+    /// Move to the Trash (undo moves it back). A symbolic link is trashed itself, never its target.
     @discardableResult
     public func trash(_ url: URL) throws -> Change {
         let change = try performTrash(url)
@@ -81,42 +98,51 @@ public final class FileOperations {
     }
 
     /// Undo the most recent change. Returns the change as it now sits on the redo stack, with the
-    /// restored location (a "name 2.ext" if the old name was taken meanwhile); nil when there is nothing to undo.
+    /// restored location (a "name 2.ext" if the old name was taken meanwhile); nil when there is nothing
+    /// to undo. Throws, keeping the change, when the item is gone (e.g. the Trash was emptied) or was
+    /// replaced or edited since the action.
     public func undo() throws -> Change? {
-        guard let change = undoStack.popLast() else { return nil }
+        guard let entry = undoEntries.popLast() else { return nil }
         do {
             let redo: Change
-            switch change {
+            switch entry.change {
             case .trashed(let original, let trashed):
-                let restored = try restore(trashed, to: original)
+                try Self.check(entry.stamp, at: trashed, name: original.lastPathComponent,
+                               missing: "is no longer in the Trash", since: "trashed")
+                let restored = try Self.restore(trashed, to: original)
                 redo = .trashed(original: restored, trashed: trashed)
             case .moved(let from, let to):
-                let back = try restore(to, to: from)
+                try Self.check(entry.stamp, at: to, missing: "is no longer in \(to.deletingLastPathComponent().lastPathComponent)",
+                               since: "moved")
+                let back = try Self.restore(to, to: from)
                 redo = .moved(from: back, to: to)
             case .copied(let from, let to):
-                try removeCopy(to)
+                try removeCopy(to, stamp: entry.stamp)
                 redo = .copied(from: from, to: to)
             case .tagged(let url, let before, let after):
                 try Self.write(before, to: url)
                 redo = .tagged(url, before: before, after: after)
             }
-            redoStack.append(redo)
+            redoEntries.append(Entry(change: redo, stamp: Self.stamp(redoing: redo)))
             return redo
         } catch {
-            undoStack.append(change)
+            undoEntries.append(entry)
             throw error
         }
     }
 
-    /// Redo the most recently undone change; returns the change as redone.
+    /// Redo the most recently undone change; returns the change as redone. Throws, keeping the change,
+    /// when the file was replaced or edited since it was put back.
     public func redo() throws -> Change? {
-        guard let change = redoStack.popLast() else { return nil }
+        guard let entry = redoEntries.popLast() else { return nil }
         do {
             let redone: Change
-            switch change {
+            switch entry.change {
             case .trashed(let original, _):
+                try Self.check(entry.stamp, at: original, missing: "is no longer there", since: "put back")
                 redone = try performTrash(original)
             case .moved(let from, let to):
+                try Self.check(entry.stamp, at: from, missing: "is no longer there", since: "moved back")
                 redone = try Self.transfer(from, toFolder: to.deletingLastPathComponent(), copy: false)
             case .copied(let from, let to):
                 redone = try Self.transfer(from, toFolder: to.deletingLastPathComponent(), copy: true)
@@ -124,23 +150,26 @@ public final class FileOperations {
                 try Self.write(after, to: url)
                 redone = .tagged(url, before: before, after: after)
             }
-            undoStack.append(redone)
+            undoEntries.append(Entry(change: redone, stamp: Self.stamp(undoing: redone)))
             return redone
         } catch {
-            redoStack.append(change)
+            redoEntries.append(entry)
             throw error
         }
     }
 
-    /// Push a change made elsewhere (e.g. a cross-volume move finished on a background queue) onto the undo stack.
+    /// Push a change made elsewhere (e.g. a cross-volume move finished on a background queue) onto the
+    /// undo stack. Call it right after the change: it notes the identity of the file the undo will touch.
     public func record(_ change: Change) {
-        undoStack.append(change)
-        redoStack.removeAll()
+        undoEntries.append(Entry(change: change, stamp: Self.stamp(undoing: change)))
+        redoEntries.removeAll()
     }
 
     private func performTrash(_ url: URL) throws -> Change {
+        guard Self.itemExists(url) else { throw Failure("\(url.lastPathComponent) is no longer there") }
         var resulting: NSURL?
         do {
+            // Moves the directory entry itself: a symbolic link goes to the Trash, its target stays.
             try fm.trashItem(at: url, resultingItemURL: &resulting)
         } catch {
             throw Failure("Cannot move \(url.lastPathComponent) to the Trash: \(Self.reason(error))")
@@ -150,38 +179,58 @@ public final class FileOperations {
     }
 
     /// Move or copy into `folder` without recording it (thread-safe; `record(_:)` it on the owning thread).
+    /// Never replaces an existing item (a taken name becomes "name 2.ext"), never follows a symbolic link
+    /// (a link is moved or copied as a link), and a move to another volume removes the original only
+    /// once the copy is complete, putting things back as they were when it cannot.
     public static func transfer(_ url: URL, toFolder folder: URL, copy: Bool) throws -> Change {
-        let fm = FileManager.default
+        try transfer(url, toFolder: folder, mode: copy ? .copy : .move)
+    }
+
+    enum Mode {
+        case move, copy
+        /// A move done as copy-then-delete, as across volumes (tests force it on one volume).
+        case moveByCopying
+    }
+
+    static func transfer(_ url: URL, toFolder folder: URL, mode: Mode) throws -> Change {
+        let copy = mode == .copy
+        let verb = copy ? "copy" : "move"
+        let name = url.lastPathComponent
         let folder = folder.standardizedFileURL
-        if !copy, folder.path == url.deletingLastPathComponent().standardizedFileURL.path {
-            throw Failure("\(url.lastPathComponent) is already in \(folder.lastPathComponent)")
+        guard itemExists(url) else { throw Failure("\(name) is no longer there") }
+        if !copy, isSameDirectory(folder, url.deletingLastPathComponent()) {
+            throw Failure("\(name) is already in \(folder.lastPathComponent)")
         }
         do {
-            try fm.createDirectory(at: folder, withIntermediateDirectories: true)
-            let target = Self.availableURL(for: url.lastPathComponent, in: folder)
-            if copy { try fm.copyItem(at: url, to: target) } else { try fm.moveItem(at: url, to: target) }
-            return copy ? .copied(from: url, to: target) : .moved(from: url, to: target)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         } catch {
-            throw Failure("Cannot \(copy ? "copy" : "move") \(url.lastPathComponent): \(reason(error))")
+            throw Failure("Cannot \(verb) \(name): cannot create the folder \(folder.lastPathComponent) (\(reason(error)))")
+        }
+        do {
+            let target = try place(url, as: name, in: folder, mode: mode)
+            return copy ? .copied(from: url, to: target) : .moved(from: url, to: target)
+        } catch let failure as PlaceFailure {
+            throw Failure("Cannot \(verb) \(name): \(failure.reason)")
         }
     }
 
     /// Put `url` back at `original` (or "name 2.ext" next to it if that name was taken meanwhile).
-    private func restore(_ url: URL, to original: URL) throws -> URL {
-        guard fm.fileExists(atPath: url.path) else { throw Failure("\(url.lastPathComponent) is no longer there") }
+    private static func restore(_ url: URL, to original: URL) throws -> URL {
         let folder = original.deletingLastPathComponent()
         do {
-            try fm.createDirectory(at: folder, withIntermediateDirectories: true)
-            let target = Self.availableURL(for: original.lastPathComponent, in: folder)
-            try fm.moveItem(at: url, to: target)
-            return target
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            return try place(url, as: original.lastPathComponent, in: folder, mode: .move)
+        } catch let failure as PlaceFailure {
+            throw Failure("Cannot restore \(original.lastPathComponent): \(failure.reason)")
         } catch {
-            throw Failure("Cannot restore \(original.lastPathComponent): \(Self.reason(error))")
+            throw Failure("Cannot restore \(original.lastPathComponent): \(reason(error))")
         }
     }
 
-    private func removeCopy(_ url: URL) throws {
-        guard fm.fileExists(atPath: url.path) else { return }
+    private func removeCopy(_ url: URL, stamp: Stamp?) throws {
+        guard Self.itemExists(url) else { return }
+        // Never trash or delete a file that replaced the copy, or the copy after it was edited.
+        try Self.check(stamp, at: url, missing: "is no longer there", since: "copied")
         do {
             guard trashesUndoneCopies else { throw Failure("delete") }
             try fm.trashItem(at: url, resultingItemURL: nil)
@@ -192,10 +241,144 @@ public final class FileOperations {
 
     private static func reason(_ error: Error) -> String {
         let ns = error as NSError
+        if ns.domain == NSPOSIXErrorDomain { return String(cString: strerror(Int32(ns.code))) }
         if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError, underlying.domain == NSPOSIXErrorDomain {
             return String(cString: strerror(Int32(underlying.code)))
         }
         return ns.localizedFailureReason ?? ns.localizedDescription
+    }
+
+    // MARK: Placing files safely
+
+    private struct PlaceFailure: Error {
+        let reason: String
+        init(_ code: Int32, hint: String = "") { reason = String(cString: strerror(code)) + hint }
+    }
+
+    /// Move or copy `source` to `folder/name`, or to the first free "stem N.ext". Exclusive: an existing item
+    /// (a dangling symbolic link included) is never replaced, not even one that appears while this runs.
+    private static func place(_ source: URL, as name: String, in folder: URL, mode: Mode) throws -> URL {
+        if mode == .move {
+            var n = 1
+            while true {
+                let target = numberedURL(name, n, in: folder)
+                n += 1
+                if itemExists(target) { continue }
+                if renamex_np(source.path, target.path, UInt32(RENAME_EXCL)) == 0 { return target }
+                let code = errno
+                switch code {
+                case EEXIST: continue
+                case EXDEV: return try place(source, as: name, in: folder, mode: .moveByCopying)
+                case ENOTSUP, EINVAL:
+                    // A file system without exclusive renames (some network volumes): check, then rename.
+                    if itemExists(target) { continue }
+                    if rename(source.path, target.path) == 0 { return target }
+                    throw PlaceFailure(errno)
+                default: throw PlaceFailure(code)
+                }
+            }
+        }
+        // Copy to a private name in the destination folder, then rename that exclusively into place: a failed
+        // copy leaves nothing behind, and no existing file is ever written to.
+        let temporary = folder.appendingPathComponent(".peekaboo-\(UUID().uuidString).tmp")
+        // COPYFILE_CLONE: an instant clone on APFS, else a full copy with metadata; a link is copied as a link.
+        // (It is not exclusive by itself, hence the private name.)
+        if copyfile(source.path, temporary.path, nil, copyfile_flags_t(COPYFILE_CLONE)) != 0 {
+            let code = errno
+            unlink(temporary.path)
+            throw PlaceFailure(code)
+        }
+        var n = 1
+        var target: URL
+        while true {
+            target = numberedURL(name, n, in: folder)
+            n += 1
+            if itemExists(target) { continue }
+            if renamex_np(temporary.path, target.path, UInt32(RENAME_EXCL)) == 0 { break }
+            let code = errno
+            if code == EEXIST { continue }
+            if code == ENOTSUP || code == EINVAL, !itemExists(target), rename(temporary.path, target.path) == 0 { break }
+            unlink(temporary.path)
+            throw PlaceFailure(code)
+        }
+        guard mode == .moveByCopying else { return target }
+        // The copy is complete: remove the original (`unlink` removes a link, never its target).
+        if unlink(source.path) != 0 {
+            let code = errno
+            unlink(target.path)
+            let readOnly = code == EACCES || code == EPERM || code == EROFS
+            throw PlaceFailure(code, hint: readOnly ? " (its folder is read-only: copy it instead)" : "")
+        }
+        return target
+    }
+
+    /// `folder/name` for n = 1, else "stem n.ext".
+    private static func numberedURL(_ name: String, _ n: Int, in folder: URL) -> URL {
+        guard n > 1 else { return folder.appendingPathComponent(name) }
+        let ext = (name as NSString).pathExtension
+        let stem = (name as NSString).deletingPathExtension
+        return folder.appendingPathComponent(ext.isEmpty ? "\(stem) \(n)" : "\(stem) \(n).\(ext)")
+    }
+
+    /// Whether anything has this name, without following a symbolic link (a dangling link counts).
+    static func itemExists(_ url: URL) -> Bool {
+        var st = stat()
+        return lstat(url.path, &st) == 0
+    }
+
+    /// Whether two paths name the same directory (also through symbolic links or a different letter case).
+    static func isSameDirectory(_ a: URL, _ b: URL) -> Bool {
+        var sa = stat(), sb = stat()
+        if stat(a.path, &sa) == 0, stat(b.path, &sb) == 0 { return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino }
+        return a.standardizedFileURL.path == b.standardizedFileURL.path
+    }
+
+    // MARK: Change detection
+
+    /// Identity and version of the item at a path (not following a symbolic link): another file, or the
+    /// same file after an edit, has a different stamp. Renames and tag changes keep it.
+    struct Stamp: Equatable {
+        let device: Int64
+        let inode: UInt64
+        let size: Int64
+        let seconds: Int
+        let nanoseconds: Int
+
+        init?(_ url: URL) {
+            var st = stat()
+            guard lstat(url.path, &st) == 0 else { return nil }
+            device = Int64(st.st_dev)
+            inode = UInt64(st.st_ino)
+            size = Int64(st.st_size)
+            seconds = st.st_mtimespec.tv_sec
+            nanoseconds = st.st_mtimespec.tv_nsec
+        }
+    }
+
+    /// The item an undo of `change` acts on.
+    private static func stamp(undoing change: Change) -> Stamp? {
+        switch change {
+        case .trashed(_, let trashed): return Stamp(trashed)
+        case .moved(_, let to), .copied(_, let to): return Stamp(to)
+        case .tagged: return nil
+        }
+    }
+
+    /// The item a redo of `change` acts on (a redone copy copies the original as it is then).
+    private static func stamp(redoing change: Change) -> Stamp? {
+        switch change {
+        case .trashed(let original, _): return Stamp(original)
+        case .moved(let from, _): return Stamp(from)
+        case .copied, .tagged: return nil
+        }
+    }
+
+    /// Throws unless the item at `url` is the one `stamp` describes. Messages say `name`, never a path.
+    private static func check(_ stamp: Stamp?, at url: URL, name: String? = nil, missing: String, since verb: String) throws {
+        guard let stamp else { return }
+        let name = name ?? url.lastPathComponent
+        guard let now = Stamp(url) else { throw Failure("\(name) \(missing)") }
+        if now != stamp { throw Failure("\(name) was replaced or edited since it was \(verb): left as it is") }
     }
 
     // MARK: Destinations
@@ -222,27 +405,26 @@ public final class FileOperations {
     }
 
     /// The folder for a `file.move:` / `file.copy:` target: a slot name (looked up in `slots`) or a path.
-    /// `~` expands; relative paths resolve against the image's folder. Nil for an unknown slot.
+    /// `~` expands; relative paths resolve against the image's folder. The result is absolute with every
+    /// `.` and `..` resolved. Nil for an unknown slot or an empty target.
     public static func destination(for target: String, slots: [String: String], imageURL: URL) -> URL? {
         let raw: String
         if let slot = slots[target] { raw = slot } else if isPathLike(target) { raw = target } else { return nil }
-        let expanded = (raw.trimmingCharacters(in: .whitespaces) as NSString).expandingTildeInPath
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+        let expanded = (trimmed as NSString).expandingTildeInPath
         if expanded.hasPrefix("/") { return URL(fileURLWithPath: expanded, isDirectory: true).standardizedFileURL }
         return URL(fileURLWithPath: expanded, isDirectory: true,
                    relativeTo: imageURL.deletingLastPathComponent()).absoluteURL.standardizedFileURL
     }
 
-    /// `folder/name`, or the first free "stem 2.ext", "stem 3.ext", … (Finder's "Keep Both").
+    /// `folder/name`, or the first free "stem 2.ext", "stem 3.ext", … (Finder's "Keep Both"). A dangling
+    /// symbolic link counts as taken. Moves and copies re-check atomically, so this is only a forecast.
     public static func availableURL(for name: String, in folder: URL) -> URL {
-        let fm = FileManager.default
-        let first = folder.appendingPathComponent(name)
-        guard fm.fileExists(atPath: first.path) else { return first }
-        let ext = (name as NSString).pathExtension
-        let stem = (name as NSString).deletingPathExtension
-        var n = 2
+        var n = 1
         while true {
-            let candidate = folder.appendingPathComponent(ext.isEmpty ? "\(stem) \(n)" : "\(stem) \(n).\(ext)")
-            if !fm.fileExists(atPath: candidate.path) { return candidate }
+            let candidate = numberedURL(name, n, in: folder)
+            if !itemExists(candidate) { return candidate }
             n += 1
         }
     }
@@ -363,43 +545,108 @@ public final class FileOperations {
 
     // MARK: exec templates
 
+    /// `exec:` placeholders and the environment variables that carry their values.
+    public static let execVariables: [String: String] = [
+        "path": "PEEKABOO_PATH", "dir": "PEEKABOO_DIR", "name": "PEEKABOO_NAME", "stem": "PEEKABOO_STEM",
+        "ext": "PEEKABOO_EXT", "index": "PEEKABOO_INDEX", "count": "PEEKABOO_COUNT",
+    ]
+
     /// POSIX shell single-quoting: `it's` → `'it'\''s'`.
     public static func shellQuote(_ s: String) -> String {
         "'" + s.replacingOccurrences(of: "'", with: #"'\''"#) + "'"
     }
 
-    /// Substitute `{path} {dir} {name} {stem} {ext} {index} {count}`, each shell-quoted. A placeholder
-    /// the user already quoted (`'{path}'`, `"{path}"`) is treated as unquoted. `index` is 1-based.
-    public static func expand(_ template: String, file: URL, index: Int, count: Int) -> String {
+    /// The values of the placeholders for the image `file` (the `index`-th, 0-based, of `count`), keyed by
+    /// environment variable: `PEEKABOO_PATH`, `_DIR`, `_NAME`, `_STEM`, `_EXT`, `_INDEX` (1-based), `_COUNT`.
+    public static func execEnvironment(file: URL, index: Int, count: Int) -> [String: String] {
         let name = file.lastPathComponent
-        let values: [String: String] = [
-            "path": file.path, "dir": file.deletingLastPathComponent().path, "name": name,
-            "stem": (name as NSString).deletingPathExtension, "ext": file.pathExtension,
-            "index": String(index + 1), "count": String(count),
+        return [
+            "PEEKABOO_PATH": file.path, "PEEKABOO_DIR": file.deletingLastPathComponent().path, "PEEKABOO_NAME": name,
+            "PEEKABOO_STEM": (name as NSString).deletingPathExtension, "PEEKABOO_EXT": file.pathExtension,
+            "PEEKABOO_INDEX": String(index + 1), "PEEKABOO_COUNT": String(count),
         ]
-        // One pass, so text inside a substituted value is never substituted again.
+    }
+
+    /// The shell command for an `exec:` template: each placeholder becomes a reference to its environment
+    /// variable, quoted for where it stands — `"${PEEKABOO_PATH}"` in plain text, `${PEEKABOO_PATH}` inside
+    /// `"…"`, `'"${PEEKABOO_PATH}"'` inside `'…'` — so a value is always exactly one word and is never parsed
+    /// as shell code. No file-derived text goes into the command: run it with `execEnvironment(…)`.
+    /// `\{path}` and `${path}` are left alone. The arguments are unused (kept for source compatibility).
+    public static func expand(_ template: String, file: URL, index: Int, count: Int) -> String {
+        execCommand(template)
+    }
+
+    /// See `expand(_:file:index:count:)`.
+    public static func execCommand(_ template: String) -> String {
+        enum Context: Equatable { case plain, single, double, backtick, command(depth: Int) }
         let chars = Array(template)
+        var stack: [Context] = [.plain]
         var out = ""
         var i = 0
         while i < chars.count {
-            if chars[i] == "{", let close = chars[i...].firstIndex(of: "}"), let value = values[String(chars[(i + 1)..<close])] {
-                var next = close + 1
-                if let last = out.last, last == "'" || last == "\"", next < chars.count, chars[next] == last {
-                    out.removeLast()
-                    next += 1
+            let c = chars[i]
+            let context = stack[stack.count - 1]
+            let next: Character? = i + 1 < chars.count ? chars[i + 1] : nil
+            if c == "{", i == 0 || chars[i - 1] != "$", let close = chars[i...].firstIndex(of: "}"),
+               let variable = execVariables[String(chars[(i + 1)..<close])] {
+                switch context {
+                case .single: out += "'\"${\(variable)}\"'"
+                case .double: out += "${\(variable)}"
+                default: out += "\"${\(variable)}\""
                 }
-                out += shellQuote(value)
-                i = next
+                i = close + 1
                 continue
             }
-            out.append(chars[i])
+            out.append(c)
             i += 1
+            switch context {
+            case .single:
+                if c == "'" { stack.removeLast() }
+            case .double:
+                if c == "\\", let next {
+                    out.append(next)
+                    i += 1
+                } else if c == "\"" {
+                    stack.removeLast()
+                } else if c == "$", next == "(" {
+                    out.append("(")
+                    i += 1
+                    stack.append(.command(depth: 0))
+                } else if c == "`" {
+                    stack.append(.backtick)
+                }
+            case .plain, .backtick, .command:
+                if c == "\\", let next {
+                    out.append(next)
+                    i += 1
+                } else if c == "'" {
+                    stack.append(.single)
+                } else if c == "\"" {
+                    stack.append(.double)
+                } else if c == "$", next == "(" {
+                    out.append("(")
+                    i += 1
+                    stack.append(.command(depth: 0))
+                } else if c == "`" {
+                    if context == .backtick { stack.removeLast() } else { stack.append(.backtick) }
+                } else if case .command(let depth) = context, c == "(" || c == ")" {
+                    stack.removeLast()
+                    if c == "(" { stack.append(.command(depth: depth + 1)) }
+                    else if depth > 0 { stack.append(.command(depth: depth - 1)) }
+                } else if c == "#", i == 1 || " \t\n;&|(".contains(chars[i - 2]) {
+                    // A comment runs to the end of the line.
+                    while i < chars.count, chars[i] != "\n" {
+                        out.append(chars[i])
+                        i += 1
+                    }
+                }
+            }
         }
         return out
     }
 
-    /// Run `command` with `/bin/sh -c` on a background queue; stdout is discarded. `completion` gets the
-    /// exit status and the tail of stderr, on an arbitrary queue.
+    /// Run `command` with `/bin/sh -c` on a background queue; stdout is discarded. `environment` is added
+    /// to the app's environment. `completion` gets the exit status and the tail of stderr, on an arbitrary queue.
     public static func run(_ command: String, environment: [String: String] = [:],
                            completion: (@Sendable (Int32, String) -> Void)? = nil) {
         DispatchQueue.global(qos: .userInitiated).async {
@@ -422,5 +669,15 @@ public final class FileOperations {
             let tail = String(decoding: stderr.suffix(300), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
             completion?(process.terminationStatus, tail)
         }
+    }
+
+    /// Run an `exec:` template for the image `file` (the `index`-th, 0-based, of `count`): the command
+    /// from `execCommand`, the values in the environment. Returns the command (for logs: it holds no file names).
+    @discardableResult
+    public static func runExec(_ template: String, file: URL, index: Int, count: Int,
+                               completion: (@Sendable (Int32, String) -> Void)? = nil) -> String {
+        let command = execCommand(template)
+        run(command, environment: execEnvironment(file: file, index: index, count: count), completion: completion)
+        return command
     }
 }

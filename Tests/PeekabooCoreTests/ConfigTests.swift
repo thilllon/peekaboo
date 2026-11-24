@@ -133,6 +133,105 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(errors("[keys]\n\"1\" = [\"none\", \"nav.next\"]\n"), ["config.toml:2: \"none\" cannot be part of an action list"])
     }
 
+    func testUnknownKeysAreWarningsThatKeepTheRest() throws {
+        // Keys from the research sample that are not implemented, mixed with real settings.
+        let (config, warnings) = try AppConfig.parse(toml: """
+        [general]
+        sort = "name"
+        [view]
+        background = "gray"
+        fit = "fit"
+        [hud]
+        mode = "full"
+        position = "bottom-left"
+        [rating]
+        star_char = "*"
+        [keys]
+        "k" = "nav.next"
+        [keys.other]
+        "a" = "nav.next"
+        """)
+        XCTAssertEqual(config.background, "gray")
+        XCTAssertEqual(config.hud, .full)
+        XCTAssertEqual(config.keymap.resolve([KeyChord(key: "k")], context: .normal), .actions([.next]))
+        XCTAssertEqual(warnings, [
+            "config.toml:1: ignored unknown table [general]",
+            "config.toml:2: ignored unknown key \"general.sort\"",
+            "config.toml:5: ignored unknown key \"view.fit\"",
+            "config.toml:8: ignored unknown key \"hud.position\"",
+            "config.toml:10: ignored unknown key \"rating.star_char\"",
+            "config.toml:13: ignored unknown table [keys.other]",
+            "config.toml:14: ignored unknown key \"keys.other.a\" (bindings go in [keys] or [keys.zoomed])",
+        ])
+        // Anything else still rejects the whole file, listing the warnings' lines too.
+        XCTAssertThrowsError(try AppConfig.parse(toml: "[view]\nfit = \"fit\"\nbackground = \"pink\"\n")) { error in
+            XCTAssertEqual((error as? ConfigError)?.messages, [
+                "config.toml:2: unknown key \"view.fit\"",
+                "config.toml:3: view.background must be one of \"black\", \"gray\", \"checker\"",
+            ])
+        }
+        // The strict initializer still rejects unknown keys.
+        XCTAssertThrowsError(try AppConfig(toml: "[view]\nfit = \"fit\"\n"))
+    }
+
+    func testStarterFileRoundTripsWithoutErrors() throws {
+        let url = directory.appendingPathComponent("config.toml")
+        let store = ConfigStore(url: url)
+        try store.createDefaultFileIfMissing()
+        let written = try String(contentsOf: url, encoding: .utf8)
+        let (config, warnings) = try AppConfig.parse(toml: written)
+        XCTAssertEqual(config, .default)
+        XCTAssertEqual(warnings, [])
+        store.load()
+        XCTAssertNil(store.lastError)
+        XCTAssertEqual(store.warnings, [])
+
+        // Uncomment every setting and table line, as the header tells the user to: still zero errors and
+        // zero warnings (planned keys are named only in prose), and the result is the template's.
+        let uncommented = written.split(separator: "\n", omittingEmptySubsequences: false).map { line -> String in
+            guard line.hasPrefix("# ") else { return String(line) }
+            let rest = line.dropFirst(2)
+            return rest.hasPrefix("[") || rest.contains(" = ") ? String(rest) : String(line)
+        }.joined(separator: "\n")
+        XCTAssertNotEqual(uncommented, written)
+        let full = try AppConfig.parse(toml: uncommented)
+        XCTAssertEqual(full.warnings, [])
+        XCTAssertEqual(full.config, try AppConfig(toml: ConfigStore.sampleTemplate))
+        XCTAssertEqual(full.config.slots.count, 4)
+        try Data(uncommented.utf8).write(to: url)
+        store.load()
+        XCTAssertNil(store.lastError)
+        XCTAssertNil(store.lastWarning)
+        XCTAssertEqual(store.config.apps["preview"], "com.apple.Preview")
+    }
+
+    func testStoreAppliesAFileWithUnknownKeysAndReportsThem() throws {
+        let url = directory.appendingPathComponent("config.toml")
+        try Data("[view]\nbackground = \"checker\"\nfit = \"fill\"\n[loading]\npreview_max_px = 1024\n".utf8).write(to: url)
+        let store = ConfigStore(url: url)
+        var messages: [String] = []
+        var changes = 0
+        store.onError = { messages.append($0) } // also gets warnings when onWarning is nil
+        store.onChange = { _ in changes += 1 }
+        store.load()
+        XCTAssertEqual(store.config.background, "checker")
+        XCTAssertEqual(changes, 1)
+        XCTAssertNil(store.lastError)
+        XCTAssertEqual(store.warnings, [
+            "config.toml:3: ignored unknown key \"view.fit\"",
+            "config.toml:4: ignored unknown table [loading]",
+            "config.toml:5: ignored unknown key \"loading.preview_max_px\"",
+        ])
+        XCTAssertEqual(messages, ["config.toml:3: ignored unknown key \"view.fit\" (+2 more)"])
+        XCTAssertEqual(store.lastWarning, messages.first)
+        // A clean file clears the warnings.
+        try Data("[view]\nbackground = \"gray\"\n".utf8).write(to: url)
+        store.load()
+        XCTAssertEqual(store.warnings, [])
+        XCTAssertNil(store.lastWarning)
+        XCTAssertEqual(messages.count, 1)
+    }
+
     func testErrorDescriptionFitsAToast() {
         let error = ConfigError(fileName: "config.toml", errors: [
             TOMLError(line: 9, column: 1, message: "second"), TOMLError(line: 2, column: 1, message: "first"),
@@ -207,12 +306,21 @@ final class ConfigTests: XCTestCase {
             try handle.write(contentsOf: Data("[hud]\nmode = \"minimal\"\n".utf8))
             try handle.close()
         }
+        // An unknown key is a warning: the rest of the file applies.
+        let warned = expectation(description: "warning")
+        store.onWarning = { message in
+            if message == "config.toml:2: ignored unknown key \"hud.modee\"" { warned.fulfill() }
+        }
+        try expectChange({ $0.hud == .off }) {
+            try Data("[hud]\nmodee = \"full\"\nmode = \"off\"\n".utf8).write(to: url, options: .atomic)
+        }
+        wait(for: [warned], timeout: 3)
         // An error is reported and the config stays.
         let failed = expectation(description: "error")
-        store.onError = { message in if message.contains("unknown key") { failed.fulfill() } }
-        try Data("[hud]\nmodee = \"off\"\n".utf8).write(to: url, options: .atomic)
+        store.onError = { message in if message.contains("hud.mode must be one of") { failed.fulfill() } }
+        try Data("[hud]\nmode = \"loud\"\n".utf8).write(to: url, options: .atomic)
         wait(for: [failed], timeout: 3)
-        XCTAssertEqual(store.config.hud, .minimal)
+        XCTAssertEqual(store.config.hud, .off)
         // Deleting the file returns to the defaults.
         try expectChange({ $0 == .default }) { try FileManager.default.removeItem(at: url) }
     }

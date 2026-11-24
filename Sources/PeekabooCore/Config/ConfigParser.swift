@@ -16,14 +16,37 @@ public struct ConfigError: Error, Equatable, Sendable, CustomStringConvertible {
     /// The first problem, plus how many more there are (fits a toast).
     public var description: String {
         guard let first = messages.first else { return "\(fileName): invalid" }
-        return errors.count > 1 ? "\(first) (+\(errors.count - 1) more)" : first
+        return Self.summary(messages) ?? first
+    }
+
+    /// The first message plus how many more there are, e.g. `config.toml:3: … (+2 more)`; nil when empty.
+    public static func summary(_ messages: [String]) -> String? {
+        guard let first = messages.first else { return nil }
+        return messages.count > 1 ? "\(first) (+\(messages.count - 1) more)" : first
     }
 }
 
 extension AppConfig {
-    /// Parse a `config.toml`. Keys the file does not mention keep their built-in defaults.
-    /// Throws `ConfigError` listing every unknown table, key, value, chord or action with its line.
+    /// Parse a `config.toml` strictly: keys the file does not mention keep their built-in defaults, and
+    /// `ConfigError` lists every unknown table, key, value, chord or action with its line.
     public init(toml text: String, fileName: String = "config.toml") throws {
+        let (config, warnings) = try Self.read(toml: text, fileName: fileName)
+        if !warnings.isEmpty { throw ConfigError(fileName: fileName, errors: warnings) }
+        self = config
+    }
+
+    /// Parse a `config.toml` the way the app loads it: unknown tables and keys (a typo, a setting from a
+    /// newer version) are skipped and returned as warnings such as `config.toml:3: ignored unknown key
+    /// "view.fit"`, and the rest of the file applies. Throws `ConfigError` for everything else (bad
+    /// values, chords, actions, TOML syntax), listing each problem with its line.
+    public static func parse(toml text: String, fileName: String = "config.toml") throws -> (config: AppConfig, warnings: [String]) {
+        let (config, warnings) = try read(toml: text, fileName: fileName)
+        let sorted = warnings.sorted { ($0.line, $0.column) < ($1.line, $1.column) }
+        return (config, sorted.map { "\(fileName):\($0.line): ignored \($0.message)" })
+    }
+
+    /// The config plus the skipped unknown tables and keys; throws for the other errors.
+    private static func read(toml text: String, fileName: String) throws -> (AppConfig, [TOMLError]) {
         let document: TOMLDocument
         do {
             document = try TOMLDocument(parsing: text)
@@ -31,14 +54,17 @@ extension AppConfig {
             throw ConfigError(fileName: fileName, errors: [error])
         }
         var reader = ConfigReader()
-        self = reader.read(document)
-        if !reader.errors.isEmpty { throw ConfigError(fileName: fileName, errors: reader.errors) }
+        let config = reader.read(document)
+        if !reader.errors.isEmpty { throw ConfigError(fileName: fileName, errors: reader.errors + reader.unknown) }
+        return (config, reader.unknown)
     }
 }
 
 /// Maps a TOML document onto `AppConfig`, collecting errors instead of stopping at the first one.
 private struct ConfigReader {
     var errors: [TOMLError] = []
+    /// Unknown tables and keys: skipped, so they are warnings when loading leniently.
+    var unknown: [TOMLError] = []
     var config = AppConfig()
 
     private static let tables: Set<[String]> = [
@@ -50,10 +76,15 @@ private struct ConfigReader {
         errors.append(TOMLError(line: entry.line, column: entry.column, message: message))
     }
 
+    /// An unknown key: it is skipped and the rest of the file still applies.
+    mutating func skip(_ entry: TOMLEntry, _ message: String) {
+        unknown.append(TOMLError(line: entry.line, column: entry.column, message: message))
+    }
+
     mutating func read(_ document: TOMLDocument) -> AppConfig {
         for table in document.tables where !Self.tables.contains(table.path) {
-            errors.append(TOMLError(line: table.line, column: 1,
-                                    message: "unknown table [\(table.path.joined(separator: "."))]"))
+            unknown.append(TOMLError(line: table.line, column: 1,
+                                     message: "unknown table [\(table.path.joined(separator: "."))]"))
         }
         var keyEntries: [(entry: TOMLEntry, context: KeyContext, chord: String)] = []
         var keymapDefaults = true, vim = false, autoAdvance = false
@@ -66,11 +97,11 @@ private struct ConfigReader {
                 case 2: keyEntries.append((entry, .normal, path[1]))
                 case 3 where path[1] == "zoomed": keyEntries.append((entry, .zoomed, path[2]))
                 case 3 where path[1] == "normal": keyEntries.append((entry, .normal, path[2]))
-                default: fail(entry, "unknown key \"\(name)\" (bindings go in [keys] or [keys.zoomed])")
+                default: skip(entry, "unknown key \"\(name)\" (bindings go in [keys] or [keys.zoomed])")
                 }
                 continue
             case "slots", "apps":
-                guard path.count == 2 else { fail(entry, "unknown key \"\(name)\""); continue }
+                guard path.count == 2 else { skip(entry, "unknown key \"\(name)\""); continue }
                 guard case .string(let value) = entry.value, !value.trimmingCharacters(in: .whitespaces).isEmpty else {
                     fail(entry, "\(name) must be a non-empty string"); continue
                 }
@@ -107,7 +138,7 @@ private struct ConfigReader {
             case "keymap.defaults": if let v = bool(entry) { keymapDefaults = v; config.keymapDefaults = v }
             case "keymap.vim": if let v = bool(entry) { vim = v; config.vimKeys = v }
             default:
-                fail(entry, "unknown key \"\(name)\"\(Self.keyHint(path))")
+                skip(entry, "unknown key \"\(name)\"\(Self.keyHint(path))")
             }
         }
         config.keymap = buildKeymap(keyEntries, defaults: keymapDefaults, vim: vim, autoAdvance: autoAdvance)
