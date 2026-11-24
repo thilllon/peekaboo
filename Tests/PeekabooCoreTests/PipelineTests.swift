@@ -306,7 +306,8 @@ final class PipelineTests: PipelineTestCase {
             pipeline.navigate(to: i, isRepeat: false)
         }
         spin(for: 0.5)
-        XCTAssertLessThanOrEqual(decoder.maxInFlight(.hardware), 3, "hardware engines: 2 + 1 for the visible image")
+        XCTAssertLessThanOrEqual(decoder.maxInFlight(.hardware), 2, "two hardware engines")
+        XCTAssertGreaterThan(decoder.maxInFlight(.hardware), 0)
         XCTAssertLessThanOrEqual(decoder.maxInFlight(.general), 5, "general ImageIO: 4 + 1 for the visible image")
         XCTAssertLessThanOrEqual(decoder.maxTotalInFlight, 6, "six decode lanes")
     }

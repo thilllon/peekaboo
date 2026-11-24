@@ -57,7 +57,7 @@ public enum FolderScanner {
 
     /// Every visible regular file (or symlink to one) in `directory`, unsorted; nil when the file system does not
     /// support `getattrlistbulk`.
-    static func listBulk(_ directory: URL) throws -> [ImageFile]? {
+    public static func listBulk(_ directory: URL) throws -> [ImageFile]? {
         let path = directory.path
         let fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         guard fd >= 0 else { throw CocoaError(.fileReadNoSuchFile, userInfo: [NSFilePathErrorKey: path]) }
@@ -73,6 +73,7 @@ public enum FolderScanner {
         defer { buffer.deallocate() }
         var out: [ImageFile] = []
         var first = true
+        let base = path.hasSuffix("/") ? path : path + "/"
         while true {
             let count = getattrlistbulk(fd, &request, buffer, capacity, 0)
             if count < 0 {
@@ -121,10 +122,10 @@ public enum FolderScanner {
                 let name = String(cString: namePointer)
                 switch objectType {
                 case UInt32(VREG.rawValue):
-                    out.append(ImageFile(url: directory.appendingPathComponent(name, isDirectory: false), name: name,
+                    out.append(ImageFile(url: URL(fileURLWithPath: base + name, isDirectory: false), name: name,
                                          byteSize: size, modified: seconds(modified), fileID: fileID))
                 case UInt32(VLNK.rawValue):
-                    if let file = resolvedLink(directory, name) { out.append(file) }
+                    if let file = resolvedLink(base, name) { out.append(file) }
                 default:
                     continue
                 }
@@ -134,31 +135,32 @@ public enum FolderScanner {
     }
 
     /// FileManager listing with the same rules as `listBulk` (fallback, and the reference in tests).
-    static func listWithFileManager(_ directory: URL) throws -> [ImageFile] {
+    public static func listWithFileManager(_ directory: URL) throws -> [ImageFile] {
         let urls = try FileManager.default.contentsOfDirectory(
             at: directory, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
             options: [.skipsHiddenFiles])
         var out: [ImageFile] = []
         out.reserveCapacity(urls.count)
+        let base = directory.path.hasSuffix("/") ? directory.path : directory.path + "/"
         for url in urls {
             let name = url.lastPathComponent
             var info = stat()
             guard lstat(url.path, &info) == 0 else { continue }
             if info.st_mode & S_IFMT == S_IFREG {
-                out.append(ImageFile(url: directory.appendingPathComponent(name, isDirectory: false), name: name,
+                out.append(ImageFile(url: URL(fileURLWithPath: base + name, isDirectory: false), name: name,
                                      byteSize: Int64(info.st_size), modified: seconds(info.st_mtimespec),
                                      fileID: UInt64(info.st_ino)))
-            } else if info.st_mode & S_IFMT == S_IFLNK, let file = resolvedLink(directory, name) {
+            } else if info.st_mode & S_IFMT == S_IFLNK, let file = resolvedLink(base, name) {
                 out.append(file)
             }
         }
         return out
     }
 
-    private static func resolvedLink(_ directory: URL, _ name: String) -> ImageFile? {
-        let url = directory.appendingPathComponent(name, isDirectory: false)
+    private static func resolvedLink(_ base: String, _ name: String) -> ImageFile? {
         var info = stat()
-        guard stat(url.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { return nil }
+        guard stat(base + name, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { return nil }
+        let url = URL(fileURLWithPath: base + name, isDirectory: false)
         return ImageFile(url: url, name: name, byteSize: Int64(info.st_size), modified: seconds(info.st_mtimespec),
                          fileID: UInt64(info.st_ino))
     }

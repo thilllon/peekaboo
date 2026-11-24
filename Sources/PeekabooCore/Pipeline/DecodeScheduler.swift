@@ -64,7 +64,7 @@ struct LaneLimits: Sendable, Equatable {
 ///
 /// The main thread replaces the queued set on every replan (`submit`), which cancels queued work instantly;
 /// running decodes cannot be aborted and finish normally. Workers pick the best runnable job under the lock:
-/// - visible jobs may use every decode lane (one more than the per-resource cap: the engines queue internally);
+/// - visible jobs may use every decode lane, including the reserved one (and one slot above the CPU/general caps);
 /// - prefetch waits while any visible job is queued or running (foreground gate), never holds the reserved
 ///   lane and respects the per-resource caps (hardware engines ≤ 2, general ImageIO ≤ 4, CPU fills the rest);
 /// - sweep jobs run on their own utility lanes only while no decode-lane work is queued or gated.
@@ -254,7 +254,9 @@ final class DecodeScheduler: @unchecked Sendable {
         for job in queued.values where job.kind != .sweep {
             let inLane = runningByLane[job.lane, default: 0]
             if job.kind == .visible {
-                guard inLane < limits.cap(job.lane) + 1 else { continue }
+                // The hardware engines are a hard limit (they serialise anyway); CPU-bound ImageIO and libjpeg-turbo
+                // work may exceed its cap by one so the visible image never queues behind prefetch.
+                guard inLane < limits.cap(job.lane) + (job.lane == .hardware ? 0 : 1) else { continue }
             } else {
                 guard prefetchRoom, inLane < limits.cap(job.lane) else { continue }
                 if gated == nil { gated = foregroundBusyLocked }

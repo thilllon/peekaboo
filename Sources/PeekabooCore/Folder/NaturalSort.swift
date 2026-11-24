@@ -61,8 +61,49 @@ public enum NaturalSort {
         return table
     }()
 
+    private static let asciiWeights = table.ascii
+    private static let digitWeight = table.digit
+
     /// Sort key of `name`, or nil when it contains characters the key cannot order.
     public static func key(_ name: String) -> [UInt8]? {
+        let fast: [UInt8]?? = name.utf8.withContiguousStorageIfAvailable { asciiKey($0) }
+        if let fast, let key = fast { return key }
+        return unicodeKey(name)
+    }
+
+    /// Fast path for ASCII names (nil on the first non-ASCII byte or unorderable character).
+    private static func asciiKey(_ bytes: UnsafeBufferPointer<UInt8>) -> [UInt8]? {
+        asciiWeights.withUnsafeBufferPointer { weights -> [UInt8]? in
+            var out: [UInt8] = []
+            out.reserveCapacity(bytes.count + 8)
+            let n = bytes.count
+            var i = 0
+            while i < n {
+                let b = bytes[i]
+                if b >= 0x80 { return nil }
+                if b >= 0x30 && b <= 0x39 {
+                    var end = i + 1
+                    while end < n && bytes[end] >= 0x30 && bytes[end] <= 0x39 { end += 1 }
+                    var start = i
+                    while start < end - 1 && bytes[start] == 0x30 { start += 1 }
+                    out.append(digitWeight)
+                    out.append(UInt8(min(end - start, 255)))
+                    out.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[start..<end]))
+                    i = end
+                    continue
+                }
+                let weight = weights[Int(b)]
+                if weight == 0 { return nil }
+                out.append(weight)
+                i += 1
+            }
+            return out
+        }
+    }
+
+    private static func unicodeKey(_ raw: String) -> [UInt8]? {
+        // Names read back from the file system are often decomposed (NFD: Hangul as conjoining jamo).
+        let name = raw.precomposedStringWithCanonicalMapping
         let t = table
         var out: [UInt8] = []
         out.reserveCapacity(name.utf8.count + 8)
@@ -111,25 +152,44 @@ public enum NaturalSort {
 
     /// `true` when `a` sorts before `b` in Finder order.
     public static func precedes(_ a: String, _ b: String) -> Bool {
-        if let ka = key(a), let kb = key(b), ka != kb { return ka.lexicographicallyPrecedes(kb) }
+        if let ka = key(a), let kb = key(b) {
+            let order = compare(ka, kb)
+            if order != 0 { return order < 0 }
+        }
         return a.localizedStandardCompare(b) == .orderedAscending
+    }
+
+    /// memcmp order of two keys (−1, 0, 1).
+    @inline(__always)
+    static func compare(_ a: [UInt8], _ b: [UInt8]) -> Int {
+        a.withUnsafeBufferPointer { pa in
+            b.withUnsafeBufferPointer { pb in
+                let n = min(pa.count, pb.count)
+                if n > 0 {
+                    let c = memcmp(pa.baseAddress!, pb.baseAddress!, n)
+                    if c != 0 { return c < 0 ? -1 : 1 }
+                }
+                return pa.count == pb.count ? 0 : (pa.count < pb.count ? -1 : 1)
+            }
+        }
     }
 
     /// Sort `items` by `name` in Finder order.
     public static func sort<T>(_ items: [T], by name: (T) -> String) -> [T] {
-        var keyed: [(key: [UInt8], item: T, name: String)] = []
-        keyed.reserveCapacity(items.count)
+        var keys: [[UInt8]] = []
+        keys.reserveCapacity(items.count)
         for item in items {
-            let n = name(item)
-            guard let key = key(n) else {
+            guard let key = key(name(item)) else {
                 return items.sorted { name($0).localizedStandardCompare(name($1)) == .orderedAscending }
             }
-            keyed.append((key, item, n))
+            keys.append(key)
         }
-        keyed.sort { a, b in
-            if a.key != b.key { return a.key.lexicographicallyPrecedes(b.key) }
-            return a.name.localizedStandardCompare(b.name) == .orderedAscending
+        var order = Array(items.indices)
+        order.sort { i, j in
+            let c = compare(keys[i], keys[j])
+            if c != 0 { return c < 0 }
+            return name(items[i]).localizedStandardCompare(name(items[j])) == .orderedAscending
         }
-        return keyed.map(\.item)
+        return order.map { items[$0] }
     }
 }

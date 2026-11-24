@@ -12,6 +12,7 @@ func runPipelineBench(_ args: ArraySlice<String>) throws {
     var traceName = "all"
     var screen = 3456
     var quick = false
+    var listing: Int?
     var rest = args
     while let arg = rest.popFirst() {
         switch arg {
@@ -19,9 +20,11 @@ func runPipelineBench(_ args: ArraySlice<String>) throws {
         case "--trace": traceName = rest.popFirst() ?? "all"
         case "--screen": screen = Int(rest.popFirst() ?? "") ?? screen
         case "--quick": quick = true
+        case "--listing": listing = Int(rest.popFirst() ?? "") ?? 10_000
         default: throw BenchError.usage("unknown option \(arg)")
         }
     }
+    if let listing { return try runListingBench(count: listing) }
     guard let corpus else { throw BenchError.usage("pass --corpus DIR or set PEEKABOO_CORPUS") }
     var folder = URL(fileURLWithPath: corpus)
     if FileManager.default.fileExists(atPath: folder.appendingPathComponent("nav").path) {
@@ -214,4 +217,40 @@ private func median(_ values: [Double]) -> Double { percentile(values, 0.5) }
 private func fmt(_ value: Double) -> String {
     if value.isNaN { return "—" }
     return value < 10 ? String(format: "%.1f", value) : String(format: "%.0f", value)
+}
+
+/// `--listing N`: folder listing and Finder-order sorting on N synthetic files in a temporary directory.
+private func runListingBench(count: Int) throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("peekaboo-listing-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let stems = ["IMG_", "DSC0", "photo (", "Screenshot 2026-11-24 at ", "스크린샷 2026-11-24 오후 ", "P10", "_MG_"]
+    for i in 0..<count {
+        let stem = stems[i % stems.count]
+        let name = stem.hasSuffix("(") ? "\(stem)\(i)).jpg" : "\(stem)\(i).\(i % 5 == 0 ? "heic" : "jpg")"
+        FileManager.default.createFile(atPath: directory.appendingPathComponent(name).path, contents: nil)
+    }
+    func measure(_ label: String, _ body: () throws -> Int) rethrows {
+        var times: [Double] = []
+        var n = 0
+        _ = try body()
+        for _ in 0..<7 {
+            let start = Trace.now()
+            n = try body()
+            times.append(Trace.ms(since: start))
+        }
+        print("\(label.padding(toLength: 46, withPad: " ", startingAt: 0)) n=\(n)  median \(fmt(median(times))) ms")
+    }
+    print("listing bench: \(count) files")
+    try measure("getattrlistbulk (name, type, mtime, flags, id)") { try FolderScanner.listBulk(directory)?.count ?? -1 }
+    try measure("FileManager + lstat (fallback)") { try FolderScanner.listWithFileManager(directory).count }
+    let names = try FolderScanner.listBulk(directory)!.map(\.name).shuffled()
+    measure("natural keys: build only") { names.reduce(0) { $0 + (NaturalSort.key($1)?.count ?? 0) } }
+    let unsupported = names.filter { NaturalSort.key($0) == nil }
+    if !unsupported.isEmpty { print("names without a fast key: \(unsupported.count), e.g. \(unsupported.prefix(2))") }
+    measure("sort: precomputed natural keys") { NaturalSort.sort(names, by: { $0 }).count }
+    measure("sort: localizedStandardCompare") { names.sorted { $0.localizedStandardCompare($1) == .orderedAscending }.count }
+    try measure("FolderScanner.scan (list + filter + sort)") { try FolderScanner.scan(directory).count }
+    let same = NaturalSort.sort(names, by: { $0 }) == names.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    print("natural keys agree with localizedStandardCompare: \(same)")
 }

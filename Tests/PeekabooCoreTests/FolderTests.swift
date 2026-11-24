@@ -47,6 +47,8 @@ final class FolderTests: XCTestCase {
             }
         }
         XCTAssertNotNil(NaturalSort.key("스크린샷 2026-11-24 오후 11.00.00.png"), "Hangul names use the fast key")
+        let decomposed = "스크린샷 2.png".decomposedStringWithCanonicalMapping
+        XCTAssertEqual(NaturalSort.key(decomposed), NaturalSort.key("스크린샷 2.png"), "NFD names from the file system")
     }
 
     func testNaturalKeysMatchFinderOrderOnRandomNames() {
