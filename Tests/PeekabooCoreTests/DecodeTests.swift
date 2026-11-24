@@ -52,7 +52,10 @@ final class DecodeTests: XCTestCase {
 
     private func write(_ image: CGImage, _ name: String, type: UTType, properties: [CFString: Any] = [:]) throws -> URL {
         let url = dir.appendingPathComponent(name)
-        let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(url as CFURL, type.identifier as CFString, 1, nil))
+        // HEIC needs the hardware HEVC encoder, which CI virtual machines may lack.
+        guard let destination = CGImageDestinationCreateWithURL(url as CFURL, type.identifier as CFString, 1, nil) else {
+            throw XCTSkip("no \(type.identifier) encoder")
+        }
         var props = properties
         if type == .jpeg || type == .heic { props[kCGImageDestinationLossyCompressionQuality] = 0.95 }
         CGImageDestinationAddImage(destination, image, props as CFDictionary)
