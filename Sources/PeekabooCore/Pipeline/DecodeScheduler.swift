@@ -30,6 +30,13 @@ struct DecodeOutcome: Sendable {
     let result: Result<DecodedImage, Error>
     /// Metadata of the file: the job's, or probed by the worker before the decode (nil only when that probe failed).
     let info: ImageInfo?
+    /// The file as `stat` saw it before and after the decode, when both agreed: what was decoded. Nil when the file
+    /// could not be stat'ed, or changed while it was decoded (see `changedDuringDecode`).
+    let stamp: FileStamp?
+    /// Size or modification time changed while the file was decoded (it is being written): the pixels match no version.
+    let changedDuringDecode: Bool
+    /// When `stamp` was read (`Trace.now()`), to tell whether it is newer than the listing.
+    let stampedAt: UInt64
     let wallMs: Double
     /// Decodes running when this one started, itself included.
     let concurrency: Int
@@ -244,6 +251,8 @@ final class DecodeScheduler: @unchecked Sendable {
         if job.kind == .visible { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) }
         defer { if job.kind == .visible { pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0) } }
         let url = job.key.url
+        // `stat` before and after (~2 µs each): a file written meanwhile, or since it was listed, is caught here.
+        let before = FileStamp.read(url)
         // First decode of the file: read its metadata before decoding (0.03–0.09 ms; the decode reuses the parse), so
         // the outcome carries it to the planner, and charge the job to the lane its decode path really takes. The
         // planner only knew the extension: a progressive JPEG decodes with libjpeg-turbo on a CPU lane, not on the
@@ -274,7 +283,10 @@ final class DecodeScheduler: @unchecked Sendable {
             }
         }
         Trace.signposter.endInterval("decode", interval)
-        return DecodeOutcome(job: job, result: result, info: job.info, wallMs: Trace.ms(since: start),
+        let wallMs = Trace.ms(since: start)
+        let after = FileStamp.read(url)
+        return DecodeOutcome(job: job, result: result, info: job.info, stamp: before == after ? after : nil,
+                             changedDuringDecode: before != after, stampedAt: Trace.now(), wallMs: wallMs,
                              concurrency: concurrency)
     }
 

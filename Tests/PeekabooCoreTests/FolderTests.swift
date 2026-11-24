@@ -101,6 +101,20 @@ final class FolderTests: XCTestCase {
         XCTAssertEqual(bulk.count, distinct + 1)
     }
 
+    /// The decode workers' `stat` and the listing agree to the bit (size and modification time), or every rescan
+    /// would take decoded files for changed ones and decode them again.
+    func testListingStampsMatchStat() throws {
+        try touch("a.jpg", bytes: 10)
+        try touch("b.jpg", bytes: 2000)
+        try FileManager.default.createSymbolicLink(at: directory.appendingPathComponent("link.jpg"),
+                                                   withDestinationURL: directory.appendingPathComponent("b.jpg"))
+        let bulk = try XCTUnwrap(FolderScanner.listBulk(directory))
+        for file in bulk + (try FolderScanner.listWithFileManager(directory)) {
+            XCTAssertEqual(FileStamp.read(file.url), FileStamp(file), file.name)
+        }
+        XCTAssertEqual(bulk.count, 3)
+    }
+
     func testScanFiltersAndSortsLikeFinder() throws {
         let names = ["b.jpg", "a10.png", "a9.heic", "notes.txt", "A1.JPG", "clip.mov", "x.webp"]
         for name in names { try touch(name) }

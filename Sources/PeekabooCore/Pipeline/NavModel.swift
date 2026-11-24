@@ -38,6 +38,13 @@ public struct PrefetchTuning: Sendable, Equatable {
     /// Inside the screen-tier window, prefetch a neighbour's preview only when it is cheap (false = always, the
     /// previous behaviour; kept for A/B runs of `peekaboo-bench pipeline --all-previews`).
     public var screenWindowCheapPreviewsOnly = true
+    /// Files on disk change without a directory event while written in place (a copy in progress, an editor saving
+    /// over the file). A file written less than `settleMs` before it was decoded is rechecked every `recheckMs` until
+    /// it is unchanged and that old; its failures are retried rather than reported meanwhile. Changed tiers are
+    /// decoded again once nothing has been written for `quietMs`.
+    public var settleMs = 2000.0
+    public var quietMs = 500.0
+    public var recheckMs = 500.0
 
     public init() {}
 

@@ -165,5 +165,6 @@ public enum FolderScanner {
                          fileID: UInt64(info.st_ino))
     }
 
-    private static func seconds(_ time: timespec) -> Double { Double(time.tv_sec) + Double(time.tv_nsec) / 1e9 }
+    /// `ImageFile.modified` of a `stat` time (the listing and `FileStamp` must agree to the bit).
+    static func seconds(_ time: timespec) -> Double { Double(time.tv_sec) + Double(time.tv_nsec) / 1e9 }
 }

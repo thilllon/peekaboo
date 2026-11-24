@@ -78,6 +78,8 @@ public struct PipelineStats: Sendable, Equatable {
     public var sweepDecodes = 0
     /// Sweep previews served by QuickLook's thumbnail cache.
     public var quickLookPreviews = 0
+    /// Files whose decoded tiers were dropped because the file changed on disk after it was decoded.
+    public var changedOnDisk = 0
     public init() {}
 }
 
@@ -109,12 +111,20 @@ public final class ImagePipeline {
         var preview: DecodedImage?
         var screen: DecodedImage?
         var full: DecodedImage?
-        /// `ImageFile.version` the pixels were decoded from (nil = unknown, e.g. opened before the folder listing).
-        var version: String?
+        /// The file as it was when the tiers, metadata and failures were decoded (nil = nothing decoded yet, or the
+        /// file could not be stat'ed).
+        var stamp: FileStamp?
+        /// When the pipeline itself last saw `files[i]`'s stamp on disk (`Trace.now()`; 0 = it comes from the listing).
+        var stampedAt: UInt64 = 0
         var info: ImageInfo?
         var family: CostModel.Family?
-        /// Tiers that failed (bit per tier): never retried.
+        /// Tiers that failed (bit per tier): not retried while the file is unchanged.
         var failed: UInt8 = 0
+        /// Tiers waiting for the file to stop changing (it was written during their decode, or they failed while it
+        /// was being written): not planned until a recheck finds it quiet.
+        var deferred: UInt8 = 0
+        /// The file was written shortly before it was decoded: it is rechecked until it is unchanged and settled.
+        var unsettled = false
         /// Read-ahead issued: 1 = head, 2 = whole file.
         var advised: UInt8 = 0
         /// QuickLook had no thumbnail: the sweep does not ask again.
@@ -133,7 +143,9 @@ public final class ImagePipeline {
         }
 
         var hasPixels: Bool { preview != nil || screen != nil || full != nil }
-        var hasState: Bool { hasPixels || info != nil || failed != 0 || advised != 0 }
+        /// Something was decoded from the file (that a change on disk makes stale).
+        var hasDecoded: Bool { hasPixels || failed != 0 || deferred != 0 }
+        var hasState: Bool { hasDecoded || info != nil || unsettled || advised != 0 }
     }
 
     private var slots: [Slot] = []
@@ -154,6 +166,14 @@ public final class ImagePipeline {
     private let inbox = OutcomeInbox()
     /// Pixels the cache let go of, freed off the main thread.
     private let releaser = Releaser()
+    /// When the browsing set was last replaced (`Trace.now()`): its stamps are at least that recent.
+    private var listedAt: UInt64 = 0
+    /// Files to `stat` again and when (`Trace.now()` nanos): recently written ones, and the image navigated to.
+    private var rechecks: [URL: UInt64] = [:]
+    private var recheckTimer: DispatchSourceTimer?
+    private static let statQueue = DispatchQueue(label: "peekaboo.recheck", qos: .userInitiated)
+    /// Reaches the pipeline from other threads without keeping it alive.
+    private let weakSelf = WeakPipeline()
 
     public convenience init(decoder: ImageDecoder, pool: PixelBufferPool, config: PipelineConfig = PipelineConfig()) {
         self.init(decoder: decoder, pool: pool, config: config, quickLook: DecodeScheduler.systemQuickLook)
@@ -166,7 +186,7 @@ public final class ImagePipeline {
         self.pool = pool
         self.config = config
         costs.alpha = config.tuning.alpha
-        let box = WeakPipeline()
+        let box = weakSelf
         let inbox = self.inbox
         scheduler = DecodeScheduler(decoder: decoder, pool: pool, limits: config.laneLimits, quickLook: quickLook) { outcome in
             inbox.push(outcome)
@@ -179,6 +199,7 @@ public final class ImagePipeline {
     deinit {
         scheduler.stop()
         wakeTimer?.cancel()
+        recheckTimer?.cancel()
         pressureSource?.cancel()
     }
 
@@ -191,6 +212,7 @@ public final class ImagePipeline {
         let oldFiles = self.files
         var oldSlots = self.slots
         self.files = files
+        listedAt = Trace.now()
         position = Dictionary(files.enumerated().map { ($1.url, $0) }, uniquingKeysWith: { first, _ in first })
         slots = [Slot](repeating: Slot(), count: files.count)
         cachedIndices.removeAll(keepingCapacity: true)
@@ -202,12 +224,14 @@ public final class ImagePipeline {
                 release(slot)
                 continue
             }
-            if let version = Self.knownVersion(files[j]) {
-                if let cached = slot.version, cached != version {
+            if let listed = FileStamp(files[j]) {
+                if let decoded = slot.stamp, decoded != listed {
                     release(slot)
                     slot = Slot()  // changed on disk: decode again
+                    stats.changedOnDisk += 1
+                } else if slot.stamp == nil, slot.hasPixels {
+                    slot.stamp = listed  // decoded where `stat` failed: the listing is all there is
                 }
-                slot.version = version
             }
             slots[j] = slot
             if slot.hasPixels {
@@ -241,6 +265,8 @@ public final class ImagePipeline {
         if files[target].url != currentFile?.url { fullRequested = nil }
         navigation.navigate(to: target, now: now, count: files.count, isRepeat: isRepeat)
         self.index = target
+        // Rewritten in place since it was decoded? That raises no directory event: `stat` it on arrival (off-main).
+        if slots[target].hasDecoded { scheduleRecheck(files[target].url, afterMs: 0) }
         if isCached(target, .screen) {
             stats.hits += 1
         } else {
@@ -271,7 +297,7 @@ public final class ImagePipeline {
             drainInbox()
             guard let i = slotIndex(of: file), currentFile == file else { return false }
             if slots[i].hasPixels { return true }
-            if slots[i].failed & (1 << Tier.screen.rawValue) != 0 { return false }
+            if (slots[i].failed | slots[i].deferred) & (1 << Tier.screen.rawValue) != 0 { return false }
             guard inbox.wait(until: deadline) else { return slots[i].hasPixels }
         }
     }
@@ -382,7 +408,7 @@ public final class ImagePipeline {
             cached: { [unowned self] j, tier in self.isCached(j, tier) },
             busy: { [unowned self] j, tier in
                 let bit: UInt8 = 1 << tier.rawValue
-                return (busyBits[j] ?? 0) & bit != 0 || self.slots[j].failed & bit != 0
+                return (busyBits[j] ?? 0) & bit != 0 || (self.slots[j].failed | self.slots[j].deferred) & bit != 0
             },
             estimate: { [unowned self] j, tier in self.estimate(j, tier) },
             cheapPreview: { [unowned self] j in self.isCheapPreview(j) },
@@ -478,12 +504,39 @@ public final class ImagePipeline {
         scheduler.acknowledge(key)
         defer { scheduleReplan() }
         guard let i = position[key.url] else { stats.wasted += 1; return }
-        let file = files[i]
-        // The file changed on disk while decoding.
-        if let decodedFrom = Self.knownVersion(outcome.job.file), let now = Self.knownVersion(file), decodedFrom != now {
+        let tuning = config.tuning
+        let bit: UInt8 = 1 << key.tier.rawValue
+        // Written while it was decoded: the pixels match no version of the file. Decode again once it is quiet.
+        if outcome.changedDuringDecode {
             stats.wasted += 1
+            slots[i].deferred |= bit
+            slots[i].unsettled = true
+            scheduleRecheck(key.url, afterMs: tuning.recheckMs)
             return
         }
+        var fresh = false
+        if let stamp = outcome.stamp {
+            if FileStamp(files[i]) != stamp {
+                // The listing is stale (the file was written in place since, which raises no directory event), or it
+                // is newer than this decode.
+                guard outcome.stampedAt >= max(listedAt, slots[i].stampedAt) else { stats.wasted += 1; return }
+                files[i] = files[i].restamped(stamp)
+                slots[i].stampedAt = outcome.stampedAt
+            }
+            if let decoded = slots[i].stamp, decoded != stamp { dropDecoded(i) }  // tiers of an older version
+            slots[i].stamp = stamp
+            // Written moments ago, maybe still being written (a copy in progress lists a partial file, and ImageIO
+            // decodes a truncated JPEG as complete): provisional until a recheck finds it settled.
+            fresh = stamp.written(within: tuning.settleMs / 1000, now: Date().timeIntervalSince1970)
+            if fresh {
+                slots[i].unsettled = true
+                scheduleRecheck(key.url, afterMs: tuning.recheckMs)
+            }
+        } else if let decodedFrom = FileStamp(outcome.job.file), let listed = FileStamp(files[i]), decodedFrom != listed {
+            stats.wasted += 1  // no `stat` here, but the listing changed while it decoded
+            return
+        }
+        let file = files[i]
         if slots[i].info == nil, let info = outcome.info {
             slots[i].info = info
             slots[i].lanes = [nil, nil, nil]  // lanes may depend on the metadata
@@ -504,9 +557,13 @@ public final class ImagePipeline {
             onDecoded?(file, image)
         case .failure(_) where outcome.job.quickLook:
             slots[i].quickLookMissed = true
+        case .failure(let error) where fresh:
+            // Most likely an empty or truncated file still being written: retry once it is quiet, report nothing yet.
+            slots[i].deferred |= bit | (key.tier == .screen ? 1 << Tier.full.rawValue : 0)
+            Trace.log("decode failed \(file.name) tier=\(key.tier) while it is being written: retry later (\(error))")
         case .failure(let error):
             stats.failures += 1
-            slots[i].failed |= 1 << key.tier.rawValue
+            slots[i].failed |= bit
             if key.tier == .screen { slots[i].failed |= 1 << Tier.full.rawValue }
             Trace.log("decode failed \(file.name) tier=\(key.tier): \(error)")
             // A failed preview is silent: the screen tier may still succeed.
@@ -528,11 +585,121 @@ public final class ImagePipeline {
         }
     }
 
-    // MARK: Cache
+    // MARK: Files changing on disk
 
-    private static func knownVersion(_ file: ImageFile) -> String? {
-        file.byteSize == 0 && file.modified == 0 ? nil : file.version
+    /// `stat` `url` again after `ms` (off the main thread), unless a recheck is due sooner.
+    private func scheduleRecheck(_ url: URL, afterMs ms: Double) {
+        let due = Trace.now() &+ UInt64(max(ms, 0) * 1e6)
+        if let pending = rechecks[url], pending <= due { return }
+        rechecks[url] = due
+        armRecheckTimer()
     }
+
+    private func armRecheckTimer() {
+        guard let next = rechecks.values.min() else {
+            recheckTimer?.schedule(deadline: .distantFuture)
+            return
+        }
+        if recheckTimer == nil {
+            let timer = DispatchSource.makeTimerSource(queue: .main)
+            timer.setEventHandler { [weak self] in self?.runRechecks() }
+            timer.resume()
+            recheckTimer = timer
+        }
+        let now = Trace.now()
+        recheckTimer?.schedule(deadline: .now() + .nanoseconds(next > now ? Int(next - now) : 0), leeway: .milliseconds(2))
+    }
+
+    private func runRechecks() {
+        let now = Trace.now()
+        let due = rechecks.compactMap { $0.value <= now ? $0.key : nil }
+        for url in due { rechecks[url] = nil }
+        armRecheckTimer()
+        guard !due.isEmpty else { return }
+        let box = weakSelf
+        Self.statQueue.async {
+            let stamps = due.map { FileStamp.read($0) }
+            let observedAt = Trace.now()
+            let wall = Date().timeIntervalSince1970
+            DispatchQueue.main.async { box.pipeline?.applyRechecks(due, stamps, observedAt: observedAt, wall: wall) }
+        }
+    }
+
+    private func applyRechecks(_ urls: [URL], _ stamps: [FileStamp?], observedAt: UInt64, wall: Double) {
+        var changed = false
+        for (url, stamp) in zip(urls, stamps) {
+            if revalidate(url, observed: stamp, observedAt: observedAt, wall: wall) { changed = true }
+        }
+        flushReleases()
+        if changed { scheduleReplan() }
+    }
+
+    /// Compare the file at `url`, as `stat` just saw it, with what was decoded from it. Tiers of an older version are
+    /// dropped once nothing has been written for `quietMs` (until then they stay on screen); deferred tiers are
+    /// planned again then. Returns true when the plan changes.
+    private func revalidate(_ url: URL, observed: FileStamp?, observedAt: UInt64, wall: Double) -> Bool {
+        guard let i = position[url] else { return false }
+        guard observedAt >= max(listedAt, slots[i].stampedAt) else {
+            // Seen before a newer listing or decode arrived: look again rather than act on it.
+            if slots[i].unsettled || slots[i].deferred != 0 { scheduleRecheck(url, afterMs: 0) }
+            return false
+        }
+        guard let observed else { return false }  // gone: the folder watcher reports removals
+        let tuning = config.tuning
+        if FileStamp(files[i]) != observed {
+            files[i] = files[i].restamped(observed)
+            slots[i].stampedAt = observedAt
+        }
+        let writing = observed.written(within: tuning.quietMs / 1000, now: wall)
+        if let decoded = slots[i].stamp, decoded != observed {
+            if writing {
+                scheduleRecheck(url, afterMs: tuning.recheckMs)
+                return false
+            }
+            dropDecoded(i)
+            return true
+        }
+        var changed = false
+        if slots[i].deferred != 0 {
+            if writing {
+                scheduleRecheck(url, afterMs: tuning.recheckMs)
+                return false
+            }
+            slots[i].deferred = 0
+            changed = true
+        }
+        if slots[i].unsettled {
+            if observed.written(within: tuning.settleMs / 1000, now: wall) {
+                scheduleRecheck(url, afterMs: tuning.recheckMs)
+            } else {
+                slots[i].unsettled = false
+            }
+        }
+        return changed
+    }
+
+    /// Forget what was decoded from file `j` (it changed on disk); its read-ahead hint and family stay.
+    private func dropDecoded(_ j: Int) {
+        let old = slots[j]
+        for tier in Tier.allCases {
+            if let image = old[tier] {
+                tierBytes[tier.rawValue] -= image.pixels.allocatedBytes
+                releaser.add(image)
+            }
+        }
+        slots[j] = Slot()
+        slots[j].stampedAt = old.stampedAt
+        slots[j].family = old.family
+        slots[j].advised = old.advised
+        cachedIndices.remove(j)
+        stats.changedOnDisk += 1
+        recountBytes()
+    }
+
+    /// `stat`s scheduled and not yet run (tests).
+    var pendingRechecks: Int { rechecks.count }
+
+    // MARK: Cache
 
     private static func isFullResolution(_ image: DecodedImage) -> Bool {
         max(image.pixels.width, image.pixels.height) >= max(image.fullWidth, image.fullHeight)
@@ -572,7 +739,6 @@ public final class ImagePipeline {
     }
 
     private func insert(_ image: DecodedImage, at j: Int, tier: Tier) {
-        if slots[j].version == nil { slots[j].version = Self.knownVersion(files[j]) }
         if let old = slots[j][tier] {
             tierBytes[tier.rawValue] -= old.pixels.allocatedBytes
             releaser.add(old)
