@@ -38,6 +38,8 @@ public final class FileOperations {
 
     public private(set) var undoStack: [Change] = []
     public private(set) var redoStack: [Change] = []
+    /// Undoing a copy moves the copy to the Trash, as Finder does; false deletes it (tests).
+    public var trashesUndoneCopies = true
     private let fm = FileManager.default
 
     public init() {}
@@ -181,6 +183,7 @@ public final class FileOperations {
     private func removeCopy(_ url: URL) throws {
         guard fm.fileExists(atPath: url.path) else { return }
         do {
+            guard trashesUndoneCopies else { throw Failure("delete") }
             try fm.trashItem(at: url, resultingItemURL: nil)
         } catch {
             do { try fm.removeItem(at: url) } catch { throw Failure("Cannot remove the copy: \(Self.reason(error))") }

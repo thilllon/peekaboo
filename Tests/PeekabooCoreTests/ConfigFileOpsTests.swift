@@ -54,6 +54,7 @@ final class ConfigFileOpsTests: XCTestCase {
         try make("keep/IMG_0002 2.jpg", "older too")
         let keep = root.appendingPathComponent("keep")
         let ops = FileOperations()
+        ops.trashesUndoneCopies = false // keep test files out of the user's Trash
 
         let moved = try ops.move(photo, toFolder: keep)
         XCTAssertEqual(moved, .moved(from: photo, to: keep.appendingPathComponent("IMG_0002 3.jpg")))
