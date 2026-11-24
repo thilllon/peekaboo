@@ -3,6 +3,7 @@ import PeekabooCore
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var viewer: ViewerWindowController?
+    private let configStore = ConfigStore()
     /// Paths opened during launch; AppKit may deliver argv paths *and* an
     /// open-documents event for the same file, so dedupe for a short window.
     private var recentlyOpened: [String: Date] = [:]
@@ -10,8 +11,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = MainMenu.make()
+        configStore.load()
         // Build the window now so its creation overlaps the wait for the open-documents event.
-        viewer = ViewerWindowController()
+        viewer = ViewerWindowController(configStore: configStore)
+        configStore.onChange = { [weak self] config in self?.viewer?.apply(config) }
+        configStore.startWatching()
         // `Peekaboo <path>` from a terminal: start immediately.
         let paths = CommandLine.arguments.dropFirst().filter { FileManager.default.fileExists(atPath: $0) }
         if !paths.isEmpty { open(paths.map { URL(fileURLWithPath: $0) }) }
@@ -43,7 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         guard !fresh.isEmpty else { return }
         openedSomething = true
-        if viewer == nil { viewer = ViewerWindowController() }
+        if viewer == nil { viewer = ViewerWindowController(configStore: configStore) }
         viewer?.open(fresh)
     }
 }
