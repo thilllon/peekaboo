@@ -266,7 +266,8 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
         let long = max(info.pixelWidth, info.pixelHeight)
         if tier != .full {
             if cr3 {
-                // ImageIO exposes no CR3 preview (asking runs a RAW decode): use the container's JPEGs.
+                // ImageIO exposes no CR3 preview (asking runs a RAW decode): use the container's JPEG / HEVC
+                // renditions (HDR PQ EOS R5 Mark II `.screen` from its HEVC tile grid: 88 ms vs 421 ms for the RAW).
                 if let output = cr3Preview(url: url, info: info, tier: tier, target: target, pool: pool) { return output }
             } else {
                 // Without `…Always` ImageIO returns the camera's embedded JPEG, scaled to the target when it is

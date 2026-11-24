@@ -1,26 +1,43 @@
 import Foundation
 
-/// Canon CR3 embedded JPEGs. ImageIO exposes no preview for CR3 (its thumbnail call falls back to a
-/// 300+ ms RAW decode), but the ISO-BMFF container carries a 1620×1080 `PRVW` JPEG and a
-/// full-size JPEG in track 1 (`CRAW` sample entry with a `JPEG` child). Parsing the boxes reads
-/// ~100 KB of headers.
+/// Canon CR3 embedded renditions. ImageIO exposes no preview for CR3 (its thumbnail call falls back to
+/// a 300+ ms RAW decode), but the ISO-BMFF container carries a 1620×1080 `PRVW` JPEG and a full-size
+/// JPEG in track 1 (`CRAW` sample entry with a `JPEG` child). Bodies shooting HDR PQ (e.g. EOS R5
+/// Mark II) store both as HEVC instead, track 1 as a grid of tiles. Parsing the boxes reads ~100 KB
+/// of headers.
 enum CR3Preview {
     struct Candidate: Equatable {
         let offset: Int
         let length: Int
         let width: Int
         let height: Int
-        /// Newer bodies (e.g. EOS R5 Mark II in HDR PQ mode) store the `PRVW` preview as HEVC:
-        /// these are its property boxes (`hvcC`, `colr`, `pixi`); `bytes` wraps the bitstream in a HEIF.
+        /// HEVC renditions: their property boxes (`hvcC`, `colr`, `pixi`); `bytes` wraps the bitstream
+        /// in a HEIF.
         var hevcProperties: [[UInt8]]?
+        /// Track-1 HEVC: the tile grid of the sample.
+        var grid: Grid?
 
         var isHEVC: Bool { hevcProperties != nil }
+    }
+
+    /// Tiles stored row-major, each as a u32 byte count and its length-prefixed NAL units.
+    struct Grid: Equatable {
+        let rows: Int
+        let columns: Int
+        let tileWidth: Int
+        let tileHeight: Int
+
+        /// As a HEIF `ImageGrid` requires: the tiles cover the output, the last row and column only partly.
+        func covers(width: Int, height: Int) -> Bool {
+            tileWidth > 0 && tileHeight > 0 && (columns - 1) * tileWidth < width && columns * tileWidth >= width
+                && (rows - 1) * tileHeight < height && rows * tileHeight >= height
+        }
     }
 
     private static let prvwUUID: [UInt8] = [0xEA, 0xF4, 0x2B, 0x5E, 0x1C, 0x98, 0x4B, 0x88,
                                             0xB9, 0xFB, 0xB7, 0xDC, 0x40, 0x6E, 0x4D, 0x16]
 
-    /// Every embedded JPEG we can locate, smallest first.
+    /// Every embedded rendition we can locate, smallest first.
     static func candidates(url: URL) -> [Candidate] {
         let fd = open(url.path, O_RDONLY)
         guard fd >= 0 else { return [] }
@@ -48,7 +65,7 @@ enum CR3Preview {
             // overflow and trap (`read` above guarantees offset < fileSize).
             guard size >= headerSize, size <= fileSize - offset else { break }
             if type == "moov", size < 16 << 20, let moov = read(offset, size) {
-                result += trackJPEGs(moov, from: headerSize, to: size)
+                result += trackImages(moov, from: headerSize, to: size)
             } else if type == "uuid", let uuid = read(offset + 8, 16), uuid == prvwUUID,
                       let body = read(offset + 24, min(4096, size - 24)), body.count > 32 {
                 // uuid payload: 8 bytes, then the PRVW box (… u16 width @14, u16 height @16, u32 size @20),
@@ -68,9 +85,11 @@ enum CR3Preview {
         return result.sorted { $0.width * $0.height < $1.width * $1.height }
     }
 
-    /// Read the bytes of one candidate: a JPEG, or for HEVC previews a minimal HEIF around the bitstream.
+    /// Read the bytes of one candidate: a JPEG, or for HEVC renditions a minimal HEIF around the bitstream.
     static func bytes(url: URL, _ candidate: Candidate) -> Data? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        // Renditions are a few MB (EOS R5 Mark II full-size HEVC: 10.5 MB); sizes come from the file.
+        guard candidate.length > 0, candidate.length <= 256 << 20,
+              let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
         let payload: Data
         do {
@@ -79,7 +98,8 @@ enum CR3Preview {
             payload = data
         } catch { return nil }
         guard let properties = candidate.hevcProperties else { return payload }
-        return heif(hevc: payload, properties: properties, width: candidate.width, height: candidate.height)
+        return heif(hevc: payload, properties: properties, width: candidate.width, height: candidate.height,
+                    grid: candidate.grid)
     }
 
     /// PRVW HEVC layout: `CISZ`, `hvcC`, `colr`, `pixi`, then `IMGD` holding length-prefixed NAL units.
@@ -110,39 +130,77 @@ enum CR3Preview {
         return nil
     }
 
-    /// A single-item HEIF (`hvc1` item with the given property boxes plus `ispe`) for ImageIO's
-    /// hardware HEVC decoder; nil when `ipma` (flags 0: 7-bit indices) cannot address every property.
-    static func heif(hevc: Data, properties: [[UInt8]], width: Int, height: Int) -> Data? {
-        func u16(_ v: Int) -> [UInt8] { [UInt8(v >> 8 & 0xFF), UInt8(v & 0xFF)] }
-        func u32(_ v: Int) -> [UInt8] { [UInt8(v >> 24 & 0xFF), UInt8(v >> 16 & 0xFF), UInt8(v >> 8 & 0xFF), UInt8(v & 0xFF)] }
-        func box(_ type: String, _ payload: [UInt8]) -> [UInt8] { u32(8 + payload.count) + Array(type.utf8) + payload }
-        func full(_ type: String, _ version: UInt8, _ payload: [UInt8]) -> [UInt8] { box(type, [version, 0, 0, 0] + payload) }
+    /// A HEIF for ImageIO's hardware HEVC decoder: one `hvc1` item over `hevc`, or with `grid` a `grid` item
+    /// (the primary) over hidden `hvc1` tiles cut from `hevc`. Image items carry `properties` (`hvcC` first,
+    /// essential) and `ispe`. Nil when the tiles do not fill the grid, or `ipma` (flags 0: 7-bit indices)
+    /// cannot address every property.
+    static func heif(hevc: Data, properties: [[UInt8]], width: Int, height: Int, grid: Grid? = nil) -> Data? {
+        guard !properties.isEmpty, hevc.count <= 1 << 30, width <= 0xFFFF, height <= 0xFFFF else { return nil }
+        // Image items as (offset, length) in `hevc`.
+        var extents = [(0, hevc.count)]
+        var tile = (width: width, height: height)
+        if let grid {
+            let count = grid.rows * grid.columns
+            guard (1...256).contains(grid.rows), (1...256).contains(grid.columns), count <= 4096 else { return nil }
+            extents = []
+            var at = 0
+            while extents.count < count, hevc.count - at >= 4 {
+                let size = (0..<4).reduce(0) { $0 << 8 | Int(hevc[hevc.startIndex + at + $1]) }
+                guard size > 0, size <= hevc.count - at - 4 else { return nil }
+                extents.append((at + 4, size))
+                at += 4 + size
+            }
+            guard extents.count == count else { return nil }
+            tile = (grid.tileWidth, grid.tileHeight)
+        }
+        let props = properties + [full("ispe", 0, u32(tile.width) + u32(tile.height))]
+            + (grid == nil ? [] : [full("ispe", 0, u32(width) + u32(height))])
+        guard props.count <= 127 else { return nil }
+        let n = properties.count
+        let images = Array(1...extents.count), gridID = extents.count + 1  // item IDs
+        let items = images.count + (grid == nil ? 0 : 1)
 
         let ftyp = box("ftyp", Array("heic".utf8) + u32(0) + Array("mif1heic".utf8))
         let hdlr = full("hdlr", 0, u32(0) + Array("pict".utf8) + u32(0) + u32(0) + u32(0) + [0])
-        let pitm = full("pitm", 0, u16(1))
-        let iinf = full("iinf", 0, u16(1) + full("infe", 2, u16(1) + u16(0) + Array("hvc1".utf8) + [0]))
-        let ispe = full("ispe", 0, u32(width) + u32(height))
-        let props = properties + [ispe]
-        guard props.count <= 127 else { return nil }
+        let pitm = full("pitm", 0, u16(grid == nil ? 1 : gridID))
+        var infe = images.flatMap { full("infe", 2, flags: grid == nil ? 0 : 1, u16($0) + u16(0) + Array("hvc1".utf8) + [0]) }
+        if grid != nil { infe += full("infe", 2, u16(gridID) + u16(0) + Array("grid".utf8) + [0]) }
+        let iinf = full("iinf", 0, u16(items) + infe)
+        let iref = grid == nil ? [] : full("iref", 0, box("dimg", u16(gridID) + u16(images.count) + images.flatMap(u16)))
         let ipco = box("ipco", props.flatMap { $0 })
-        let associations = (1...props.count).map { UInt8($0) | ($0 == 1 ? 0x80 : 0) }  // hvcC is essential
-        let ipma = full("ipma", 0, u32(1) + u16(1) + [UInt8(props.count)] + associations)
-        let iprp = box("iprp", ipco + ipma)
+        let imageProperties = (1...n + 1).map { UInt8($0) | ($0 == 1 ? 0x80 : 0) }  // properties + ispe; hvcC is essential
+        var entries = images.flatMap { u16($0) + [UInt8(imageProperties.count)] + imageProperties }
+        if grid != nil {
+            let gridProperties = [UInt8(n + 2)] + (2..<n + 1).map { UInt8($0) }  // output ispe, then colr / pixi
+            entries += u16(gridID) + [UInt8(gridProperties.count)] + gridProperties
+        }
+        let iprp = box("iprp", ipco + full("ipma", 0, u32(items) + entries))
+        // mdat: `hevc`, then for a grid its ImageGrid (version 0, flags 0: 16-bit size; rows − 1, columns − 1).
+        let imageGrid = grid.map { [0, 0, UInt8($0.rows - 1), UInt8($0.columns - 1)] + u16(width) + u16(height) } ?? []
         func meta(dataOffset: Int) -> [UInt8] {
-            let iloc = full("iloc", 0, [0x44, 0x00] + u16(1) + u16(1) + u16(0) + u16(1) + u32(dataOffset) + u32(hevc.count))
-            return full("meta", 0, hdlr + pitm + iloc + iinf + iprp)
+            var locations = extents.map { (dataOffset + $0.0, $0.1) }
+            if grid != nil { locations.append((dataOffset + hevc.count, imageGrid.count)) }
+            let iloc = locations.enumerated().flatMap { u16($0.offset + 1) + u16(0) + u16(1) + u32($0.element.0) + u32($0.element.1) }
+            return full("meta", 0, hdlr + pitm + full("iloc", 0, [0x44, 0x00] + u16(locations.count) + iloc) + iinf + iref + iprp)
         }
         let metaSize = meta(dataOffset: 0).count
         var out = Data(ftyp + meta(dataOffset: ftyp.count + metaSize + 8))
-        out.append(contentsOf: u32(8 + hevc.count) + Array("mdat".utf8))
+        out.append(contentsOf: u32(8 + hevc.count + imageGrid.count) + Array("mdat".utf8))
         out.append(hevc)
+        out.append(contentsOf: imageGrid)
         return out
+    }
+
+    private static func u16(_ v: Int) -> [UInt8] { [UInt8(v >> 8 & 0xFF), UInt8(v & 0xFF)] }
+    private static func u32(_ v: Int) -> [UInt8] { [UInt8(v >> 24 & 0xFF), UInt8(v >> 16 & 0xFF), UInt8(v >> 8 & 0xFF), UInt8(v & 0xFF)] }
+    private static func box(_ type: String, _ payload: [UInt8]) -> [UInt8] { u32(8 + payload.count) + Array(type.utf8) + payload }
+    private static func full(_ type: String, _ version: UInt8, flags: UInt8 = 0, _ payload: [UInt8]) -> [UInt8] {
+        box(type, [version, 0, 0, flags] + payload)
     }
 
     // MARK: - moov / trak walking
 
-    private static func trackJPEGs(_ moov: [UInt8], from start: Int, to end: Int) -> [Candidate] {
+    private static func trackImages(_ moov: [UInt8], from start: Int, to end: Int) -> [Candidate] {
         var result: [Candidate] = []
         for trak in children(moov, start, end, type: "trak") {
             guard let mdia = children(moov, trak.0, trak.1, type: "mdia").first,
@@ -154,9 +212,13 @@ enum CR3Preview {
             guard entry + 36 <= stsd.1, String(decoding: moov[entry + 4..<entry + 8], as: UTF8.self) == "CRAW" else { continue }
             let entrySize = be32(moov, entry)
             let entryEnd = min(stsd.1, entry + entrySize)
-            // A JPEG track has a `JPEG` child box inside the CRAW entry.
-            guard contains(moov, entry + 8, entryEnd, fourCC: "JPEG") else { continue }
             let width = be16(moov, entry + 32), height = be16(moov, entry + 34)
+            // A JPEG track has a `JPEG` child box inside the CRAW entry, an HEVC one an `HEVC` child.
+            var hevc: (properties: [[UInt8]], grid: Grid)?
+            if !contains(moov, entry + 8, entryEnd, fourCC: "JPEG") {
+                guard let tiles = hevcGrid(moov, entry, entryEnd, width: width, height: height) else { continue }
+                hevc = tiles
+            }
             var length = 0, chunk = 0
             if let stsz = children(moov, stbl.0, stbl.1, type: "stsz").first, stsz.0 + 12 <= stsz.1 {
                 length = be32(moov, stsz.0 + 4)
@@ -168,10 +230,32 @@ enum CR3Preview {
                 chunk = be32(moov, stco.0 + 8)
             }
             if length > 0, chunk > 0, width > 0, height > 0 {
-                result.append(Candidate(offset: chunk, length: length, width: width, height: height))
+                result.append(Candidate(offset: chunk, length: length, width: width, height: height,
+                                        hevcProperties: hevc?.properties, grid: hevc?.grid))
             }
         }
         return result
+    }
+
+    /// The `HEVC` child of the CRAW sample entry at `entry` (child boxes start 90 bytes in, after the visual
+    /// sample entry fields): a u32, `GRID` (u32, u32 tile count, a HEIF `ImageGrid`), `CISZ` (u32, u32 tile
+    /// width, u32 tile height), then the `hvcC`, `colr`, `pixi` property boxes.
+    private static func hevcGrid(_ d: [UInt8], _ entry: Int, _ end: Int, width: Int, height: Int)
+        -> (properties: [[UInt8]], grid: Grid)? {
+        guard let hevc = children(d, entry + 90, end, type: "HEVC").first,
+              let gridBox = children(d, hevc.0 + 4, hevc.1, type: "GRID").first, gridBox.1 - gridBox.0 >= 16,
+              let cisz = children(d, hevc.0 + 4, hevc.1, type: "CISZ").first, cisz.1 - cisz.0 >= 12 else { return nil }
+        let imageGrid = gridBox.0 + 8
+        let grid = Grid(rows: Int(d[imageGrid + 2]) + 1, columns: Int(d[imageGrid + 3]) + 1,
+                        tileWidth: be32(d, cisz.0 + 4), tileHeight: be32(d, cisz.0 + 8))
+        // ImageGrid version 0 with 16-bit output sizes, the size of the sample entry, as many tiles as announced.
+        guard d[imageGrid] == 0, d[imageGrid + 1] & 1 == 0, be16(d, imageGrid + 4) == width, be16(d, imageGrid + 6) == height,
+              be32(d, gridBox.0 + 4) == grid.rows * grid.columns, grid.covers(width: width, height: height) else { return nil }
+        let properties = ["hvcC", "colr", "pixi"].compactMap { type in
+            children(d, hevc.0 + 4, hevc.1, type: type).first.map { box(type, Array(d[$0.0..<$0.1])) }
+        }
+        guard properties.first?[4..<8].elementsEqual("hvcC".utf8) ?? false else { return nil }
+        return (properties, grid)
     }
 
     /// Payload ranges (start, end) of the child boxes of `type` within [start, end).
