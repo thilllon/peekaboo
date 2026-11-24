@@ -670,7 +670,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         } else if let onScreen {
             parts.append("\(onScreen.fullWidth)×\(onScreen.fullHeight)")
         }
-        if onScreen != nil { parts.append("\(Int((renderer.effectiveScale * 100).rounded())) %") }
+        if onScreen != nil { parts.append("\(KeyLabels.percent(renderer.effectiveScale)) %") }
         if let summary = tagSummaries[file.url], !summary.isEmpty { parts.append(summary) }
         if failureReason(for: file) != nil { parts.append("cannot open") }
         var content = HUDContent(line: parts.joined(separator: "  ·  "))
@@ -905,7 +905,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         case .zoomFit: zoom(.fit)
         case .zoomFill: zoom(.fill)
         case .zoomActual: zoom(.scale(1), anchor: mouseInView())
-        case .zoomSet(let factor): zoom(.scale(factor), anchor: mouseInView())
+        case .zoomSet(let factor): zoom(.scale(min(factor, Self.maximumZoom)), anchor: mouseInView())
         case .zoomIn: zoomStep(Self.zoomFactor(config.zoomStep))
         case .zoomOut: zoomStep(1 / Self.zoomFactor(config.zoomStep))
         case .zoomToggle: zoom(renderer.zoomMode == .fit ? .scale(1) : .fit, anchor: mouseInView())
@@ -1046,6 +1046,9 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         renderer.setZoom(mode, anchor: anchor)
         afterGeometryChange()
     }
+
+    /// Largest magnification, as `Renderer.zoom(by:)` allows (`zoom.set` accepts any positive factor).
+    static let maximumZoom = 64.0
 
     /// `view.zoom_step`, guarded against values that would not zoom (≤ 1) or jump absurdly.
     static func zoomFactor(_ step: Double) -> Double {
