@@ -90,11 +90,13 @@ func runRenderBench(_ args: ArraySlice<String>) throws {
         var times: [Double] = []
         for _ in 0..<frames {
             body()
-            _ = renderer.renderOffscreen(format: .bgra8Unorm)
+            _ = renderer.renderOffscreen(format: .bgra8Unorm, reuseTarget: true)
             times.append(renderer.lastFrameGPUms)
         }
         return median(times)
     }
+    // Warm up (GPU clocks ramp with load).
+    for _ in 0..<30 { renderer.discardCanvas(); _ = renderer.renderOffscreen(format: .bgra8Unorm, reuseTarget: true) }
     let zooms: [(String, ZoomMode)] = [("fit", .fit), ("0.5x", .scale(0.5)), ("1.0x", .scale(1)), ("2.5x", .scale(2.5)), ("5x", .scale(5))]
     print("zoom   | settle frame ms | path       | next frame ms | path")
     for (name, mode) in zooms {
@@ -129,7 +131,7 @@ func runRenderBench(_ args: ArraySlice<String>) throws {
     var times: [Double] = []
     for _ in 0..<frames {
         tiered.discardCanvas()
-        _ = tiered.renderOffscreen(format: .bgra8Unorm)
+        _ = tiered.renderOffscreen(format: .bgra8Unorm, reuseTarget: true)
         times.append(tiered.lastFrameGPUms)
     }
     print(String(format: "fit, screen tier %dx%d: settle frame %.3f ms (%@)", screen.pixels.width, screen.pixels.height,

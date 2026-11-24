@@ -282,6 +282,7 @@ public final class Renderer {
         let drawable: SIMD2<Double>
     }
     private var canvas: Canvas?
+    private var offscreenTarget: MTLTexture?
     private var canvasTexture: MTLTexture?
     private var tmpTexture: MTLTexture?
     private var tables: (fx: MTLBuffer, wx: MTLBuffer, fy: MTLBuffer, wy: MTLBuffer, capacity: Int)?
@@ -507,14 +508,20 @@ public final class Renderer {
 
     /// Render the current view into a new texture (tests and `peekaboo-bench`). `rgba16Float` returns linear
     /// Display P3 without dither; `bgra8Unorm` matches the SDR drawable. Waits for the GPU.
-    public func renderOffscreen(size: CGSize? = nil, format: MTLPixelFormat = .rgba16Float) -> MTLTexture? {
+    /// `reuseTarget` renders into the texture returned by the previous call when size and format match (bench).
+    public func renderOffscreen(size: CGSize? = nil, format: MTLPixelFormat = .rgba16Float, reuseTarget: Bool = false) -> MTLTexture? {
         let px = size ?? CGSize(width: drawableSize.x, height: drawableSize.y)
-        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: max(1, Int(px.width)),
-                                                         height: max(1, Int(px.height)), mipmapped: false)
-        d.usage = [.renderTarget, .shaderRead]
-        d.storageMode = .shared
-        guard let target = context.device.makeTexture(descriptor: d),
-              let commands = context.queue.makeCommandBuffer() else { return nil }
+        let w = max(1, Int(px.width)), h = max(1, Int(px.height))
+        var target: MTLTexture? = nil
+        if reuseTarget, let t = offscreenTarget, t.width == w, t.height == h, t.pixelFormat == format { target = t }
+        if target == nil {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: w, height: h, mipmapped: false)
+            d.usage = [.renderTarget, .shaderRead]
+            d.storageMode = .shared
+            target = context.device.makeTexture(descriptor: d)
+            if reuseTarget { offscreenTarget = target }
+        }
+        guard let target, let commands = context.queue.makeCommandBuffer() else { return nil }
         encodeFrame(commands, target: target)
         commands.commit()
         commands.waitUntilCompleted()
@@ -858,6 +865,9 @@ public final class Renderer {
             b0 = b1
         }
         e.endEncoding()
+        if Trace.enabled {
+            Trace.log("HQ L\(L) canvas \(cw)x\(ch) taps \(ntapsX)x\(ntapsY) r=\(String(format: "%.3f", rp.sx)) light=\(rp.light) bands=\((ch + rowsPerBand - 1) / rowsPerBand)")
+        }
         return canvasTex
     }
 
