@@ -934,7 +934,14 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// Self-contained fallback for a folder watcher: re-list the folder when the window
     /// becomes key (files added or removed in Finder while Peekaboo was in the background).
     private func rescanIfNeeded() {
-        guard case .folder(let folder) = browseSource, !listingPending, Trace.ms(since: lastListing) > 1500 else { return }
+        guard Trace.ms(since: lastListing) > 1500 else { return }
+        rescanFolder()
+    }
+
+    /// Re-list the browsed folder off the main thread and apply additions, removals and changed
+    /// versions, keeping the current file (a `FolderWatcher` callback can call this directly).
+    func rescanFolder() {
+        guard case .folder(let folder) = browseSource, !listingPending else { return }
         let generation = openGeneration
         lastListing = Trace.now()
         DispatchQueue.global(qos: .utility).async { [weak self] in
