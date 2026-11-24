@@ -8,10 +8,10 @@ import IOSurface
 ///
 /// | Source | `.preview` | `.screen` | `.full` |
 /// |---|---|---|---|
-/// | baseline JPEG | EXIF thumbnail, else IOSurface SPI /8 | IOSurface SPI, power-of-two subsample covering the target | IOSurface SPI |
+/// | baseline JPEG | EXIF thumbnail, else IOSurface SPI /≤4 | IOSurface SPI, power-of-two subsample (≤ 4) covering the target | IOSurface SPI |
 /// | progressive JPEG | EXIF thumbnail, else ImageIO /8 (DC-only) | libjpeg-turbo, DCT scale covering the target | libjpeg-turbo |
-/// | HEIC / HEIF / AVIF | thumbnail item, else IOSurface SPI /n | IOSurface SPI /n | IOSurface SPI |
-/// | camera RAW | embedded preview (CR3: own ISO-BMFF parse) | embedded preview if it covers the target, else RAW decode /n | RAW decode (16-bit) |
+/// | HEIC / HEIF / AVIF | thumbnail item, else IOSurface SPI /≤4 | IOSurface SPI /≤4 | IOSurface SPI |
+/// | camera RAW | embedded preview (CR3: own ISO-BMFF parse) | embedded preview at the target size if it covers it, else RAW decode /n | RAW decode (16-bit) |
 /// | PNG, WebP, TIFF, … | thumbnail (`Always`) | IOSurface SPI /n | IOSurface SPI |
 ///
 /// Every path hands over pixels in their native layout (no CPU colour or format conversion) and
@@ -156,13 +156,18 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
             return thumb
         }
         let long = max(scan.width, scan.height)
+        // Baseline JPEG: never /8 — it leaves the hardware path on the public CGImage route
+        // (24 MP 43 vs 36 ms, 50 MP 138 vs 71 ms); through the IOSurface SPI /4 and /8 cost the same.
+        let baselineFactor = Self.coveringSubsample(long: long, target: target, maxFactor: 4)
         switch route {
         case .hardware, .imageIO:
-            return try surfaceOrPublic(probe, subsample: Self.coveringSubsample(long: long, target: target), pool: pool)
+            return try surfaceOrPublic(probe, subsample: baselineFactor, pool: pool)
         case .turbo:
-            if tier == .preview, scan.coding == .progressive {
-                // ImageIO's /8 path only decodes the DC scan: 24 MP in ~32 ms vs ~300 ms for anything larger.
-                if let output = try? surfaceOrPublic(probe, subsample: 8, pool: pool) { return output }
+            if tier == .preview {
+                // Progressive: ImageIO's /8 path decodes only the DC scan (24 MP ~32 ms vs ~300 ms for anything
+                // larger). Baseline beyond the hardware limit: /4.
+                let factor = scan.coding == .progressive ? 8 : baselineFactor
+                if let output = try? surfaceOrPublic(probe, subsample: factor, pool: pool) { return output }
             }
             do {
                 let pixels = try turbo(url: url, data: data, target: target, pool: pool)
@@ -191,10 +196,10 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
                 // ImageIO exposes no CR3 preview (asking runs a RAW decode): use the container's JPEGs.
                 if let output = cr3Preview(url: url, info: info, tier: tier, target: target, pool: pool) { return output }
             } else {
-                // Without `…Always` ImageIO returns the camera's embedded JPEG; a huge limit keeps it at
-                // native size (no CPU resampling) and the GPU scales it.
-                let limit = tier == .preview ? target : 1 << 16
-                if let preview = embeddedThumbnail(probe, maxPixel: limit, pool: pool),
+                // Without `…Always` ImageIO returns the camera's embedded JPEG, scaled to the target when it is
+                // larger (DCT scaling: NEF 8256 px preview → 3456 px in 93 ms and 48 MB instead of 127 ms and 180 MB
+                // at native size). A preview smaller than the screen target falls through to a RAW decode.
+                if let preview = embeddedThumbnail(probe, maxPixel: target, pool: pool),
                    tier == .preview || max(preview.pixels.width, preview.pixels.height) >= min(target, long) {
                     return preview
                 }
