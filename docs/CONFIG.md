@@ -38,8 +38,18 @@ the first problem with its line number, for example:
 config.toml:17: unknown action "nav.nxt" (did you mean "nav.next"?)
 ```
 
-Unknown tables, unknown keys, wrong value types, unknown chords, unknown actions, unknown move/copy
-slots, a chord bound twice in the same table and sequence conflicts are all errors.
+Wrong value types, values out of range, unknown chords, unknown actions, unknown move/copy slots, a
+chord bound twice in the same table, sequence conflicts and TOML syntax errors are all errors.
+
+Unknown tables and unknown keys (a typo, or a setting from a newer version) are **warnings**: they are
+skipped, the rest of the file is applied, and a toast names them with their line numbers:
+
+```
+config.toml:3: ignored unknown key "view.fit" (+1 more)
+```
+
+The starter file names the settings that are planned but not read yet (such as `[general]` `sort`)
+only in a comment, so uncommenting its settings never produces a warning.
 
 ### TOML subset
 
@@ -252,15 +262,29 @@ Ids are `namespace.verb`, optionally followed by `:argument`.
 `file.trash` moves the file to the Trash at once (a rename on the same volume) and shows the next image.
 ⌘Z puts it back where it was, for the whole session. Finder's "Put Back" may not know about files
 trashed by apps, so use ⌘Z. A volume without a Trash reports an error; nothing is deleted silently.
+If the Trash was emptied meanwhile, undo says so (`IMG_0042.jpg is no longer in the Trash`).
 
 ### Move and copy
 
 A target is either a slot name from `[slots]` or a path. Paths may start with `~`; a relative path
 (`./_keep`, `../Selects`, or a slot such as `3 = "./_rejects"`) is resolved against **the folder of the
-current image**, so it means "a subfolder next to this photo". Missing folders are created. A file
-never overwrites another one: a name that is taken becomes `name 2.jpg`, `name 3.jpg`, … (like
-Finder's Keep Both). Undo moves the file back (or removes the copy). Copies, and moves to another
-volume, run in the background: the next image shows at once, and a failure brings the file back.
+current image**, so it means "a subfolder next to this photo". `.` and `..` are resolved before use.
+Missing folders are created. A file never overwrites another one: a name that is taken (even by a
+broken symbolic link) becomes `name 2.jpg`, `name 3.jpg`, … (like Finder's Keep Both), decided by an
+exclusive rename, so a file that appears at the last moment is not replaced either. Undo moves the file
+back (or removes the copy). Copies, and moves to another volume, run in the background: the next image
+shows at once, and a failure brings the file back.
+
+Safety rules:
+
+- A symbolic link is moved, copied or trashed as the link; its target is never touched.
+- A move to another volume copies first and removes the original only once the copy is complete. If
+  the original cannot be removed (a read-only folder or card), the copy is removed again and the toast
+  suggests copying instead.
+- Undo and redo leave a file alone if it was replaced or edited since the action (`IMG_0042.jpg was
+  replaced or edited since it was copied: left as it is`). Renames and tag changes do not count as edits.
+- A read-only source or destination folder fails with a message such as `Cannot move IMG_0042.jpg:
+  Permission denied`; nothing is moved or recorded. Messages name files and folders, not full paths.
 
 `file.move:ask` (`m`) and `file.copy:ask` (`c`) open a menu of your slots. A slot whose name is one
 character (`1`…`9`, `k`, …) is chosen with that key. Return picks the previous destination, and `o`
@@ -284,20 +308,36 @@ XMP rather than Finder tags.
 ### exec commands
 
 `exec:<command>` runs the command with `/bin/sh -c`, in the background; its output is discarded and a
-toast reports a non-zero exit status. These placeholders are replaced, **already shell-quoted**, so
-write them bare (`{path}`, not `"{path}"`):
+toast reports a non-zero exit status. The file's values are passed in the command's **environment**,
+never pasted into the command text, so no file name can run code (a photo named `$(rm -rf ~).jpg` is
+just a name). Each placeholder becomes a reference to its variable:
 
-| Placeholder | Example for `/Photos/Trip/IMG_0042.HEIC`, 42nd of 120 |
+| Placeholder | Variable | Example for `/Photos/Trip/IMG_0042.HEIC`, 42nd of 120 |
+|---|---|---|
+| `{path}` | `PEEKABOO_PATH` | `/Photos/Trip/IMG_0042.HEIC` |
+| `{dir}` | `PEEKABOO_DIR` | `/Photos/Trip` |
+| `{name}` | `PEEKABOO_NAME` | `IMG_0042.HEIC` |
+| `{stem}` | `PEEKABOO_STEM` | `IMG_0042` |
+| `{ext}` | `PEEKABOO_EXT` | `HEIC` |
+| `{index}` | `PEEKABOO_INDEX` | `42` (1-based) |
+| `{count}` | `PEEKABOO_COUNT` | `120` |
+
+Quoting rules: the reference is quoted for where the placeholder stands, so every value stays exactly
+one word, spaces and quotes included. You can write placeholders bare or inside quotes:
+
+| You write | The shell runs |
 |---|---|
-| `{path}` | `'/Photos/Trip/IMG_0042.HEIC'` |
-| `{dir}` | `'/Photos/Trip'` |
-| `{name}` | `'IMG_0042.HEIC'` |
-| `{stem}` | `'IMG_0042'` |
-| `{ext}` | `'HEIC'` |
-| `{index}` | `'42'` (1-based) |
-| `{count}` | `'120'` |
+| `open -R {path}` | `open -R "${PEEKABOO_PATH}"` |
+| `echo "x {path}"` | `echo "x ${PEEKABOO_PATH}"` |
+| `echo 'x {path}'` | `echo 'x '"${PEEKABOO_PATH}"''` |
+| `cp {path} ~/Desktop/{name}` | `cp "${PEEKABOO_PATH}" ~/Desktop/"${PEEKABOO_NAME}"` |
+| `echo "$(basename {path})"` | `echo "$(basename "${PEEKABOO_PATH}")"` |
 
-The environment also has `PEEKABOO_PATH`, `PEEKABOO_INDEX` (1-based) and `PEEKABOO_COUNT`.
+`\{path}` and `${path}` are left as they are, and so is anything after a `#` comment. You can also use
+the variables directly (`"$PEEKABOO_PATH"`); quote them yourself then. `{name}`, `{stem}` and `{ext}`
+may start with `-`, so put `--` before them for commands that would read them as options; `{path}` and
+`{dir}` always start with `/`. Do not pass placeholders to `eval` or `sh -c`, which would parse the
+value as code again.
 
 ### Open with
 
