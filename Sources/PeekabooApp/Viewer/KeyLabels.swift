@@ -86,6 +86,9 @@ enum KeyLabels {
         return (key, mods)
     }
 
+    /// `factor` as a whole percentage ("200" for 2). Any finite factor: `Int(_:)` would trap above Int.max.
+    static func percent(_ factor: Double) -> String { String(format: "%.0f", (factor * 100).rounded()) }
+
     /// Short description of an action for menus and the help overlay.
     static func title(_ action: Action) -> String {
         switch action {
@@ -101,7 +104,7 @@ enum KeyLabels {
         case .zoomOut: return "Zoom Out"
         case .zoomToggle: return "Toggle Fit / 100 %"
         case .zoomKeep: return "Keep Zoom Across Images"
-        case .zoomSet(let f): return "Zoom \(Int((f * 100).rounded())) %"
+        case .zoomSet(let f): return "Zoom \(percent(f)) %"
         case .pan(let d): return "Pan \(d.rawValue.capitalized)"
         case .panEdge(let e): return "Pan to \(e.rawValue.capitalized) Edge"
         case .panCenter: return "Center Image"

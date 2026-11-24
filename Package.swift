@@ -34,6 +34,7 @@ let package = Package(
         .executableTarget(name: "PeekabooBench", dependencies: ["PeekabooCore", "PeekabooRender"], swiftSettings: speed),
         .testTarget(name: "PeekabooCoreTests", dependencies: ["PeekabooCore"]),
         .testTarget(name: "PeekabooRenderTests", dependencies: ["PeekabooRender"]),
+        .testTarget(name: "PeekabooAppTests", dependencies: ["PeekabooApp"]),
     ],
     swiftLanguageModes: [.v5]
 )
