@@ -58,6 +58,7 @@ final class SelfTest {
     private var firstCommitWall: Double?
     private var firstPresent: (wall: Double, tier: Tier?)?
     private var droppedFrames = 0
+    private var redraws = 0
     private var presentedFrames = 0
     private var phase = "launch"
     private var steps: [Step] = []
@@ -94,8 +95,12 @@ final class SelfTest {
     private func presented(_ record: FrameRecord, _ time: CFTimeInterval) {
         guard time > 0 else {
             droppedFrames += 1
-            // The first image frame was dropped: draw it again so (a) measures a frame on glass.
-            if firstPresent == nil, record.file != nil { viewer.redraw() }
+            // The first image frame was dropped: draw it again (a few times at most) so (a)
+            // measures a frame on glass. Nothing is ever presented while the display sleeps.
+            if firstPresent == nil, record.file != nil, redraws < 3 {
+                redraws += 1
+                viewer.redraw()
+            }
             return
         }
         presentedFrames += 1
@@ -218,6 +223,9 @@ final class SelfTest {
         results["files"] = viewer.pipeline.files.count
         results["frames_presented"] = presentedFrames
         results["frames_dropped"] = droppedFrames
+        // Presentation needs an awake, unlocked display with the window on screen.
+        results["display_awake"] = CGDisplayIsAsleep(CGMainDisplayID()) == 0
+        results["window_visible"] = viewer.window?.occlusionState.contains(.visible) ?? false
         results["pipeline"] = ["hits": stats.hits, "misses": stats.misses, "decodes": stats.decodes,
                                "cached_mb": stats.cachedBytes >> 20]
         if let data = try? JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]),

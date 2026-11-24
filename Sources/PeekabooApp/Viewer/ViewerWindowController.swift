@@ -105,6 +105,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private var memoryPressure: DispatchSourceMemoryPressure?
     private var observers: [NSObjectProtocol] = []
     private var lastTitle = ""
+    private var pendingTitle: String?
 
     init(configStore: ConfigStore) {
         self.configStore = configStore
@@ -272,11 +273,14 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         Trace.log("decode failed \(file.name): \(error)")
         guard file == pipeline.currentFile, shownFile != file, pipeline.best(for: file) == nil else { return }
         let reason: String
+        func detail(_ s: String, _ generic: String) -> String {
+            s.isEmpty || s == file.name || s == file.url.path ? generic : "\(generic) (\(s))"
+        }
         switch error as? DecodeError {
-        case .unsupported(let s)?: reason = s.isEmpty ? "unsupported format" : s
-        case .unreadable(let s)?: reason = s.isEmpty ? "unreadable" : s
-        case .outOfMemory?: reason = "out of memory"
-        case nil: reason = "\(error)"
+        case .unsupported(let s)?: reason = detail(s, "Unsupported format")
+        case .unreadable(let s)?: reason = detail(s, "Damaged file or not an image")
+        case .outOfMemory?: reason = "Not enough memory to decode it"
+        case nil: reason = error.localizedDescription
         }
         failures[file.url] = reason
         // Do not leave the previous image under the new name.
@@ -291,14 +295,21 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
 
     private func show(_ image: DecodedImage, for file: ImageFile) {
         let wasNewFile = shownFile != file
+        let t0 = Trace.now()
         renderer.setImage(image, key: file.url)
         shownFile = file
         shownTier = image.tier
         setLoading(false)
         if failures[file.url] == nil { hud.setMessage(nil) }
+        let t1 = Trace.now()
         renderFrame()
+        let t2 = Trace.now()
         if renderer.wantsFullResolution { pipeline.requestFullResolution() }
         updateHUD()
+        if Trace.enabled {
+            Trace.log(String(format: "show main thread: setImage %.3f  render %.3f  hud %.3f ms",
+                             Double(t1 &- t0) / 1e6, Double(t2 &- t1) / 1e6, Double(Trace.now() &- t2) / 1e6))
+        }
         if Trace.enabled {
             Trace.log("shown \(file.name) tier=\(image.tier) \(image.pixels.width)x\(image.pixels.height) decode=\(String(format: "%.1f", Double(image.decodeNanos) / 1e6)) ms\(wasNewFile ? String(format: " +%.2f ms after nav", Trace.ms(since: navigationStart)) : "")")
         }
@@ -327,9 +338,16 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         guard target != pipeline.index || shownFile == nil else { return }
         beginNavigation()
         pipeline.navigate(to: target, isRepeat: isRepeat)
+        let t1 = Trace.now()
         presentCurrent()
+        let t2 = Trace.now()
         // Title and HUD switch to the target in the same run-loop turn (same frame) as the swap.
         updateHUD()
+        if Trace.enabled {
+            let t3 = Trace.now()
+            Trace.log(String(format: "nav main thread: pipeline %.3f  present %.3f  hud %.3f ms",
+                             Double(t1 &- navigationStart) / 1e6, Double(t2 &- t1) / 1e6, Double(t3 &- t2) / 1e6))
+        }
     }
 
     private func armLoadingIndicator(for file: ImageFile) {
@@ -374,10 +392,23 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         setTitle("\(file.name) — \(index)/\(count)")
     }
 
+    /// The title is hidden (Window menu and Mission Control only) and costs ~0.5 ms to set, so it
+    /// follows the HUD after the frame instead of on the navigation's critical path, coalesced
+    /// while skimming.
     private func setTitle(_ title: String) {
-        guard title != lastTitle else { return }
-        lastTitle = title
-        window?.title = title
+        guard title != lastTitle else {
+            pendingTitle = nil
+            return
+        }
+        let schedule = pendingTitle == nil
+        pendingTitle = title
+        guard schedule else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self, let title = self.pendingTitle else { return }
+            self.pendingTitle = nil
+            self.lastTitle = title
+            self.window?.title = title
+        }
     }
 
     private func detailRows(_ file: ImageFile, _ info: ImageInfo?, _ image: DecodedImage?) -> [HUDContent.Row] {

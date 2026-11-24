@@ -1,4 +1,5 @@
 import AppKit
+import CoreText
 import PeekabooCore
 import QuartzCore
 
@@ -32,6 +33,8 @@ private final class TextBox {
         text.isWrapped = true
         text.truncationMode = .end
         text.alignmentMode = .left
+        // Rasterise the text off the main thread at commit time.
+        text.drawsAsynchronously = true
         box.addSublayer(text)
         box.isHidden = true
     }
@@ -40,9 +43,20 @@ private final class TextBox {
     @discardableResult
     func set(_ string: NSAttributedString, maxWidth: CGFloat) -> CGSize {
         let limit = max(maxWidth - 2 * padding.width, 40)
-        let rect = string.boundingRect(with: CGSize(width: limit, height: 10_000),
-                                       options: [.usesLineFragmentOrigin, .usesFontLeading])
-        let size = CGSize(width: min(ceil(rect.width) + 2, limit), height: ceil(rect.height) + 1)
+        let measured: CGSize
+        let singleLine = !string.string.contains("\n")
+        if singleLine {
+            // One CTLine is ~10x cheaper than a TextKit bounding rect (HUD updates on every navigation).
+            let line = CTLineCreateWithAttributedString(string)
+            var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
+            let width = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
+            measured = CGSize(width: width, height: ascent + descent + leading)
+        } else {
+            measured = string.boundingRect(with: CGSize(width: limit, height: 10_000),
+                                           options: [.usesLineFragmentOrigin, .usesFontLeading]).size
+        }
+        let size = CGSize(width: min(ceil(measured.width) + 2, limit), height: ceil(measured.height) + 1)
+        text.isWrapped = !singleLine
         text.string = string
         text.frame = CGRect(x: padding.width, y: padding.height, width: size.width, height: size.height)
         box.bounds = CGRect(x: 0, y: 0, width: size.width + 2 * padding.width, height: size.height + 2 * padding.height)
