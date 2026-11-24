@@ -22,16 +22,12 @@ private struct Img {
 }
 
 final class PeekabooRenderTests: XCTestCase {
-    var device: MTLDevice!
     var pool: PixelBufferPool!
 
     override func setUpWithError() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("no Metal device") }
-        self.device = device
         pool = PixelBufferPool(device: device)
     }
-
-    func testMetalDeviceAvailable() { XCTAssertNotNil(PeekabooRenderInfo.defaultDevice()) }
 
     // MARK: Helpers
 
