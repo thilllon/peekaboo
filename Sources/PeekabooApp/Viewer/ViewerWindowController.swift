@@ -465,7 +465,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         if !force, tags[file.url] != nil { return }
         let url = file.url
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let values = try? url.resourceValues(forKeys: [.tagNamesKey, .labelNumberKey])
+            // A fresh URL: NSURL caches resource values, which would hide a tag just written.
+            let values = try? URL(fileURLWithPath: url.path, isDirectory: false).resourceValues(forKeys: [.tagNamesKey, .labelNumberKey])
             let result = FileTags(names: values?.tagNames ?? [], labelNumber: values?.labelNumber ?? 0)
             DispatchQueue.main.async {
                 guard let self else { return }

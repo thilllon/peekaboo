@@ -168,6 +168,7 @@ final class HUD {
     func setContent(_ new: HUDContent) {
         guard new != content else { return }
         content = new
+        Trace.log("hud: \(new.line)\(new.details.isEmpty ? "" : " | " + new.details.map { "\($0.label)=\($0.value)" }.joined(separator: "; "))")
         refreshInfo()
     }
 
