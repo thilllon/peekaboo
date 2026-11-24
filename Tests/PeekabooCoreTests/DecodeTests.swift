@@ -247,7 +247,7 @@ final class DecodeTests: XCTestCase {
         XCTAssertEqual(screen.pixels.height, 384)
         let preview = try decoder.decode(url, tier: .preview, targetLongSide: 64, pool: pool)
         XCTAssertGreaterThanOrEqual(preview.pixels.width, 64)
-        XCTAssertLessThanOrEqual(preview.pixels.width, 128, "/8 subsample (or a thumbnail item)")
+        XCTAssertLessThanOrEqual(preview.pixels.width, 256, "HEIF subsample is capped at /4 (or a thumbnail item)")
         let full = try decoder.decode(url, tier: .full, targetLongSide: 0, pool: pool)
         XCTAssertEqual(full.pixels.width, 1024)
         for image in [preview, screen, full] {

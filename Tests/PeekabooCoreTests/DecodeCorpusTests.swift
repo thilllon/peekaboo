@@ -1,4 +1,5 @@
 import CoreGraphics
+import ImageIO
 import Metal
 import XCTest
 @testable import PeekabooCore
@@ -54,7 +55,8 @@ final class DecodeCorpusTests: XCTestCase {
                     case .screen:
                         XCTAssertGreaterThanOrEqual(long, min(target, fullLong), "\(name) screen covers the target")
                     case .preview:
-                        XCTAssertLessThanOrEqual(long, max(2 * target, 1100), "\(name) preview stays small")
+                        // Subsampled previews: /8 (HEIF: /4, where /8 is slower) of the full size at most.
+                        XCTAssertLessThanOrEqual(long, max(2 * target, fullLong / 4 + 1), "\(name) preview stays small")
                     }
                 }
             }
@@ -66,13 +68,31 @@ final class DecodeCorpusTests: XCTestCase {
         guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("no Metal device") }
         let pool = PixelBufferPool(device: device)
         let decoder = ImageIODecoder()
-        for url in files(root) where url.pathExtension.uppercased() != "CR3" {
+        for url in files(root) {
+            _ = try decoder.decode(url, tier: .preview, targetLongSide: 512, pool: pool)  // warm the RAW plug-ins
             let start = Trace.now()
             let image = try decoder.decode(url, tier: .preview, targetLongSide: 512, pool: pool)
             let ms = Trace.ms(since: start)
-            // A demosaic would produce 16-bit pixels and take 0.2–1.4 s.
+            // A demosaic would produce 16-bit pixels and take 0.2–1.4 s (CR3: its JPEG or HEVC PRVW preview).
             XCTAssertNotEqual(image.pixels.layout, .rgba16, url.lastPathComponent)
             XCTAssertLessThan(ms, 150, "\(url.lastPathComponent): \(ms) ms")
+        }
+    }
+
+    func testCR3PreviewCandidates() throws {
+        let raw = try corpus().appendingPathComponent("raw")
+        let cr3 = files(raw).filter { $0.pathExtension.uppercased() == "CR3" }
+        guard !cr3.isEmpty else { throw XCTSkip("no CR3 in the corpus") }
+        for url in cr3 {
+            let candidates = CR3Preview.candidates(url: url)
+            XCTAssertFalse(candidates.isEmpty, url.lastPathComponent)
+            for candidate in candidates {
+                XCTAssertGreaterThan(candidate.width, 0)
+                let data = try XCTUnwrap(CR3Preview.bytes(url: url, candidate))
+                let source = try XCTUnwrap(CGImageSourceCreateWithData(data as CFData, nil))
+                let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+                XCTAssertEqual(image?.height, candidate.height, "\(url.lastPathComponent) \(candidate)")
+            }
         }
     }
 

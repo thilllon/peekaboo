@@ -124,9 +124,9 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
             if tier == .preview, probe.hasThumbnailItem, let thumb = embeddedThumbnail(probe, maxPixel: target, pool: pool) {
                 return thumb
             }
-            // HEVC/AV1 decode the whole image whatever the factor: /8 costs a little more than /4 (HEIC 12 MP
-            // 36 vs 29 ms) but keeps previews at a quarter of the memory.
-            return try surfaceOrPublic(probe, subsample: subsample(probe, target), pool: pool)
+            // HEVC/AV1 decode the whole image whatever the factor, and /8 is slower than /4
+            // (HEIC 12 MP 36 vs 29 ms, 44 MP 122 vs 60 ms; AVIF 24 MP 52 vs 40 ms): cap at /4.
+            return try surfaceOrPublic(probe, subsample: subsample(probe, target, maxFactor: 4), pool: pool)
         case .raw(let cr3):
             return try decodeRAW(probe, cr3: cr3, url: url, tier: tier, target: target, pool: pool)
         case .other:
@@ -209,10 +209,22 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
         guard let pick = candidates.first(where: { max($0.width, $0.height) >= need }) ?? (tier == .preview ? candidates.last : nil),
               let data = CR3Preview.bytes(url: url, pick),
               let source = CGImageSourceCreateWithData(data as CFData, ImageProbe.sourceOptions) else { return nil }
-        guard let probe = try? data.withUnsafeBytes({ try ImageProbe(source: source, url: url, jpegBytes: $0) }),
-              case .jpeg(let scan) = probe.kind,
-              let output = try? decodeJPEG(probe, scan: scan, url: url, data: data, tier: tier == .preview ? .screen : tier,
-                                           target: target, pool: pool) else { return nil }
+        guard let probe = try? data.withUnsafeBytes({ try ImageProbe(source: source, url: url, jpegBytes: $0) }) else {
+            return nil
+        }
+        let decoded: Output?
+        switch probe.kind {
+        case .jpeg(let scan):
+            decoded = try? decodeJPEG(probe, scan: scan, url: url, data: data, tier: tier == .preview ? .screen : tier,
+                                      target: target, pool: pool)
+        case .heif:
+            // 10-bit PQ previews (HDR PQ shooting mode): ask ImageIO for its tone-mapped SDR rendition.
+            decoded = try? publicImage(probe, subsample: subsample(probe, target), pool: pool,
+                                       extra: [kCGImageSourceDecodeRequest: kCGImageSourceDecodeToSDR])
+        default:
+            decoded = nil
+        }
+        guard let output = decoded else { return nil }
         // The embedded JPEG carries no orientation of its own; the RAW's EXIF orientation applies.
         return Output(pixels: output.pixels, orientation: output.orientation == .up ? info.orientation : output.orientation,
                       path: "cr3 \(pick.width)x\(pick.height) " + output.path)
@@ -287,8 +299,10 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
 
     /// Public fallback: a lazy CGImage (parallel-safe, unlike `ShouldCacheImmediately`) decoded by a
     /// same-format draw into a pooled buffer.
-    private func publicImage(_ probe: ImageProbe, subsample: Int, pool: PixelBufferPool) throws -> Output {
-        var options: [CFString: Any] = [kCGImageSourceShouldCache: false]
+    private func publicImage(_ probe: ImageProbe, subsample: Int, pool: PixelBufferPool,
+                             extra: [CFString: Any] = [:]) throws -> Output {
+        var options: [CFString: Any] = extra
+        options[kCGImageSourceShouldCache] = false
         if subsample > 1 { options[kCGImageSourceSubsampleFactor] = subsample }
         guard let image = CGImageSourceCreateImageAtIndex(probe.source, probe.index, options as CFDictionary) else {
             throw DecodeError.unsupported(probe.info.typeIdentifier)

@@ -10,6 +10,11 @@ enum CR3Preview {
         let length: Int
         let width: Int
         let height: Int
+        /// Newer bodies (e.g. EOS R5 Mark II in HDR PQ mode) store the `PRVW` preview as HEVC:
+        /// these are its property boxes (`hvcC`, `colr`, `pixi`); `bytes` wraps the bitstream in a HEIF.
+        var hevcProperties: [[UInt8]]?
+
+        var isHEVC: Bool { hevcProperties != nil }
     }
 
     private static let prvwUUID: [UInt8] = [0xEA, 0xF4, 0x2B, 0x5E, 0x1C, 0x98, 0x4B, 0x88,
@@ -43,14 +48,16 @@ enum CR3Preview {
             if type == "moov", size < 16 << 20, let moov = read(offset, size) {
                 result += trackJPEGs(moov, from: headerSize, to: size)
             } else if type == "uuid", let uuid = read(offset + 8, 16), uuid == prvwUUID,
-                      let body = read(offset + 24, min(512, size - 24)) {
-                // uuid payload: 8 bytes, then the PRVW box (… u16 width @14, u16 height @16 …), then the JPEG.
-                if let soi = findSOI(body) {
-                    let prvw = 8
-                    let width = body.count > prvw + 18 ? be16(body, prvw + 14) : 0
-                    let height = body.count > prvw + 18 ? be16(body, prvw + 16) : 0
+                      let body = read(offset + 24, min(4096, size - 24)), body.count > 32 {
+                // uuid payload: 8 bytes, then the PRVW box (… u16 width @14, u16 height @16, u32 size @20),
+                // then either a JPEG or HEVC property boxes followed by an `IMGD` bitstream box.
+                let prvw = 8
+                let width = be16(body, prvw + 14), height = be16(body, prvw + 16)
+                if let soi = findSOI(Array(body.prefix(512))) {
                     let start = offset + 24 + soi
                     result.append(Candidate(offset: start, length: offset + size - start, width: width, height: height))
+                } else if let hevc = hevcPreview(body, from: prvw + 24, base: offset + 24, width: width, height: height) {
+                    result.append(hevc)
                 }
             }
             offset += size
@@ -59,14 +66,70 @@ enum CR3Preview {
         return result.sorted { $0.width * $0.height < $1.width * $1.height }
     }
 
-    /// Read the bytes of one candidate.
+    /// Read the bytes of one candidate: a JPEG, or for HEVC previews a minimal HEIF around the bitstream.
     static func bytes(url: URL, _ candidate: Candidate) -> Data? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
+        let payload: Data
         do {
             try handle.seek(toOffset: UInt64(candidate.offset))
-            return try handle.read(upToCount: candidate.length)
+            guard let data = try handle.read(upToCount: candidate.length), data.count == candidate.length else { return nil }
+            payload = data
         } catch { return nil }
+        guard let properties = candidate.hevcProperties else { return payload }
+        return heif(hevc: payload, properties: properties, width: candidate.width, height: candidate.height)
+    }
+
+    /// PRVW HEVC layout: `CISZ`, `hvcC`, `colr`, `pixi`, then `IMGD` holding length-prefixed NAL units.
+    private static func hevcPreview(_ body: [UInt8], from start: Int, base: Int, width: Int, height: Int) -> Candidate? {
+        var properties: [[UInt8]] = []
+        var offset = start
+        while offset + 8 <= body.count {
+            let size = be32(body, offset)
+            let type = String(decoding: body[offset + 4..<offset + 8], as: UTF8.self)
+            guard size >= 8 else { return nil }
+            if type == "IMGD" {
+                guard properties.first.map({ String(decoding: $0[4..<8], as: UTF8.self) == "hvcC" }) ?? false,
+                      width > 0, height > 0, offset + 12 <= body.count else { return nil }
+                // The payload starts with a u32 byte count of the NAL units that follow (4-byte length prefixed).
+                let skip = be32(body, offset + 8) == size - 12 ? 12 : 8
+                return Candidate(offset: base + offset + skip, length: size - skip, width: width, height: height,
+                                 hevcProperties: properties)
+            }
+            guard offset + size <= body.count else { return nil }
+            if ["hvcC", "colr", "pixi"].contains(type) { properties.append(Array(body[offset..<offset + size])) }
+            offset += size
+        }
+        return nil
+    }
+
+    /// A single-item HEIF (`hvc1` item with the given property boxes plus `ispe`) for ImageIO's
+    /// hardware HEVC decoder.
+    static func heif(hevc: Data, properties: [[UInt8]], width: Int, height: Int) -> Data {
+        func u16(_ v: Int) -> [UInt8] { [UInt8(v >> 8 & 0xFF), UInt8(v & 0xFF)] }
+        func u32(_ v: Int) -> [UInt8] { [UInt8(v >> 24 & 0xFF), UInt8(v >> 16 & 0xFF), UInt8(v >> 8 & 0xFF), UInt8(v & 0xFF)] }
+        func box(_ type: String, _ payload: [UInt8]) -> [UInt8] { u32(8 + payload.count) + Array(type.utf8) + payload }
+        func full(_ type: String, _ version: UInt8, _ payload: [UInt8]) -> [UInt8] { box(type, [version, 0, 0, 0] + payload) }
+
+        let ftyp = box("ftyp", Array("heic".utf8) + u32(0) + Array("mif1heic".utf8))
+        let hdlr = full("hdlr", 0, u32(0) + Array("pict".utf8) + u32(0) + u32(0) + u32(0) + [0])
+        let pitm = full("pitm", 0, u16(1))
+        let iinf = full("iinf", 0, u16(1) + full("infe", 2, u16(1) + u16(0) + Array("hvc1".utf8) + [0]))
+        let ispe = full("ispe", 0, u32(width) + u32(height))
+        let props = properties + [ispe]
+        let ipco = box("ipco", props.flatMap { $0 })
+        let associations = (1...props.count).map { UInt8($0) | ($0 == 1 ? 0x80 : 0) }  // hvcC is essential
+        let ipma = full("ipma", 0, u32(1) + u16(1) + [UInt8(props.count)] + associations)
+        let iprp = box("iprp", ipco + ipma)
+        func meta(dataOffset: Int) -> [UInt8] {
+            let iloc = full("iloc", 0, [0x44, 0x00] + u16(1) + u16(1) + u16(0) + u16(1) + u32(dataOffset) + u32(hevc.count))
+            return full("meta", 0, hdlr + pitm + iloc + iinf + iprp)
+        }
+        let metaSize = meta(dataOffset: 0).count
+        var out = Data(ftyp + meta(dataOffset: ftyp.count + metaSize + 8))
+        out.append(contentsOf: u32(8 + hevc.count) + Array("mdat".utf8))
+        out.append(hevc)
+        return out
     }
 
     // MARK: - moov / trak walking

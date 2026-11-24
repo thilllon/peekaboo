@@ -19,6 +19,7 @@ func runDecodeBench(_ args: ArraySlice<String>) throws {
     var threads = 6
     var skeleton = false
     var filter: String?
+    var dump: URL?
     var it = args.makeIterator()
     while let arg = it.next() {
         switch arg {
@@ -29,6 +30,7 @@ func runDecodeBench(_ args: ArraySlice<String>) throws {
         case "--threads": threads = Int(it.next() ?? "") ?? threads
         case "--filter": filter = it.next()
         case "--skeleton": skeleton = true
+        case "--dump": dump = it.next().map { URL(fileURLWithPath: $0) }
         default: throw BenchError.usage("unknown option \(arg)")
         }
     }
@@ -72,6 +74,9 @@ func runDecodeBench(_ args: ArraySlice<String>) throws {
                         times.append(Trace.ms(since: t0))
                         let p = image.pixels
                         out = "\(p.width)x\(p.height) \(p.layout)\(image.orientation == .up ? "" : " o\(image.orientation.rawValue)")"
+                        if let dump, times.count == 1 {
+                            writePNG(p, to: dump.appendingPathComponent("\(url.lastPathComponent)-\(tier).png"))
+                        }
                     } catch {
                         out = "error \(error)"
                     }
@@ -87,6 +92,31 @@ func runDecodeBench(_ args: ArraySlice<String>) throws {
     print(pad("TOTAL (sum of medians)", 46) + lpad(String(format: "%.1f", totals[0]), 8)
           + totals.dropFirst().map { lpad(String(format: "%.1f", $0), 9) }.joined())
 
+    // HDR rendition cost vs SDR for gain-map files (`ImageIODecoder.decodeHDR` stays off unless < 2x).
+    if !skeleton {
+        let saved = ImageIODecoder.decodeHDR
+        defer { ImageIODecoder.decodeHDR = saved }
+        for url in files where (try? decoder.probe(url).hasGainMap) == true {
+            var line = "hdr \(url.lastPathComponent):"
+            for hdr in [false, true] {
+                ImageIODecoder.decodeHDR = hdr
+                var times: [Double] = []
+                var out = ""
+                for _ in 0..<iters {
+                    autoreleasepool {
+                        let t0 = Trace.now()
+                        if let image = try? decoder.decode(url, tier: .screen, targetLongSide: screen, pool: pool) {
+                            times.append(Trace.ms(since: t0))
+                            out = "\(image.pixels.layout)\(image.isHDR ? " HDR" : "")"
+                        }
+                    }
+                }
+                line += String(format: " %@ %.2f ms (%@)", hdr ? "HDR" : "SDR", median(times), out)
+            }
+            print(line)
+        }
+    }
+
     // Parallel throughput of .screen decodes (the prefetch workload).
     let navDir = root.appendingPathComponent("nav")
     let navFiles = imageFiles(in: navDir, skipping: nil)
@@ -101,6 +131,28 @@ func runDecodeBench(_ args: ArraySlice<String>) throws {
 private enum BenchError: Error, CustomStringConvertible {
     case usage(String)
     var description: String { if case .usage(let s) = self { return s }; return "" }
+}
+
+/// `--dump DIR`: write a decoded buffer as PNG (visual check of layout, alpha and colour tagging).
+private func writePNG(_ p: PixelBuffer, to url: URL) {
+    let opaque = p.alpha == .opaque
+    let info: UInt32
+    switch p.layout {
+    case .rgba8: info = (opaque ? CGImageAlphaInfo.noneSkipLast : .premultipliedLast).rawValue
+    case .bgra8: info = (opaque ? CGImageAlphaInfo.noneSkipFirst : .premultipliedFirst).rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+    case .argb8: info = (opaque ? CGImageAlphaInfo.noneSkipFirst : .premultipliedFirst).rawValue
+    case .rgba16: info = (opaque ? CGImageAlphaInfo.noneSkipLast : .premultipliedLast).rawValue | CGBitmapInfo.byteOrder16Little.rawValue
+    case .rgba16f: info = p.layout.cgBitmapInfo
+    }
+    let data = Data(bytes: p.baseAddress, count: p.byteCount)
+    guard let provider = CGDataProvider(data: data as CFData),
+          let image = CGImage(width: p.width, height: p.height, bitsPerComponent: p.layout.bitsPerComponent,
+                              bitsPerPixel: p.layout.bytesPerPixel * 8, bytesPerRow: p.bytesPerRow, space: p.colorSpace,
+                              bitmapInfo: CGBitmapInfo(rawValue: info), provider: provider, decode: nil,
+                              shouldInterpolate: false, intent: .defaultIntent),
+          let destination = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) else { return }
+    CGImageDestinationAddImage(destination, image, nil)
+    CGImageDestinationFinalize(destination)
 }
 
 private func median(_ values: [Double]) -> Double {
