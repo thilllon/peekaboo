@@ -67,6 +67,8 @@ final class FileActions {
     }
 
     func undo() -> FileActionResult {
+        if let busy = slowInFlight { return Self.busyResult(busy) }
+        if let slow = operations.takeSlowUndo() { return runInBackground(slow) }
         do {
             guard let change = try operations.undo() else { return FileActionResult(toast: "Nothing to undo") }
             return describe(change, undo: true)
@@ -76,12 +78,71 @@ final class FileActions {
     }
 
     func redo() -> FileActionResult {
+        if let busy = slowInFlight { return Self.busyResult(busy) }
+        if let slow = operations.takeSlowRedo() { return runInBackground(slow) }
         do {
             guard let change = try operations.redo() else { return FileActionResult(toast: "Nothing to redo") }
             return describe(change, undo: false)
         } catch {
             return FileActionResult(toast: "Redo failed: \(error)")
         }
+    }
+
+    /// An undo or redo that copies a file across volumes, running in the background; further undos and redos
+    /// wait for it, so that the stacks stay in order.
+    private var slowInFlight: FileOperations.SlowChange?
+
+    private static func busyResult(_ slow: FileOperations.SlowChange) -> FileActionResult {
+        FileActionResult(toast: "Still \(slow.isUndo ? "undoing" : "redoing") the last change: wait for it to finish")
+    }
+
+    /// Like the forward move and copy: the bytes move off the main thread, the viewer updates at once where it
+    /// can (a redone move takes the file out of the list), the result comes as a late result, and a failure
+    /// puts the file back in the list.
+    private func runInBackground(_ slow: FileOperations.SlowChange) -> FileActionResult {
+        slowInFlight = slow
+        let verb = slow.isUndo ? "Undo" : "Redo"
+        // The file a redone move takes out of the browsing set.
+        let leaving: ImageFile?
+        let started: FileActionResult
+        switch slow.change {
+        case .moved(_, let to) where slow.isUndo:
+            leaving = nil
+            started = FileActionResult(toast: "\(verb): moving \(to.lastPathComponent) back…")
+        case .moved(let from, let to):
+            let file = FileOperations.imageFile(at: from)
+            leaving = file
+            started = FileActionResult(outcome: .removed(file),
+                                       toast: "\(verb): moving to \(to.deletingLastPathComponent().lastPathComponent)…")
+        case .copied(_, let to):
+            leaving = nil
+            started = FileActionResult(toast: "\(verb): copying to \(to.deletingLastPathComponent().lastPathComponent)…")
+        case .trashed, .tagged:
+            leaving = nil
+            started = FileActionResult()
+        }
+        let owner = WeakFileActions(self)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = FileOperations.perform(slow)
+            DispatchQueue.main.async {
+                guard let actions = owner.value else { return }
+                actions.slowInFlight = nil
+                do {
+                    let change = try actions.operations.finish(slow, with: result)
+                    var finished = actions.describe(change, undo: slow.isUndo)
+                    // A redone move that ended as a copy (the file changed meanwhile) left the file where it was.
+                    if let leaving, case .copied = change, FileManager.default.fileExists(atPath: leaving.url.path) {
+                        finished.outcome = .restored(FileOperations.imageFile(at: leaving.url))
+                    }
+                    actions.onLateResult?(finished)
+                } catch {
+                    var outcome = FileActionOutcome.unchanged
+                    if let leaving, FileManager.default.fileExists(atPath: leaving.url.path) { outcome = .restored(leaving) }
+                    actions.onLateResult?(FileActionResult(outcome: outcome, toast: "\(verb) failed: \(error)"))
+                }
+            }
+        }
+        return started
     }
 
     // MARK: Dispatch

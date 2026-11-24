@@ -300,7 +300,8 @@ Missing folders are created. A file never overwrites another one: a name that is
 broken symbolic link) becomes `name 2.jpg`, `name 3.jpg`, … (like Finder's Keep Both), decided by an
 exclusive rename, so a file that appears at the last moment is not replaced either. Undo moves the file
 back (or removes the copy). Copies, and moves to another volume, run in the background: the next image
-shows at once, and a failure brings the file back.
+shows at once, and a failure brings the file back. So do their undo and redo; another ⌘Z or ⇧⌘Z waits
+until the one in progress has finished.
 
 Safety rules:
 

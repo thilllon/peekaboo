@@ -11,7 +11,9 @@ import Foundation
 /// and failure messages name files, not their full paths.
 ///
 /// Not thread-safe: use it from one thread (the main thread in the app). Every operation is a
-/// rename, a copy or one `setxattr`, so it returns quickly on the same volume.
+/// rename, a copy or one `setxattr`, so it returns quickly on the same volume; what copies across
+/// volumes runs elsewhere through `transfer` + `record`, and `takeSlowUndo`/`takeSlowRedo` + `perform` +
+/// `finish`.
 public final class FileOperations {
     /// One undoable change.
     public enum Change: Equatable, Sendable {
@@ -64,13 +66,15 @@ public final class FileOperations {
 
     /// A change plus the identity of the item that its undo (or redo) acts on, so that neither touches a
     /// file that was replaced or edited since.
-    private struct Entry {
+    fileprivate struct Entry: Sendable {
         let change: Change
         let stamp: Stamp?
     }
 
     private var undoEntries: [Entry] = []
     private var redoEntries: [Entry] = []
+    /// How many changes `record(_:)` has pushed (`finish(_:with:)` tells which came while it ran).
+    private var recordedCount = 0
 
     public init() {}
 
@@ -117,7 +121,7 @@ public final class FileOperations {
     /// any other failure (a read-only folder, a full disk) keeps it for another try.
     public func undo() throws -> Change? {
         guard let entry = undoEntries.popLast() else { return nil }
-        do {
+        let result = Result<Entry, Error> {
             let redo: Change
             switch entry.change {
             case .trashed(let original, let trashed):
@@ -126,10 +130,7 @@ public final class FileOperations {
                 let restored = try Self.restore(trashed, to: original)
                 redo = .trashed(original: restored, trashed: trashed)
             case .moved(let from, let to):
-                try Self.check(entry.stamp, at: to, missing: "is no longer in \(to.deletingLastPathComponent().lastPathComponent)",
-                               since: "moved")
-                let back = try Self.restore(to, to: from)
-                redo = .moved(from: back, to: to)
+                redo = try Self.undoMove(from: from, to: to, stamp: entry.stamp)
             case .copied(let from, let to):
                 try removeCopy(to, stamp: entry.stamp)
                 redo = .copied(from: from, to: to)
@@ -138,44 +139,31 @@ public final class FileOperations {
                 try Self.write(before, to: url)
                 redo = .tagged(url, before: before, after: after)
             }
-            redoEntries.append(Entry(change: redo, stamp: Self.stamp(redoing: redo)))
-            return redo
-        } catch let failure as Failure where failure.permanent {
-            throw failure
-        } catch {
-            undoEntries.append(entry)
-            throw error
+            return Entry(change: redo, stamp: Self.stamp(redoing: redo))
         }
+        return try settle(entry, undo: true, result)
     }
 
     /// Redo the most recently undone change; returns the change as redone. Throws when it cannot, dropping
     /// the change when its file is gone or was replaced or edited since it was put back (as `undo()` does).
     public func redo() throws -> Change? {
         guard let entry = redoEntries.popLast() else { return nil }
-        do {
+        let result = Result<Entry, Error> {
             let redone: Change
             switch entry.change {
             case .trashed(let original, _):
                 try Self.check(entry.stamp, at: original, missing: "is no longer there", since: "put back")
                 redone = try performTrash(original)
-            case .moved(let from, let to):
-                try Self.check(entry.stamp, at: from, missing: "is no longer there", since: "moved back")
-                redone = try Self.transfer(from, toFolder: to.deletingLastPathComponent(), copy: false)
-            case .copied(let from, let to):
-                redone = try Self.transfer(from, toFolder: to.deletingLastPathComponent(), copy: true)
+            case .moved, .copied:
+                redone = try Self.redoTransfer(entry.change, stamp: entry.stamp)
             case .tagged(let url, let before, let after):
                 try Self.requireItem(url)
                 try Self.write(after, to: url)
                 redone = .tagged(url, before: before, after: after)
             }
-            undoEntries.append(Entry(change: redone, stamp: Self.stamp(undoing: redone)))
-            return redone
-        } catch let failure as Failure where failure.permanent {
-            throw failure
-        } catch {
-            redoEntries.append(entry)
-            throw error
+            return Entry(change: redone, stamp: Self.stamp(undoing: redone))
         }
+        return try settle(entry, undo: false, result)
     }
 
     /// Push a change made elsewhere (e.g. a cross-volume move finished on a background queue) onto the
@@ -183,6 +171,114 @@ public final class FileOperations {
     public func record(_ change: Change) {
         undoEntries.append(Entry(change: change, stamp: Self.stamp(undoing: change)))
         redoEntries.removeAll()
+        recordedCount += 1
+    }
+
+    /// The file work of undoing a move (thread-safe: no stacks).
+    private static func undoMove(from: URL, to: URL, stamp: Stamp?) throws -> Change {
+        try check(stamp, at: to, missing: "is no longer in \(to.deletingLastPathComponent().lastPathComponent)", since: "moved")
+        let back = try restore(to, to: from)
+        return .moved(from: back, to: to)
+    }
+
+    /// The file work of redoing a move or a copy (thread-safe: no stacks).
+    private static func redoTransfer(_ change: Change, stamp: Stamp?) throws -> Change {
+        switch change {
+        case .moved(let from, let to):
+            try check(stamp, at: from, missing: "is no longer there", since: "moved back")
+            return try transfer(from, toFolder: to.deletingLastPathComponent(), copy: false)
+        case .copied(let from, let to):
+            return try transfer(from, toFolder: to.deletingLastPathComponent(), copy: true)
+        case .trashed, .tagged:
+            throw Failure("Cannot redo this change here")
+        }
+    }
+
+    /// Put the result of undoing (or redoing) `entry` where it belongs: the resulting entry on the other
+    /// stack, or `entry` back on its own after a failure that may pass. A change that can never be undone
+    /// (its file is gone, or was replaced or edited) is dropped instead, so that the next undo reaches the
+    /// older changes rather than failing on it for the rest of the session. `recordedSince` changes were
+    /// recorded while the work ran (`finish(_:with:)`): they stay above it, and an undone change can no
+    /// longer be redone.
+    private func settle(_ entry: Entry, undo: Bool, _ result: Result<Entry, Error>, recordedSince: Int = 0) throws -> Change {
+        switch result {
+        case .success(let done):
+            if !undo {
+                undoEntries.insert(done, at: max(0, undoEntries.count - recordedSince))
+            } else if recordedSince == 0 {
+                redoEntries.append(done)
+            }
+            return done.change
+        case .failure(let error):
+            if let failure = error as? Failure, failure.permanent { throw failure }
+            if undo {
+                undoEntries.insert(entry, at: max(0, undoEntries.count - recordedSince))
+            } else if recordedSince == 0 {
+                redoEntries.append(entry)
+            }
+            throw error
+        }
+    }
+
+    // MARK: Undo and redo off the main thread
+
+    /// An undo or redo that copies a file across volumes (seconds for a large file on a card or a network
+    /// share), taken off its stack so that it can run off the main thread: `perform(_:)` it on any thread,
+    /// then hand the result to `finish(_:with:)` on the owning one.
+    public struct SlowChange: Sendable {
+        fileprivate let entry: Entry
+        public let isUndo: Bool
+        fileprivate let recordedBefore: Int
+        /// The change as it stood on its stack.
+        public var change: Change { entry.change }
+    }
+
+    /// Take the next undo off the stack if it copies the file back across volumes; nil when the next
+    /// undo is quick (use `undo()`) or there is none.
+    public func takeSlowUndo() -> SlowChange? {
+        guard let entry = undoEntries.last, case .moved(let from, let to) = entry.change,
+              Self.movesByCopying || Self.crossesVolumes(to, from.deletingLastPathComponent()) else { return nil }
+        undoEntries.removeLast()
+        return SlowChange(entry: entry, isUndo: true, recordedBefore: recordedCount)
+    }
+
+    /// Take the next redo off the stack if it copies (a move across volumes, or a copy); nil otherwise.
+    public func takeSlowRedo() -> SlowChange? {
+        guard let entry = redoEntries.last else { return nil }
+        switch entry.change {
+        case .moved(let from, let to):
+            guard Self.movesByCopying || Self.crossesVolumes(from, to.deletingLastPathComponent()) else { return nil }
+        case .copied: break
+        case .trashed, .tagged: return nil
+        }
+        redoEntries.removeLast()
+        return SlowChange(entry: entry, isUndo: false, recordedBefore: recordedCount)
+    }
+
+    /// What `perform(_:)` did, for `finish(_:with:)`.
+    public struct SlowResult: Sendable {
+        /// The entry for the other stack, with the identity of the item that its next undo or redo acts on,
+        /// read off the main thread too (a lookup on a card or a share can take milliseconds).
+        fileprivate let result: Result<Entry, Error>
+    }
+
+    /// The file work of a taken undo or redo. Thread-safe: it touches no stack.
+    public static func perform(_ slow: SlowChange) -> SlowResult {
+        SlowResult(result: Result {
+            if slow.isUndo, case .moved(let from, let to) = slow.entry.change {
+                let redo = try undoMove(from: from, to: to, stamp: slow.entry.stamp)
+                return Entry(change: redo, stamp: stamp(redoing: redo))
+            }
+            let redone = try redoTransfer(slow.entry.change, stamp: slow.entry.stamp)
+            return Entry(change: redone, stamp: stamp(undoing: redone))
+        })
+    }
+
+    /// Settle a taken undo or redo as `undo()` and `redo()` do, on the owning thread. Changes recorded while
+    /// it ran stay above it on the undo stack.
+    @discardableResult
+    public func finish(_ slow: SlowChange, with done: SlowResult) throws -> Change {
+        try settle(slow.entry, undo: slow.isUndo, done.result, recordedSince: recordedCount - slow.recordedBefore)
     }
 
     private func performTrash(_ url: URL) throws -> Change {

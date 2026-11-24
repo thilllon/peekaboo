@@ -534,6 +534,84 @@ final class FileOperationsSafetyTests: XCTestCase {
         XCTAssertEqual(try listing("card"), ["d.jpg", "e.jpg"])
     }
 
+    /// `perform` on a background queue, as the app runs it.
+    private func performOffTheMainThread(_ slow: FileOperations.SlowChange) -> FileOperations.SlowResult {
+        final class Box: @unchecked Sendable { var result: FileOperations.SlowResult? }
+        let box = Box()
+        let done = expectation(description: "performed")
+        DispatchQueue.global(qos: .userInitiated).async {
+            XCTAssertFalse(Thread.isMainThread)
+            box.result = FileOperations.perform(slow)
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 10)
+        return box.result!
+    }
+
+    func testUndoAndRedoThatCopyAcrossVolumesRunOffTheMainThreadInOrder() throws {
+        let card = root.appendingPathComponent("card")
+        let ops = FileOperations()
+        ops.trashesUndoneCopies = false
+        // A move on one volume and a tag change are quick: they stay with undo().
+        let quick = try make("shoot/quick.jpg")
+        try ops.move(quick, toFolder: card)
+        XCTAssertNil(ops.takeSlowUndo())
+        try ops.setTags(FileOperations.Tags(names: ["Pick"]), of: card.appendingPathComponent("quick.jpg"))
+        XCTAssertNil(ops.takeSlowUndo())
+        XCTAssertEqual(ops.undoStack.count, 2)
+
+        // Across volumes (stood in for by copy-then-delete) the undo is taken off the stack, its bytes move on
+        // another thread, and finish puts it on the redo stack; the redo goes the same way.
+        FileOperations.movesByCopying = true
+        let photo = try make("shoot/s.jpg", "s")
+        try ops.move(photo, toFolder: card)
+        let undo = try XCTUnwrap(ops.takeSlowUndo())
+        XCTAssertTrue(undo.isUndo)
+        XCTAssertEqual(ops.undoStack.count, 2, "taken off")
+        let undone = try ops.finish(undo, with: performOffTheMainThread(undo))
+        XCTAssertEqual(undone, .moved(from: photo, to: card.appendingPathComponent("s.jpg")))
+        XCTAssertEqual(try String(contentsOf: photo, encoding: .utf8), "s")
+        XCTAssertEqual(ops.redoStack, [undone])
+        let redo = try XCTUnwrap(ops.takeSlowRedo())
+        XCTAssertFalse(redo.isUndo)
+        XCTAssertEqual(try ops.finish(redo, with: performOffTheMainThread(redo)), undone)
+        XCTAssertFalse(exists(photo))
+        XCTAssertEqual(ops.undoStack.count, 3)
+
+        // A change recorded while an undo runs stays on top, and the undone move can no longer be redone.
+        let slow = try XCTUnwrap(ops.takeSlowUndo())
+        let other = try make("other/o.jpg")
+        try ops.setTags(FileOperations.Tags(names: ["Reject"]), of: other)
+        _ = try ops.finish(slow, with: performOffTheMainThread(slow))
+        XCTAssertTrue(exists(photo))
+        XCTAssertEqual(ops.undoStack.last, .tagged(other, before: FileOperations.Tags(), after: FileOperations.Tags(names: ["Reject"])))
+        XCTAssertEqual(ops.redoStack, [])
+
+        // A failure that may pass puts the change back below what was recorded meanwhile.
+        guard getuid() != 0 else { throw XCTSkip("root ignores permissions") }
+        try ops.move(photo, toFolder: card)
+        let failing = try XCTUnwrap(ops.takeSlowUndo())
+        let shoot = root.appendingPathComponent("shoot")
+        try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: shoot.path)
+        let result = performOffTheMainThread(failing)
+        try ops.setTags(FileOperations.Tags(), of: other)
+        XCTAssertThrowsError(try ops.finish(failing, with: result)) { error in
+            XCTAssertEqual("\(error)", "Cannot restore s.jpg: Permission denied")
+        }
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shoot.path)
+        XCTAssertEqual(ops.undoStack.suffix(2).first, .moved(from: photo, to: card.appendingPathComponent("s.jpg")))
+        XCTAssertEqual(ops.undoStack.last, .tagged(other, before: FileOperations.Tags(names: ["Reject"]), after: FileOperations.Tags()))
+
+        // Redoing a copy copies again: always taken.
+        let copied = try make("shoot/c.jpg", "c")
+        try ops.copy(copied, toFolder: card)
+        _ = try ops.undo()
+        let recopy = try XCTUnwrap(ops.takeSlowRedo())
+        XCTAssertEqual(try ops.finish(recopy, with: performOffTheMainThread(recopy)),
+                       .copied(from: copied, to: card.appendingPathComponent("c.jpg")))
+        XCTAssertEqual(try String(contentsOf: card.appendingPathComponent("c.jpg"), encoding: .utf8), "c")
+    }
+
     func testMissingSourcesAndSameFolderMoves() throws {
         let ops = FileOperations()
         XCTAssertThrowsError(try ops.move(root.appendingPathComponent("shoot/gone.jpg"), toFolder: root)) { error in
