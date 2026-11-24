@@ -18,9 +18,12 @@ measurements behind them (all measured on an M4 Pro, 48 GB, macOS 26.6, unless n
 ## 2. Decode paths (per format)
 
 ImageIO facts that drive the routing:
-- Baseline JPEG ≤ ~50 MP is decoded by the **hardware JPEG engines** (2 on M4 Pro): 24 MP 51 ms vs 109 ms in software.
-- `kCGImageSourceShouldCacheImmediately` decodes are **serialised process-wide**; the draw, thumbnail and
-  private `CGImageSourceCreateIOSurfaceAtIndex` paths run in parallel. That private call returns a BGRA
+- Baseline JPEG up to at least 60 MP is decoded by the **hardware JPEG engines** (2 on M4 Pro): 24 / 50 / 60 MP in
+  49.8 / 114 / 129 ms vs libjpeg-turbo 109 / 284 / 308 ms. 101 MP and the 22705 px panorama fall back to software.
+- `kCGImageSourceShouldCacheImmediately` decodes are **serialised process-wide** (flat 10.5 img/s at 1–12 threads); a lazy
+  `CGImage` drawn into our own pre-faulted buffer in its native colour space scales to 33 img/s at 12 threads, and the
+  private `CGImageSourceCreateIOSurfaceAtIndex` path also runs in parallel. Never share a `CGImageSource` across threads:
+  it serialises (2.9–6.7× slower) and produced non-deterministic pixels in the thread-safety test. That private call returns a BGRA
   IOSurface (zero copy to Metal) and uses **both** HW engines: 24 MP at ~20 ms per image with 2 workers.
   It is resolved with `dlsym` and must fall back to the public path when missing.
 - `CreateThumbnailAtIndex(Always, MaxPixelSize 3456)` is a **trap** for JPEG (131–144 ms for 24 MP, 3× a full
@@ -29,6 +32,8 @@ ImageIO facts that drive the routing:
   HEIC thumbnail item ~2 ms, RAW: ARW 1616×1080 in 11 ms, RAF 4416×2944 in 34 ms, NEF full-size in 94 ms,
   ProRAW DNG 4032×3024 in 42 ms. **CR3 exposes no preview** (parse the ISO-BMFF container for the embedded JPEG).
 - Progressive JPEG is never HW-decoded (24 MP: 310 ms), but `SubsampleFactor 8` takes a DC-only path: 32 ms.
+- Baseline JPEG scale cliffs: `SubsampleFactor 4` is the cheapest reduced decode (24 MP 40 ms, 50–60 MP 90–101 ms);
+  `SubsampleFactor 8` and thumbnails ≤ 1024 px are *slower* (they leave the hardware path).
 - JPEG > HW limit (101 MP: 726 ms; 22705 px panorama: 1044 ms) falls back to single-threaded software.
 - PNG (24 MP 268 ms) and WebP (290 ms) have no fast path. HEIC cost is independent of output size (always full decode, HW).
 - Default outputs are not BGRA (full decode = RGBX, thumbnails = XRGB); converting by drawing costs +62 ms per
@@ -40,12 +45,12 @@ DCT scaling saves only 10–20% on high-entropy files (Huffman-bound); 10 thread
 
 | Source | `.preview` (≤ 512 px) | `.screen` | `.full` |
 |---|---|---|---|
-| JPEG baseline ≤ HW limit | embedded EXIF/MPF thumb if present; else `Subsample 8` | HW IOSurface path (full or `Subsample 2` when W/2 ≥ screen) | HW IOSurface path |
-| JPEG progressive | `Subsample 8` (DC-only) | libjpeg-turbo, DCT scale covering the screen | libjpeg-turbo |
-| JPEG > HW limit | embedded thumb, else libjpeg-turbo 1/8 | libjpeg-turbo, DCT scale covering the screen | libjpeg-turbo (tiles for > 16384 px) |
-| HEIC / HEIF / AVIF | embedded thumbnail item | ImageIO (HW) | ImageIO (HW) |
-| Camera RAW | embedded preview (thumbnail without `Always`); CR3 via own BMFF parse | largest embedded preview if it covers the screen, else RAW decode (background) | RAW decode (0.25–1.4 s), only on zoom |
-| PNG / WebP / TIFF / GIF / JXL / PSD / EXR | `CreateThumbnailAtIndex(Always, ≤ 512)` | parallel draw path | parallel draw path |
+| JPEG baseline ≤ HW limit | embedded EXIF/MPF thumb if present (0.2–1 ms); else `Subsample 4` (24 MP 40 ms) — never 8 | `Subsample 2` when W/2 ≥ screen (24 MP 44.6 ms), else full | HW: IOSurface path or lazy decode drawn into own buffer (49.8 ms @ 24 MP) |
+| JPEG progressive | `Subsample 8` (DC-only, 32 ms @ 24 MP, 88 ms @ 101 MP) | libjpeg-turbo 1/2 (253 ms @ 24 MP) | libjpeg-turbo (290 ms @ 24 MP) |
+| JPEG > HW limit | embedded thumb, else `Subsample 4` | libjpeg-turbo, DCT scale covering the screen | libjpeg-turbo (641 ms @ 101 MP; tiles above 16384 px) |
+| HEIC / HEIF / AVIF | embedded thumbnail item (~2 ms); else thumbnail 1024 (70–76 ms @ 50 MP) | thumbnail at the screen long side (62–73 ms @ 50 MP) | ImageIO full via IOSurface (94–110 ms; 195–227 ms if copied out) |
+| Camera RAW | embedded preview, thumbnail without `Always` (ARW 15, RAF 19, NEF 43 ms); CR3 via own BMFF parse | embedded preview at screen size if it covers the screen (RAF 70, NEF 93 ms), else RAW decode in the background | RAW decode (ProRAW 133 … ARW 61 MP 886 ms), only on zoom |
+| PNG / WebP / TIFF / GIF / JXL / PSD / EXR | thumbnail ≤ 512 (TIFF 23, AVIF 48, PNG 277, WebP 303 ms) | parallel lazy-draw path | parallel lazy-draw path |
 
 HDR (gain-map HEIC/JPEG): `kCGImageSourceDecodeRequest = DecodeToHDR` (10-bit PQ / half-float) when the screen
 reports EDR headroom > 1, displayed through the EDR path of the renderer. SDR otherwise.
@@ -122,9 +127,10 @@ viewers score 21–26 dB and alias 10–25× more.
 
 | Path | Target |
 |---|---|
-| Prefetch hit: key → frame on glass | ≤ 1 refresh (8.3 ms @120 Hz) |
+| Prefetch hit: key → frame submitted (CPU encode + GPU) | ≤ 1 ms (measured encode 0.05–0.09 ms, GPU 0.3–0.5 ms) |
+| Prefetch hit: key → on glass | ≤ present latency (measured CAMetalLayer → glass 24.9 ms = 3 vsyncs @120 Hz, 13.8 ms @144 Hz); keep the drawable queue short |
 | Miss, embedded preview available: first pixel | ≤ 12 ms after the key |
-| Cold launch (Finder) → first pixel | ≤ 250 ms |
+| Cold launch (Finder) → first pixel | ≤ 250 ms (measured skeleton-equivalent 258 ms; remove the ~70 ms main-thread stall before the first present) |
 | Resident re-open → first pixel | ≤ 80 ms |
 | GPU per frame at 3456×2234 | ≤ 3.5 ms |
 | Main-thread work per navigation | ≤ 1 ms |
