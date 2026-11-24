@@ -146,11 +146,15 @@ struct JPEGScan: Equatable {
         }
         let xmp = Array("http://ns.adobe.com/xap/1.0/\0".utf8)
         if seg.starts(with: xmp) {
-            // Cheap substring search: Ultra HDR / ISO gain map namespaces, Apple's HDR gain map tag.
-            let text = String(decoding: seg[xmp.count...], as: UTF8.self)
-            if text.contains("hdrgm:") || text.contains("HDRGainMap") || text.contains("ns.apple.com/HDRGainMap") {
-                result.gainMapHint = true
-            }
+            // Ultra HDR / ISO gain map namespace, Apple's HDR gain map tags (memmem: microseconds for 64 KB).
+            if contains(seg, "hdrgm:") || contains(seg, "HDRGainMap") { result.gainMapHint = true }
+        }
+    }
+
+    private static func contains(_ haystack: [UInt8], _ needle: String) -> Bool {
+        let pattern = Array(needle.utf8)
+        return haystack.withUnsafeBytes { h in
+            pattern.withUnsafeBytes { n in memmem(h.baseAddress, h.count, n.baseAddress, n.count) != nil }
         }
     }
 

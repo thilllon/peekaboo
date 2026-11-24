@@ -40,13 +40,15 @@ enum TurboJPEG {
         (dimension * factor.num + factor.denom - 1) / factor.denom
     }
 
-    /// The smallest DCT scaling factor ≤ 1 whose output long side still covers `target`
-    /// (`target <= 0` means full size).
+    /// The smallest DCT scaling factor whose output long side still covers `target` (`target <= 0`
+    /// means full size). Only 1/2, 1/4 and 1/8 are used: they have SIMD reduced-size IDCTs, while
+    /// the odd M/8 factors run plain C and measured slower than a full decode (101 MP progressive:
+    /// 3/8 759 ms vs full 686 ms).
     static func coveringScale(width: Int, height: Int, target: Int) -> (num: Int, denom: Int) {
         let long = max(width, height)
         guard target > 0, target < long else { return (1, 1) }
         var best = (num: 1, denom: 1)
-        for factor in scalingFactors where factor.num <= factor.denom {
+        for factor in scalingFactors where factor.num == 1 && [2, 4, 8].contains(factor.denom) {
             if scaled(long, factor) >= target { best = factor } else { break }
         }
         return best

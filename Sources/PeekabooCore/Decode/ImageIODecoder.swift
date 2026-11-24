@@ -124,6 +124,8 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
             if tier == .preview, probe.hasThumbnailItem, let thumb = embeddedThumbnail(probe, maxPixel: target, pool: pool) {
                 return thumb
             }
+            // HEVC/AV1 decode the whole image whatever the factor: /8 costs a little more than /4 (HEIC 12 MP
+            // 36 vs 29 ms) but keeps previews at a quarter of the memory.
             return try surfaceOrPublic(probe, subsample: subsample(probe, target), pool: pool)
         case .raw(let cr3):
             return try decodeRAW(probe, cr3: cr3, url: url, tier: tier, target: target, pool: pool)
@@ -135,8 +137,9 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
         }
     }
 
-    private func subsample(_ probe: ImageProbe, _ target: Int) -> Int {
-        Self.coveringSubsample(long: max(probe.info.pixelWidth, probe.info.pixelHeight), target: target)
+    private func subsample(_ probe: ImageProbe, _ target: Int, maxFactor: Int = 8) -> Int {
+        Self.coveringSubsample(long: max(probe.info.pixelWidth, probe.info.pixelHeight), target: target,
+                               maxFactor: maxFactor)
     }
 
     // MARK: JPEG
@@ -180,16 +183,17 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
         let info = probe.info
         let long = max(info.pixelWidth, info.pixelHeight)
         if tier != .full {
-            if cr3, let output = cr3Preview(url: url, info: info, tier: tier, target: target, pool: pool) { return output }
-            // Without `…Always` ImageIO returns the camera's embedded JPEG; a huge limit keeps it at native size
-            // (no CPU resampling) and the GPU scales it.
-            let limit = tier == .preview ? target : 1 << 16
-            if let preview = embeddedThumbnail(probe, maxPixel: limit, pool: pool),
-               tier == .preview || max(preview.pixels.width, preview.pixels.height) >= min(target, long) {
-                return preview
-            }
-            if tier == .preview, let thumb = thumbnail(probe, maxPixel: target, always: true, pool: pool, path: "raw thumbnail") {
-                return thumb
+            if cr3 {
+                // ImageIO exposes no CR3 preview (asking runs a RAW decode): use the container's JPEGs.
+                if let output = cr3Preview(url: url, info: info, tier: tier, target: target, pool: pool) { return output }
+            } else {
+                // Without `…Always` ImageIO returns the camera's embedded JPEG; a huge limit keeps it at
+                // native size (no CPU resampling) and the GPU scales it.
+                let limit = tier == .preview ? target : 1 << 16
+                if let preview = embeddedThumbnail(probe, maxPixel: limit, pool: pool),
+                   tier == .preview || max(preview.pixels.width, preview.pixels.height) >= min(target, long) {
+                    return preview
+                }
             }
         }
         // RAW decode: the SPI declines full size (returns nil) but delivers 16-bit RGBA for /2…/8.
@@ -246,11 +250,34 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     private func surface(_ probe: ImageProbe, subsample: Int) -> Output? {
         guard let surface = IOSurfaceSPI.surface(probe.source, index: probe.index, subsample: subsample),
               let layout = IOSurfaceSPI.layout(of: surface) else { return nil }
+        let (space, alpha) = traits(probe)
         let pixels = PixelBuffer(width: IOSurfaceGetWidth(surface), height: IOSurfaceGetHeight(surface),
-                                 bytesPerRow: IOSurfaceGetBytesPerRow(surface), layout: layout,
-                                 alpha: probe.info.hasAlpha ? .premultiplied : .opaque,
-                                 colorSpace: colorSpace(probe), storage: .surface(surface))
+                                 bytesPerRow: IOSurfaceGetBytesPerRow(surface), layout: layout, alpha: alpha,
+                                 colorSpace: space, storage: .surface(surface))
         return Output(pixels: pixels, orientation: probe.info.orientation, path: "iosurface /\(subsample)")
+    }
+
+    /// Colour space and alpha semantics of the source pixels, without decoding. The SPI keeps the
+    /// file's alpha as stored (PNG: straight, measured), so it is read from the lazy, header-only
+    /// CGImage; opaque images with a well-known profile skip even that.
+    private func traits(_ probe: ImageProbe) -> (CGColorSpace, AlphaMode) {
+        if !probe.info.hasAlpha {
+            switch probe.info.colorProfileName {
+            case "sRGB IEC61966-2.1": return (TurboJPEG.sRGB, .opaque)
+            case "Display P3": return (Self.displayP3, .opaque)
+            default: break
+            }
+        }
+        guard let image = CGImageSourceCreateImageAtIndex(probe.source, probe.index, ImageProbe.sourceOptions) else {
+            return (TurboJPEG.sRGB, probe.info.hasAlpha ? .straight : .opaque)
+        }
+        let alpha: AlphaMode
+        switch image.alphaInfo {
+        case .premultipliedFirst, .premultipliedLast: alpha = .premultiplied
+        case .first, .last: alpha = .straight
+        default: alpha = probe.info.hasAlpha ? .straight : .opaque
+        }
+        return (NativeImage.rgbSpace(image), alpha)
     }
 
     private func surfaceOrPublic(_ probe: ImageProbe, subsample: Int, pool: PixelBufferPool) throws -> Output {
@@ -268,18 +295,6 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
         }
         let pixels = try NativeImage.pixels(image, pool: pool, opaque: !probe.info.hasAlpha)
         return Output(pixels: pixels, orientation: probe.info.orientation, path: "cgimage /\(subsample)")
-    }
-
-    /// Colour space of the source pixels without decoding: well-known profiles by name, otherwise
-    /// the (lazy, header-only) CGImage's space.
-    private func colorSpace(_ probe: ImageProbe) -> CGColorSpace {
-        switch probe.info.colorProfileName {
-        case "sRGB IEC61966-2.1": return TurboJPEG.sRGB
-        case "Display P3": return Self.displayP3
-        default:
-            let image = CGImageSourceCreateImageAtIndex(probe.source, probe.index, ImageProbe.sourceOptions)
-            return image.map(NativeImage.rgbSpace) ?? TurboJPEG.sRGB
-        }
     }
 
     static let displayP3 = CGColorSpace(name: CGColorSpace.displayP3)!
