@@ -194,8 +194,8 @@ public enum FolderScanner {
     static func seconds(_ time: timespec) -> Double { Double(time.tv_sec) + Double(time.tv_nsec) / 1e9 }
 
     /// The POSIX reason of an error `scan` or `browse` threw (the bulk listing's own, or the one under a FileManager
-    /// error): `EPERM` when macOS privacy protection refuses the folder (System Settings › Privacy & Security ›
-    /// Files and Folders), `EACCES` when its permissions do. nil when there is none.
+    /// error): `EPERM` when macOS privacy protection refuses the folder (System Settings › Privacy & Security › Files &
+    /// Folders or Full Disk Access), `EACCES` when its permissions do. nil when there is none.
     public static func posixCode(_ error: Error) -> Int32? {
         var next: NSError? = error as NSError
         while let current = next {

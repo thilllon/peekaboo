@@ -236,9 +236,15 @@ viewers score 21–26 dB and alias 10–25× more.
   the app's defaults) `FolderAccessRequest` lists the three one after another on a utility queue, a second after
   launch next to the updater, so the prompts come right after installation instead of in the middle of browsing:
   nothing runs before the first frame, and the main thread spends one `UserDefaults` read on it (plus a queue hop at
-  first launch). Never headless, in the self-test, with `PEEKABOO_ACTIONS` or outside an app bundle. A listing that
-  is refused (EPERM: privacy protection; EACCES: the folder's permissions) shows the opened image on its own and one
-  6 s toast with the way to allow it (System Settings › Privacy & Security › Files and Folders).
+  first launch). Only when LaunchServices started the app (launchd is its parent: Finder, the Dock, `open`, the
+  updater's relaunch), because macOS charges what a process started from a shell reads to the terminal; never
+  headless, in the self-test, with `PEEKABOO_ACTIONS` or outside an app bundle. A listing that is refused shows the
+  opened image on its own with a 6 s toast that says how to allow it, again at either end of the set instead of
+  "First image" / "Last image" (an opened folder says it as its message). EPERM (privacy protection) names the Files &
+  Folders switch of the place the folder is in (Desktop, Documents or Downloads Folder; Removable or Network Volumes,
+  from one `statfs` off the main thread), else Full Disk Access, the only setting for Mail, Messages or Time Machine
+  backups; EACCES (the folder's own permissions) points to Finder › Get Info › Sharing & Permissions. While the
+  folder is refused, the window becoming key lists it again (back from System Settings), off the main thread.
 
 ### Animation
 

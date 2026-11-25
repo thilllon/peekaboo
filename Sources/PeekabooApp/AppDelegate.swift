@@ -89,7 +89,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         guard folderAccess.start(presentation: presentation, selfTest: selfTest != nil) else { return }
         let ms = Trace.ms(since: started)
         Trace.log(String(format: "folder access: first launch, listing %@ on a utility queue (main thread %.3f ms)",
-                         folderAccess.folders.map(\.lastPathComponent).joined(separator: ", "), ms))
+                         FolderAccessRequest.folders.map(\.lastPathComponent).joined(separator: ", "), ms))
     }
 
     private func startUpdates() {

@@ -76,7 +76,7 @@ Everything below was measured on a MacBook Pro M4 Pro (see [docs/research.md](do
    themselves.
 3. At first launch macOS asks, once for each, whether Peekaboo may access your Desktop, Documents and Downloads folders:
    Peekaboo lists the folder of the image you open so you can browse it, and asks then rather than in the middle of your
-   work. macOS keeps the answers, across updates too; change them in **System Settings → Privacy & Security → Files and
+   work. macOS keeps the answers, across updates too; change them in **System Settings → Privacy & Security → Files &
    Folders**. In a folder Peekaboo may not read, the image you open shows on its own and a toast says how to allow it.
 4. Optional: make it the default viewer with Finder → Get Info → Open with → Peekaboo → Change All.
 
