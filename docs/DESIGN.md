@@ -103,7 +103,14 @@ time-to-sharp equal to no-prefetch.
 - **Windows**: `.screen` ahead `clamp(2 + ⌈250/I_eff⌉, 2, 12)`, behind 2; `.preview` ahead `clamp(4 + ⌈1000/I_eff⌉, 4, 48)`, behind 4.
   Earliest deadline first; a preview runs just before the screen tier of the same image.
 - **Skimming** (`I_eff < 120 ms`): show previews only; the screen tier of the visible image waits for a dwell of
-  `clamp(1.5·EMA, 40, 120) ms`. Skip a screen-tier prefetch that cannot finish before the user passes the image.
+  `clamp(1.5·EMA, 40, 120) ms`. Skip a screen-tier prefetch that cannot finish before the user passes the image, and
+  one of an image already passed unless it is short (≤ 150 ms with every lane busy: hardware JPEG and HEIC decodes):
+  its reversal ETA makes any decode look feasible, but a progressive JPEG or PNG decode started for every image passed
+  fills the lanes and still runs beside the decode of the image the user stops on.
+- **Cost model**: EWMA of measured decode times per (format family by extension, megapixel bucket, tier),
+  normalised by concurrency, seeded from §2. Baseline and progressive JPEGs share a family: told apart, the exact
+  progressive estimate (×1.6 for all lanes busy in the feasibility test) stopped prefetches that do land in time in
+  mixed folders (docs/research.md, "Skimming past progressive JPEGs").
 - **Foreground gate**: while the visible image's decode is queued or running, no new prefetch starts.
 - **Lanes**: 6 decode lanes (one reserved for the visible image), routed by decode path (HW JPEG engine: ≤ 2 in flight;
   CPU/libjpeg-turbo; ImageIO other). 4 background lanes (QoS utility → E-cores) for the folder-wide preview sweep,
@@ -118,7 +125,9 @@ time-to-sharp equal to no-prefetch.
 - **Early renditions**: a screen or full decode may hand over an approximate version of its tier (progressive JPEG
   first passes) through a `PartialSink`; the scheduler asks whether it is still wanted (the current image's screen
   tier until it is sharp, its full tier once requested), the pipeline shows it and never caches it, and the exact tier
-  of the same decode replaces it. Prefetch decodes never make one.
+  of the same decode replaces it. Prefetch decodes never make one. A rendition of another version of the file than
+  the listed one is dropped; the file the app opens is decoded before its folder is listed, so the worker's `stat`
+  before the decode is what is compared.
 - **Folder**: `getattrlistbulk` (10k entries with metadata in 8 ms) and a precomputed natural-sort key (7 ms for
   10k names; `localizedStandardCompare` 30 ms). Watch the directory with a `DispatchSource` (0.2–0.6 ms latency).
 - `F_RDADVISE` read-ahead when a file enters a prefetch window.
