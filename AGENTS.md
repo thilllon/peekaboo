@@ -109,7 +109,8 @@ One-time setup on the maintainer's Mac (never commit any of it):
 Without a Developer ID it refuses to publish unless `ALLOW_ADHOC=1` (other Macs then need "Open Anyway").
 `DRY_RUN=1 mise run release` builds and packages everything (ad-hoc without a certificate) and prints the
 notarization, tag and publish commands instead of running them. `mise run app` and `mise run dmg` sign with the
-Developer ID when the keychain has one and fall back to ad-hoc for local builds (`SIGN_IDENTITY=-` forces ad-hoc).
+Developer ID when the keychain has one and fall back to ad-hoc for local builds (`SIGN_IDENTITY=-` forces ad-hoc);
+a local ad-hoc build carries `get-task-allow` (lldb, Instruments), a release never does.
 
 Installed apps read `https://github.com/thilllon/peekaboo/releases/latest/download/latest.json`
 (`Sources/PeekabooApp/Update`, `Sources/PeekabooCore/Update`): keep its fields and the zip layout stable, since every

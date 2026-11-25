@@ -44,7 +44,7 @@ if [[ "$(sign_identity)" == - && "${ALLOW_ADHOC:-0}" != 1 ]]; then
 fi
 
 # 4. Build, sign, notarize, staple: build/Peekaboo.app, build/Peekaboo-$VERSION.zip and .dmg.
-VERSION="$VERSION" ./.mise/tasks/app
+RELEASE=1 VERSION="$VERSION" ./.mise/tasks/app
 NOTARIZE=1 ./.mise/tasks/dmg
 APP=build/Peekaboo.app
 ZIP="build/Peekaboo-$VERSION.zip"

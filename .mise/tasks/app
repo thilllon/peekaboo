@@ -31,7 +31,10 @@ cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 # Hardened runtime in every build, so what runs here is what ships. Releases carry no entitlements: the app needs
 # none (the IOSurface SPI is a dlsym into ImageIO, Metal compiles shaders out of process).
-if [[ "$IDENTITY" == - ]]; then
+if [[ "$IDENTITY" == - && "${RELEASE:-0}" == 1 ]]; then
+  # An ad-hoc release (ALLOW_ADHOC=1): no get-task-allow, so other processes cannot attach to the shipped app.
+  codesign --force --sign - --options runtime --timestamp=none "$APP"
+elif [[ "$IDENTITY" == - ]]; then
   # Ad-hoc: opens on this Mac only; other Macs' Gatekeeper blocks it (releases need a Developer ID).
   # get-task-allow keeps local builds open to lldb and Instruments under the hardened runtime.
   ENTITLEMENTS="$(mktemp)"
