@@ -443,9 +443,14 @@ final class PeekabooRenderTests: XCTestCase {
         r.setViewSize(CGSize(width: 50, height: 40), backingScale: 1)
         r.setImage(image, key: "hdr")
         XCTAssertEqual(layer.pixelFormat, .rgba16Float)
-        XCTAssertEqual(layer.preferredDynamicRange, .high)
-        XCTAssertEqual(layer.contentsHeadroom, Renderer.hdrHeadroom)
-        XCTAssertGreaterThan(layer.contentsHeadroom, 1)
+        if #available(macOS 26, *) {
+            XCTAssertEqual(layer.preferredDynamicRange, .high)
+            XCTAssertEqual(layer.contentsHeadroom, Renderer.hdrHeadroom)
+            XCTAssertGreaterThan(layer.contentsHeadroom, 1)
+            XCTAssertFalse(layer.wantsExtendedDynamicRangeContent, "macOS 26 tags the drawables instead")
+        } else {
+            XCTAssertTrue(layer.wantsExtendedDynamicRangeContent)
+        }
         let c = render(r)[x: 25, y: 20]
         XCTAssertEqual(c.x, 3.0, accuracy: 0.01)
         XCTAssertEqual(c.y, 0.5, accuracy: 0.01)
@@ -453,8 +458,25 @@ final class PeekabooRenderTests: XCTestCase {
         // Back to SDR for an SDR image.
         r.setImage(makeImage(width: 8, height: 8) { _, _ in SIMD4(1, 2, 3, 255) }, key: "sdr")
         XCTAssertEqual(layer.pixelFormat, .bgra8Unorm)
-        XCTAssertEqual(layer.preferredDynamicRange, .standard)
-        XCTAssertEqual(layer.contentsHeadroom, 0)
+        if #available(macOS 26, *) {
+            XCTAssertEqual(layer.preferredDynamicRange, .standard)
+            XCTAssertEqual(layer.contentsHeadroom, 0)
+        } else {
+            XCTAssertFalse(layer.wantsExtendedDynamicRangeContent)
+        }
+    }
+
+    // MARK: Oldest supported system
+
+    /// The shaders compile at runtime in the newest Metal language version of the running system, so the source
+    /// must stay within what the oldest supported macOS compiles: macOS 14 has MSL 3.1.
+    func testShadersCompileAsMetal31ForMacOS14() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let options = RenderContext.compileOptions()
+        options.languageVersion = .version3_1
+        let oldest = try device.makeLibrary(source: Shaders.source, options: options)
+        let current = try device.makeLibrary(source: Shaders.source, options: RenderContext.compileOptions())
+        XCTAssertEqual(Set(oldest.functionNames), Set(current.functionNames))
     }
 
     // MARK: Present latency

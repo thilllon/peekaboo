@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+#MISE description="Build the static libjpeg-turbo PeekabooCore links into .deps/ (pinned release, SHA-256 checked, arm64 + Neon, macOS 14)"
+# mise runs file tasks from the project root. A no-op while .deps/ matches the pin and the flags below.
+set -euo pipefail
+VERSION=3.2.1
+SHA256=c27ad72a68da151177929aa969ae773a2da5ac2af9ce946079314fdac8cece7f
+# Package.swift `platforms`: objects built for a newer macOS than the app's minimum make ld warn and may
+# call functions the older system lacks.
+MACOS=14.0
+FLAGS=(
+  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_OSX_ARCHITECTURES=arm64
+  -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOS"
+  -DENABLE_SHARED=OFF
+  -DENABLE_STATIC=ON
+  -DWITH_SIMD=ON
+  -DREQUIRE_SIMD=ON
+  -DWITH_TOOLS=OFF
+)
+PREFIX="$PWD/.deps/libjpeg-turbo"
+STAMP="$VERSION $SHA256 ${FLAGS[*]}"
+if [[ -f "$PREFIX/lib/libturbojpeg.a" && "$(cat "$PREFIX/.stamp" 2>/dev/null)" == "$STAMP" ]]; then
+  echo "$PREFIX: libjpeg-turbo $VERSION up to date"
+  exit 0
+fi
+command -v cmake > /dev/null || { echo "cmake not found: run 'mise install' (mise.toml pins it)" >&2; exit 1; }
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+curl -fsSL --retry 3 -o "$WORK/src.tar.gz" \
+  "https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/$VERSION/libjpeg-turbo-$VERSION.tar.gz"
+echo "$SHA256  $WORK/src.tar.gz" | shasum -a 256 -c --quiet -
+tar -xzf "$WORK/src.tar.gz" -C "$WORK"
+SRC="$WORK/libjpeg-turbo-$VERSION"
+cmake -S "$SRC" -B "$WORK/build" "${FLAGS[@]}" > "$WORK/configure.log" || { cat "$WORK/configure.log"; exit 1; }
+cmake --build "$WORK/build" --target turbojpeg-static --parallel "$(sysctl -n hw.ncpu)" > "$WORK/build.log" ||
+  { cat "$WORK/build.log"; exit 1; }
+
+rm -rf "$PREFIX"
+mkdir -p "$PREFIX/include" "$PREFIX/lib"
+cp "$WORK/build/libturbojpeg.a" "$PREFIX/lib/"
+cp "$SRC/src/turbojpeg.h" "$PREFIX/include/"
+cp "$SRC/LICENSE.md" "$PREFIX/"
+echo "$STAMP" > "$PREFIX/.stamp"
+echo "$PREFIX: libjpeg-turbo $VERSION built for macOS $MACOS arm64"

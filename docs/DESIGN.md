@@ -14,6 +14,7 @@ measurements behind them (all measured on an M4 Pro, 48 GB, macOS 26.6, unless n
 | Upload | Zero-copy: decode into a shared `MTLBuffer` / IOSurface, wrap as texture | `makeTexture` over the buffer: 0.014 ms. `replace(region:)` 7.6 ms. |
 | Lifecycle | Stay resident after the last window closes | Re-open of a running app ≈ 65 ms (mostly `open`/LaunchServices) vs 230–250 ms cold. |
 | Shaders | MSL source embedded in Swift, compiled at runtime on a background thread started in `main()` | Offline compiler absent. 1.1 ms with a warm OS shader cache, 31–42 ms (≤ 97 ms) on first compile; hidden behind AppKit init. |
+| Oldest macOS | **14 (Sonoma)**, Apple Silicon. Newer APIs behind `#available` with the macOS 26 path unchanged (ISO gain-map probe 15+, `MTLCompileOptions.mathMode` 15+, EDR drawable tagging 26+); the shaders stay MSL 3.1; libjpeg-turbo built from its pinned release for 14.0 at `-O3` (`mise run deps`); binaries record SDK 26.0 | Every strong import passes the SDK's macOS 14 availability annotations. On macOS 26 decode, pipeline, render and process-launch times are unchanged (same pixels), except libjpeg-turbo: Homebrew's bottle is `-Os`, upstream's Release `-O3` decodes progressive JPEGs 4–26 % faster (101 MP `.full` 795 → 587 ms; an `-Os` build of the same source measures as before). |
 
 ## 2. Decode paths (per format)
 
@@ -184,7 +185,8 @@ viewers score 21–26 dB and alias 10–25× more.
   Neighbours get pre-rendered fit canvases, so next/prev is a ~0.4 ms present.
 - **Colour**: working space linear Display P3; source → working conversion on the GPU (3×3 matrix + transfer function),
   never on the CPU. SDR: `bgra8Unorm` drawable tagged Display P3, sRGB-curve encode + TPDF ±1 LSB dither in the present
-  pass. HDR/EDR: `rgba16Float` + `extendedLinearDisplayP3`, macOS 26 `preferredDynamicRange`.
+  pass. HDR/EDR: `rgba16Float` + `extendedLinearDisplayP3`, macOS 26 `preferredDynamicRange` + `contentsHeadroom`
+  (macOS 14–15: `wantsExtendedDynamicRangeContent`).
 - **Tiling** above 16384 px (Apple9 limit, verified): level-0 tiles with an 8 px apron, visible tiles first.
 - **Pacing**: event-driven immediate render for discrete actions; a `CADisplayLink` only while animating;
   one drawable per refresh.

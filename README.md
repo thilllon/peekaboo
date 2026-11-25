@@ -19,7 +19,7 @@
 <p align="center">
   <a href="https://github.com/thilllon/peekaboo/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/thilllon/peekaboo/ci.yml?branch=main&logo=githubactions&logoColor=white&label=CI" alt="CI" /></a>
   <a href="https://github.com/thilllon/peekaboo/releases/latest"><img src="https://img.shields.io/github/v/release/thilllon/peekaboo?label=release" alt="release" /></a>
-  <img src="https://img.shields.io/badge/macOS-26%2B%20%C2%B7%20Apple%20Silicon-black?logo=apple" alt="macOS 26+" />
+  <img src="https://img.shields.io/badge/macOS-14%2B%20%C2%B7%20Apple%20Silicon-black?logo=apple" alt="macOS 14+" />
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT" /></a>
 </p>
 
@@ -77,7 +77,7 @@ Everything below was measured on a MacBook Pro M4 Pro (see [docs/research.md](do
    current release.)
 3. Optional: make it the default viewer with Finder → Get Info → Open with → Peekaboo → Change All.
 
-Requires macOS 26 (Tahoe) on Apple Silicon.
+Requires macOS 14 (Sonoma) or later on Apple Silicon.
 
 **Versions** are the release commit's day and the start of its hash, e.g. `20261125-ab2342`. Peekaboo › About Peekaboo,
 Settings and `peekaboo --version` show it with the build number, e.g. `20261125-ab2342 (35)`.
@@ -123,9 +123,9 @@ and action.
 ## Build from source
 
 ```sh
-brew install jpeg-turbo   # statically linked
-mise install              # pinned gitleaks + lefthook
+mise install              # pinned gitleaks, lefthook, cmake
 mise run setup            # git hooks
+mise run deps             # static libjpeg-turbo (pinned, checksum-verified) for macOS 14 → .deps/
 mise run install          # build the release app into ~/Applications
 ```
 
@@ -147,3 +147,7 @@ The decisions and the measurements behind them are in [docs/DESIGN.md](docs/DESI
 ## License
 
 [MIT](LICENSE)
+
+Peekaboo links [libjpeg-turbo](https://libjpeg-turbo.org) statically. This software is based in part on the work of the
+Independent JPEG Group. libjpeg-turbo's license (IJG, Modified BSD, zlib) ships in the app as
+`Contents/Resources/LICENSE-libjpeg-turbo.md`.
