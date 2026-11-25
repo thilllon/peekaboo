@@ -1,7 +1,8 @@
 // swift-tools-version: 6.2
 import PackageDescription
 
-// Oldest supported macOS (Sonoma; Apple Silicon only). `.mise/tasks/deps` builds libjpeg-turbo for the same version.
+// Oldest supported macOS (Sonoma; Apple Silicon only). `.mise/tasks/deps` builds libjpeg-turbo and libwebp for the
+// same version.
 let minimumMacOS = "14.0"
 
 // Release builds favour raw speed: whole-module optimisation is the SwiftPM
@@ -30,6 +31,8 @@ let package = Package(
     targets: [
         // libjpeg-turbo (static, built by `mise run deps`): parallel CPU JPEG decoding with DCT scaling and ROI crops.
         .systemLibrary(name: "CTurboJPEG", path: "Sources/CTurboJPEG"),
+        // libwebp (static, built by `mise run deps`): WebPAnimDecoder composites animated WebP frame after frame.
+        .systemLibrary(name: "CWebP", path: "Sources/CWebP"),
         // Own C decoders where ImageIO is slow: PNG (system zlib) and the early rendition of progressive JPEGs.
         // SwiftPM builds release C at -Os, which leaves the unfilter's per-byte loops rolled (the left neighbours go
         // through memory): 24 MP PNG 158–167 ms, 143–154 ms at -O3 (one thread: 272 vs 202 ms).
@@ -38,9 +41,11 @@ let package = Package(
         // Decode tiers, tiered cache, prefetch scheduler, folder model, config/keymap. No AppKit.
         .target(
             name: "PeekabooCore",
-            dependencies: ["CTurboJPEG", "CPeekabooDecode"],
+            dependencies: ["CTurboJPEG", "CPeekabooDecode", "CWebP"],
             swiftSettings: speed,
-            linkerSettings: [.unsafeFlags([Context.packageDirectory + "/.deps/libjpeg-turbo/lib/libturbojpeg.a"])]),
+            linkerSettings: [.unsafeFlags(["libjpeg-turbo/lib/libturbojpeg.a", "libwebp/lib/libwebpdemux.a",
+                                           "libwebp/lib/libwebp.a", "libwebp/lib/libsharpyuv.a"]
+                                            .map { Context.packageDirectory + "/.deps/" + $0 })]),
         // Metal renderer: textures, quality pyramid, resampling kernels, progressive refinement.
         .target(name: "PeekabooRender", dependencies: ["PeekabooCore"], swiftSettings: speed),
         // AppKit shell (programmatic; no storyboard, no SwiftUI).

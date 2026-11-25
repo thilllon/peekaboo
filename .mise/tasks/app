@@ -40,8 +40,10 @@ printf 'APPL????' > "$APP/Contents/PkgInfo"
 # CLI launcher ships inside the bundle; `mise run install` links it onto PATH.
 cp Resources/peekaboo "$APP/Contents/Resources/peekaboo"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
-# The statically linked libjpeg-turbo requires its license text (IJG, Modified BSD, zlib) with the binary.
+# The statically linked libraries require their license texts with the binary: libjpeg-turbo (IJG, Modified BSD,
+# zlib) and libwebp (BSD-3-Clause and its patent grant).
 cp .deps/libjpeg-turbo/LICENSE.md "$APP/Contents/Resources/LICENSE-libjpeg-turbo.md"
+cp .deps/libwebp/LICENSE.txt "$APP/Contents/Resources/LICENSE-libwebp.txt"
 
 # Hardened runtime in every build, so what runs here is what ships. Releases carry no entitlements: the app needs
 # none (the IOSurface SPI is a dlsym into ImageIO, Metal compiles shaders out of process).

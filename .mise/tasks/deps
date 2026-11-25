@@ -1,12 +1,25 @@
 #!/usr/bin/env bash
-#MISE description="Build the static libjpeg-turbo PeekabooCore links, and its headers, into .deps/ (pinned release, SHA-256 checked, arm64 + Neon, macOS 14)"
-# mise runs file tasks from the project root. A no-op while .deps/ matches the pin and the flags below.
+#MISE description="Build the static libjpeg-turbo and libwebp PeekabooCore links, and their headers, into .deps/ (pinned releases, SHA-256 checked, arm64 + Neon, macOS 14)"
+# mise runs file tasks from the project root. A no-op while .deps/ matches the pins and the flags below.
 set -euo pipefail
-VERSION=3.2.1
-SHA256=c27ad72a68da151177929aa969ae773a2da5ac2af9ce946079314fdac8cece7f
+command -v cmake > /dev/null || { echo "cmake not found: run 'mise install' (mise.toml pins it)" >&2; exit 1; }
 # Package.swift `platforms`: objects built for a newer macOS than the app's minimum make ld warn and may
 # call functions the older system lacks.
 MACOS=14.0
+# Scratch build folders, removed on exit (also when a build fails).
+SCRATCH=()
+trap 'rm -rf ${SCRATCH[@]+"${SCRATCH[@]}"}' EXIT
+
+# fetch <url> <sha256> <dir>: download a source tarball into <dir>, check it, unpack it there.
+fetch() {
+  curl -fsSL --retry 3 -o "$3/src.tar.gz" "$1"
+  echo "$2  $3/src.tar.gz" | shasum -a 256 -c --quiet -
+  tar -xzf "$3/src.tar.gz" -C "$3"
+}
+
+libjpeg_turbo() {
+VERSION=3.2.1
+SHA256=c27ad72a68da151177929aa969ae773a2da5ac2af9ce946079314fdac8cece7f
 FLAGS=(
   -DCMAKE_BUILD_TYPE=Release
   -DCMAKE_OSX_ARCHITECTURES=arm64
@@ -25,16 +38,12 @@ PREFIX="$PWD/.deps/libjpeg-turbo"
 STAMP="$VERSION $SHA256 ${FLAGS[*]} ${HEADERS[*]} jconfig.h"
 if [[ -f "$PREFIX/lib/libturbojpeg.a" && "$(cat "$PREFIX/.stamp" 2>/dev/null)" == "$STAMP" ]]; then
   echo "$PREFIX: libjpeg-turbo $VERSION up to date"
-  exit 0
+  return
 fi
-command -v cmake > /dev/null || { echo "cmake not found: run 'mise install' (mise.toml pins it)" >&2; exit 1; }
-
+local WORK
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
-curl -fsSL --retry 3 -o "$WORK/src.tar.gz" \
-  "https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/$VERSION/libjpeg-turbo-$VERSION.tar.gz"
-echo "$SHA256  $WORK/src.tar.gz" | shasum -a 256 -c --quiet -
-tar -xzf "$WORK/src.tar.gz" -C "$WORK"
+SCRATCH+=("$WORK")
+fetch "https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/$VERSION/libjpeg-turbo-$VERSION.tar.gz" "$SHA256" "$WORK"
 SRC="$WORK/libjpeg-turbo-$VERSION"
 cmake -S "$SRC" -B "$WORK/build" "${FLAGS[@]}" > "$WORK/configure.log" || { cat "$WORK/configure.log"; exit 1; }
 cmake --build "$WORK/build" --target turbojpeg-static --parallel "$(sysctl -n hw.ncpu)" > "$WORK/build.log" ||
@@ -48,3 +57,48 @@ cp "$WORK/build/jconfig.h" "$PREFIX/include/"
 cp "$SRC/LICENSE.md" "$PREFIX/"
 echo "$STAMP" > "$PREFIX/.stamp"
 echo "$PREFIX: libjpeg-turbo $VERSION built for macOS $MACOS arm64"
+}
+
+# libwebp's animation decoder (WebPAnimDecoder, libwebpdemux) composites animated WebP frame after frame; ImageIO
+# decodes frame i from the first frame again. Only the libraries: no tools, no mux library.
+libwebp() {
+local VERSION=1.6.0
+# Signed by the WebP release signing key 6B0E 6B70 976D E303 EDF2  F601 F9C3 D6BD B823 2B5D (.tar.gz.asc next to it).
+local SHA256=e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564
+local FLAGS=(
+  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_OSX_ARCHITECTURES=arm64
+  -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOS"
+  -DBUILD_SHARED_LIBS=OFF
+  -DWEBP_BUILD_ANIM_UTILS=OFF -DWEBP_BUILD_CWEBP=OFF -DWEBP_BUILD_DWEBP=OFF -DWEBP_BUILD_GIF2WEBP=OFF
+  -DWEBP_BUILD_IMG2WEBP=OFF -DWEBP_BUILD_VWEBP=OFF -DWEBP_BUILD_WEBPINFO=OFF -DWEBP_BUILD_WEBPMUX=OFF
+  -DWEBP_BUILD_LIBWEBPMUX=OFF -DWEBP_BUILD_EXTRAS=OFF
+)
+local LIBS=(libwebpdemux.a libwebp.a libsharpyuv.a)
+local HEADERS=(src/webp/decode.h src/webp/demux.h src/webp/mux_types.h src/webp/types.h)
+local PREFIX="$PWD/.deps/libwebp"
+local STAMP="$VERSION $SHA256 ${FLAGS[*]} ${LIBS[*]} ${HEADERS[*]}"
+if [[ -f "$PREFIX/lib/libwebpdemux.a" && "$(cat "$PREFIX/.stamp" 2>/dev/null)" == "$STAMP" ]]; then
+  echo "$PREFIX: libwebp $VERSION up to date"
+  return
+fi
+local WORK
+WORK="$(mktemp -d)"
+SCRATCH+=("$WORK")
+fetch "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-$VERSION.tar.gz" "$SHA256" "$WORK"
+local SRC="$WORK/libwebp-$VERSION"
+cmake -S "$SRC" -B "$WORK/build" "${FLAGS[@]}" > "$WORK/configure.log" || { cat "$WORK/configure.log"; exit 1; }
+cmake --build "$WORK/build" --target webpdemux webp sharpyuv --parallel "$(sysctl -n hw.ncpu)" > "$WORK/build.log" ||
+  { cat "$WORK/build.log"; exit 1; }
+
+rm -rf "$PREFIX"
+mkdir -p "$PREFIX/include/webp" "$PREFIX/lib"
+for lib in "${LIBS[@]}"; do cp "$WORK/build/$lib" "$PREFIX/lib/"; done
+for header in "${HEADERS[@]}"; do cp "$SRC/$header" "$PREFIX/include/webp/"; done
+cat "$SRC/COPYING" "$SRC/PATENTS" > "$PREFIX/LICENSE.txt"
+echo "$STAMP" > "$PREFIX/.stamp"
+echo "$PREFIX: libwebp $VERSION built for macOS $MACOS arm64"
+}
+
+libjpeg_turbo
+libwebp
