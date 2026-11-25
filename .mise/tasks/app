@@ -29,11 +29,17 @@ printf 'APPL????' > "$APP/Contents/PkgInfo"
 cp Resources/peekaboo "$APP/Contents/Resources/peekaboo"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
-# Hardened runtime in every build, so what runs here is what ships. No entitlements: the app needs none
-# (the IOSurface SPI is a dlsym into ImageIO, Metal compiles shaders out of process).
+# Hardened runtime in every build, so what runs here is what ships. Releases carry no entitlements: the app needs
+# none (the IOSurface SPI is a dlsym into ImageIO, Metal compiles shaders out of process).
 if [[ "$IDENTITY" == - ]]; then
   # Ad-hoc: opens on this Mac only; other Macs' Gatekeeper blocks it (releases need a Developer ID).
-  codesign --force --sign - --options runtime --timestamp=none "$APP"
+  # get-task-allow keeps local builds open to lldb and Instruments under the hardened runtime.
+  ENTITLEMENTS="$(mktemp)"
+  trap 'rm -f "$ENTITLEMENTS"' EXIT
+  printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+    '<plist version="1.0"><dict><key>com.apple.security.get-task-allow</key><true/></dict></plist>' > "$ENTITLEMENTS"
+  codesign --force --sign - --options runtime --entitlements "$ENTITLEMENTS" --timestamp=none "$APP"
 else
   codesign --force --sign "$IDENTITY" --options runtime --timestamp "$APP"
 fi
