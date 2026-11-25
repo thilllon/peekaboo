@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#MISE description="Release HEAD of main as YYYYMMDD-<sha6> (build number = commit count): Developer ID signed + notarized app and DMG, tag v<version> and GitHub Release \"Peekaboo <version>\" with Peekaboo-<version>.dmg, Peekaboo.dmg, Peekaboo-<version>.zip and latest.json. DRY_RUN=1 prints the notarization and publishing commands; ALLOW_ADHOC=1 publishes without a Developer ID"
+#MISE description="Release HEAD of main as YYYYMMDD-<sha6> (build number = commit count): Developer ID signed + notarized app and DMG, tag v<version> and GitHub Release \"Peekaboo <version>\" with Peekaboo-<version>.dmg, Peekaboo-<version>.zip and latest.json; NOTES_FILE= gives the release notes (default: generated). DRY_RUN=1 prints the notarization and publishing commands; ALLOW_ADHOC=1 publishes without a Developer ID"
 # mise runs file tasks from the project root.
 set -euo pipefail
 source .mise/lib/signing.sh
@@ -19,10 +19,16 @@ git fetch -q --tags origin main
 # The build number counts commits: a shallow clone would count too few.
 [[ "$(git rev-parse --is-shallow-repository)" == false ]] || fail "a shallow clone: git fetch --unshallow first"
 dry || gh auth status >/dev/null 2>&1 || fail "gh is not logged in (gh auth login)"
+# The tag is public and carries the tagger: never a personal address (a clone without this repo's git config would use
+# the global one).
+[[ "$(git config user.email)" == *@users.noreply.github.com ]] ||
+  fail "git config user.email must be the GitHub noreply address, not $(git config user.email)"
+[[ -z "${NOTES_FILE:-}" || -s "$NOTES_FILE" ]] || fail "NOTES_FILE=$NOTES_FILE is missing or empty"
 
 # 2. The version of HEAD: YYYYMMDD-<sha6> (the same commit always gets the same one) and its build number, which
 #    must be above the latest release's (the updater installs only higher builds).
 [[ $# -eq 0 ]] || { echo "usage: mise run release (the version comes from HEAD: YYYYMMDD-<sha6>)" >&2; exit 1; }
+SHA="$(git rev-parse HEAD)"  # the commit built, tagged and released, whatever happens to the checkout meanwhile
 VERSION="$(head_version)"
 BUILD="$(head_build)"
 TAG="v$VERSION"
@@ -56,8 +62,6 @@ fi
 if [[ -n "${TEAM_ID:-}" ]] && is_developer_id "$APP" && [[ "$(team_id "$APP")" != "$TEAM_ID" ]]; then
   fail "the app is signed by team $(team_id "$APP"), not $TEAM_ID (APPLE_TEAM_ID of .env.production)"
 fi
-# Same bytes under a stable name: https://github.com/$REPO/releases/latest/download/Peekaboo.dmg
-cp "$DMG" build/Peekaboo.dmg
 
 # 5. latest.json: what the in-app updater reads (Sources/PeekabooCore/Update/UpdateManifest.swift).
 BASE="https://github.com/$REPO/releases/download/$TAG"
@@ -78,8 +82,12 @@ plutil -convert xml1 -o /dev/null build/latest.json
 cat build/latest.json
 
 # 6. Tag, push the tag, publish.
-run git tag -a "$TAG" -m "Peekaboo $VERSION"
+[[ "$(git rev-parse HEAD)" == "$SHA" ]] && git diff --quiet && git diff --cached --quiet ||
+  fail "the checkout changed while releasing: not tagging $SHA"
+run git tag -a "$TAG" "$SHA" -m "Peekaboo $VERSION"
 run git push -q origin "refs/tags/$TAG"
-run gh release create "$TAG" "$DMG" build/Peekaboo.dmg "$ZIP" build/latest.json --repo "$REPO" \
-  --title "Peekaboo $VERSION" --generate-notes --latest --verify-tag
+NOTES=(--generate-notes)
+[[ -n "${NOTES_FILE:-}" ]] && NOTES=(--notes-file "$NOTES_FILE")
+run gh release create "$TAG" "$DMG" "$ZIP" build/latest.json --repo "$REPO" \
+  --title "Peekaboo $VERSION" "${NOTES[@]}" --latest --verify-tag
 if dry; then echo "DRY_RUN: nothing was tagged or published"; else echo "released $TAG"; fi
