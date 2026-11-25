@@ -224,6 +224,12 @@ neighbour in a register per byte keeps three independent chains in flight), two 
 every IDAT cost ≤ 5 ms and are kept (a corrupt file goes to ImageIO). Samples are identical to ImageIO's for RGB/RGBA
 8/16-bit, palette 1/2/4/8-bit with and without tRNS, colour keys and every filter type (`PNGDecodeTests`).
 
+Apple's `iDOT` PNGs (screenshots) split the rows in two halves that ImageIO inflates in parallel. The IDAT data is
+still one zlib stream (fully flushed at the split, the split row Sub-filtered), so the decoder reads it as one: a
+system-resource iDOT PNG decodes identically to ImageIO (5.7 vs 6.4 ms), and a 12 MP iDOT re-encode of the corpus
+screenshot-like PNG in 66 ms vs ImageIO's 80–86 ms (117 ms without iDOT). Inflating the halves on two threads would
+roughly halve that again (not done yet). `CgBI` (Xcode's iOS-optimised PNG: a critical chunk) goes to ImageIO.
+
 ### WebP
 
 libwebp 1.6.0 built from source (`-O3`, NEON) decoding BGRA into an own buffer vs ImageIO (which renders the same
@@ -266,6 +272,6 @@ skimming (first pixel p90 108–123 ms instead of 24–35), so prefetch keeps th
 
 ### Persistent cache
 
-Not built: after these changes the slowest first views are 140–150 ms (PNG 24 MP, progressive panorama early
+Not built: after these changes the slowest first views are ~150–165 ms (PNG 24 MP, progressive panorama early
 rendition); a disk cache of ~25 MB screen renditions would only shorten revisits, which QuickLook's thumbnail cache and
 the in-memory tiers already cover, at gigabytes of disk.
