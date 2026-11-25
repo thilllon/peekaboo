@@ -151,7 +151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let built = settings == nil
         let controller = settings ?? SettingsWindowController(store: configStore, updateStatus: { [weak self] in
             self?.updateStatus
-        }) { [weak self] in
+        }, presentation: presentation) { [weak self] in
             self?.viewer?.perform(.configFile)
         }
         settings = controller

@@ -44,14 +44,20 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate, NSW
     private var banner: NSStackView!
     private var observer: NSObjectProtocol?
 
+    /// In front and key, or out of sight for tests (`.headless`).
+    let presentation: Presentation
+
     /// `updateStatus`: the updater's status line now (`AppDelegate.updateStatus`; nil without an updater), shown when
     /// the Updates pane opens. `openConfigFile`: `app.config_file`.
-    init(store: ConfigStore, updateStatus: @escaping () -> String?, openConfigFile: @escaping () -> Void) {
+    init(store: ConfigStore, updateStatus: @escaping () -> String?, presentation: Presentation = .interactive,
+         openConfigFile: @escaping () -> Void) {
         model = SettingsModel(store: store)
         self.updateStatus = updateStatus
+        self.presentation = presentation
         self.openConfigFile = openConfigFile
         let window = SettingsWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
                                     styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: true)
+        window.staysOffScreen = presentation == .headless
         window.isReleasedWhenClosed = false
         window.toolbarStyle = .preference
         super.init(window: window)
@@ -96,9 +102,13 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate, NSW
 
     deinit { if let observer { NotificationCenter.default.removeObserver(observer) } }
 
-    /// Bring the window to the front, on `pane` if given.
+    /// Bring the window to the front, on `pane` if given; headless: order it in out of sight (`Presentation`).
     func show(_ pane: Pane? = nil) {
         if let pane, pane != current { select(pane) }
+        if presentation == .headless {
+            window?.orderInOutOfSight()
+            return
+        }
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate()
@@ -211,6 +221,13 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate, NSW
 /// Text fields need the standard editing shortcuts, which the app's menu (built from the viewer's keymap) does not
 /// carry: ⌘X ⌘C ⌘V ⌘A ⌘Z ⇧⌘Z go to the field being edited, and ⌘W closes this window rather than the viewer.
 final class SettingsWindow: NSWindow {
+    /// Headless (tests): the frame stays where it is put, off every screen (`Presentation`).
+    var staysOffScreen = false
+
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        staysOffScreen ? frameRect : super.constrainFrameRect(frameRect, to: screen)
+    }
+
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         guard event.type == .keyDown, let chord = KeyChord(event: event), chord.modifiers.contains(.command),
               chord.modifiers.isDisjoint(with: [.option, .control]) else { return super.performKeyEquivalent(with: event) }

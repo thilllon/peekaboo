@@ -42,7 +42,8 @@ final class HeadlessTests: ViewerTestCase {
         assertWindowServerShowsNothing()
     }
 
-    /// The app delegate activates the app when it launches and while it presents the first frame: never headless.
+    /// The app delegate activates the app when it launches, while it presents the first frame and when it shows the
+    /// Settings window: never headless.
     func testTheAppDelegateNeverActivatesTheApp() throws {
         let config = root.appendingPathComponent("launch.toml")
         try Data().write(to: config)
@@ -59,6 +60,7 @@ final class HeadlessTests: ViewerTestCase {
         delegate.applicationWillFinishLaunching(Notification(name: NSApplication.willFinishLaunchingNotification))
         let viewer: ViewerWindowController = try XCTUnwrap(property(delegate, "viewer"))
         defer {
+            delegate.settings?.window?.close()
             viewer.window?.close()
             spin(0.05)
         }
@@ -72,6 +74,10 @@ final class HeadlessTests: ViewerTestCase {
         viewer.window?.close()
         XCTAssertTrue(delegate.applicationShouldHandleReopen(NSApp, hasVisibleWindows: false))
         XCTAssertTrue(viewer.window?.isVisible == true, "a Dock click shows the window again")
+        viewer.perform(.config)
+        let settings = try XCTUnwrap(delegate.settings, "app.config opens the Settings window")
+        XCTAssertEqual(settings.presentation, .headless)
+        XCTAssertTrue(settings.window?.isVisible == true, "the Settings window is ordered in")
         spin(0.2)
         assertNothingOnScreen()
         assertWindowServerShowsNothing()

@@ -20,7 +20,7 @@ enum Presentation {
 
 extension NSWindow {
     /// `.headless`: order the window in out of sight. Its class must not constrain its frame to a screen (AppKit moves
-    /// a titled window back onto one when it is ordered in): `ViewerWindow.staysOffScreen`.
+    /// a titled window back onto one when it is ordered in): `staysOffScreen` of `ViewerWindow` and `SettingsWindow`.
     func orderInOutOfSight() {
         alphaValue = 0
         ignoresMouseEvents = true

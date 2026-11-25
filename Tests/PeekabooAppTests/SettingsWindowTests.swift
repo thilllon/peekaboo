@@ -24,7 +24,7 @@ final class SettingsWindowTests: ViewerTestCase {
         if let toml { try Data(toml.utf8).write(to: configURL) }
         store = ConfigStore(url: configURL)
         store.load()
-        let controller = SettingsWindowController(store: store, updateStatus: updateStatus) {}
+        let controller = SettingsWindowController(store: store, updateStatus: updateStatus, presentation: .headless) {}
         self.controller = controller
         return controller
     }
@@ -61,6 +61,7 @@ final class SettingsWindowTests: ViewerTestCase {
         CommandLine.arguments = [arguments.first ?? "Peekaboo"]
         defer { CommandLine.arguments = arguments }
         let delegate = AppDelegate()
+        delegate.presentation = .headless
         delegate.applicationWillFinishLaunching(Notification(name: NSApplication.willFinishLaunchingNotification))
         delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
         let viewer: ViewerWindowController = try XCTUnwrap(property(delegate, "viewer"))
