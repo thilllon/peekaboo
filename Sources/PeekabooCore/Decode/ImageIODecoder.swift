@@ -319,14 +319,17 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
         return n == length ? bytes : nil
     }
 
-    /// The early rendition holds a second whole-image coefficient buffer while it decodes (2 bytes per sample: 0.6 GB
-    /// for a 101 MP 4:4:4 file) and its own output until the exact tier replaces it (0.4 GB for that file's `.full`):
-    /// only when both together are small against physical memory (48 GB: 1.5 GB; 16 GB: 0.5 GB).
-    static func earlyRenditionFits(_ scan: JPEGScan, target: Int) -> Bool {
+    /// The early rendition holds a second whole-image coefficient buffer while it decodes (2 bytes per sample, chroma
+    /// planes smaller by their subsampling: 0.6 GB for a 101 MP 4:4:4 file, 71 MB for 24 MP 4:2:0) and its own output
+    /// until the exact tier replaces it (0.4 GB for that 101 MP file's `.full`): only when both together are small
+    /// against physical memory (RAM / 32: 1.5 GB on 48 GB, 256 MB on 8 GB).
+    static func earlyRenditionFits(_ scan: JPEGScan, target: Int,
+                                   physicalMemory: UInt64 = ProcessInfo.processInfo.physicalMemory) -> Bool {
         let factor = TurboJPEG.coveringScale(width: scan.width, height: scan.height, target: target)
         let output = Double(TurboJPEG.scaled(scan.width, factor)) * Double(TurboJPEG.scaled(scan.height, factor)) * 4
-        let coefficients = Double(scan.width) * Double(scan.height) * Double(max(1, scan.components)) * 2
-        return coefficients + output <= Double(ProcessInfo.processInfo.physicalMemory) / 32
+        let chroma = Double(max(0, scan.components - 1)) / Double(max(1, scan.lumaH * scan.lumaV))
+        let coefficients = Double(scan.width) * Double(scan.height) * (1 + chroma) * 2
+        return coefficients + output <= Double(physicalMemory) / 32
     }
 
     // MARK: RAW

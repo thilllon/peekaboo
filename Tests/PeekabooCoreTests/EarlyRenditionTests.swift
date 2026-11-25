@@ -193,13 +193,22 @@ final class EarlyRenditionTests: XCTestCase {
         XCTAssertTrue(none.received.isEmpty, "baseline JPEGs and previews have no early rendition")
     }
 
-    /// The rendition's extra memory (a second coefficient buffer and its output) must stay small against RAM.
+    /// The rendition's extra memory (a second coefficient buffer and its output) must stay small against RAM (/32).
     func testEarlyRenditionMemoryGuard() {
-        let photo = JPEGScan(coding: .progressive, width: 5947, height: 3964, components: 3)
-        XCTAssertTrue(ImageIODecoder.earlyRenditionFits(photo, target: 3456), "24 MP: 0.24 GB, fine with 8 GB")
-        let huge = JPEGScan(coding: .progressive, width: 60000, height: 60000, components: 3)
-        XCTAssertFalse(ImageIODecoder.earlyRenditionFits(huge, target: 0), "3.6 GP: 36 GB")
-        XCTAssertFalse(ImageIODecoder.earlyRenditionFits(huge, target: 3456), "the coefficients alone are 21.6 GB")
+        let gb: UInt64 = 1 << 30
+        func fits(_ w: Int, _ h: Int, luma: (Int, Int), target: Int, ram: UInt64) -> Bool {
+            ImageIODecoder.earlyRenditionFits(JPEGScan(coding: .progressive, width: w, height: h, components: 3,
+                                                       lumaH: luma.0, lumaV: luma.1), target: target, physicalMemory: ram)
+        }
+        // 24 MP at the screen tier (full size): 4:4:4 141 MB of coefficients + 94 MB of output; 4:2:0 71 + 94 MB.
+        XCTAssertTrue(fits(5947, 3964, luma: (1, 1), target: 3456, ram: 8 * gb))
+        XCTAssertFalse(fits(5947, 3964, luma: (1, 1), target: 3456, ram: 7 * gb), "235 MB > 224 MB")
+        XCTAssertTrue(fits(5947, 3964, luma: (2, 2), target: 3456, ram: 6 * gb), "4:2:0 has half the coefficient planes")
+        // 101 MP 4:4:4: 609 MB of coefficients, plus 101 MB at the screen tier (1/2) or 406 MB at full size.
+        XCTAssertTrue(fits(11800, 8600, luma: (1, 1), target: 3456, ram: 48 * gb))
+        XCTAssertTrue(fits(11800, 8600, luma: (1, 1), target: 0, ram: 48 * gb))
+        XCTAssertFalse(fits(11800, 8600, luma: (1, 1), target: 0, ram: 16 * gb))
+        XCTAssertFalse(fits(60000, 60000, luma: (1, 1), target: 3456, ram: 512 * gb), "21.6 GB of coefficients")
     }
 
     // MARK: Robustness
