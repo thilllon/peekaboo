@@ -206,6 +206,19 @@ viewers score 21–26 dB and alias 10–25× more.
   stars/labels/flags as Finder tags.
 - HUD as `CATextLayer`s above the Metal layer (no blur views), updated only on state changes; toasts.
 - Full screen: instant borderless (notch-aware) by default; native as an option.
+- Updates (no Sparkle): `latest.json` of the latest GitHub release, read 11 s after launch (the updater is set up 1 s
+  after launch, behind the first frame and its sharp tier), every 6 h and when the network returns (≥ 1 h apart), on a
+  utility queue with an ephemeral `URLSession`. A newer zip is verified (SHA-256,
+  code signature with Peekaboo's identifier and the running app's Developer ID team), staged on the app's volume
+  (`~/Library/Caches/com.thilllon.Peekaboo/Updates`, or one fixed folder among the system's temporary items of the
+  app's volume, so nothing piles up per run) and swapped in with one `renamex_np(RENAME_SWAP)` by the app's own
+  executable (`--install-update`) once the app has quit. An install that fails there is recorded
+  (`InstallFailure.plist` in the same cache folder): the next run says so in one toast (a file read on the utility
+  queue 1 s after launch), and automatic checks then offer that version as a download instead of fetching it again
+  to fail on every quit; "Check for Updates…" or a newer release tries again.
+  Nothing of it runs before the first frame; launch → first frame is unchanged. The banner (an AppKit text field and
+  buttons: 5–20 ms of main-thread work to build) waits for 1.5 s without input unless the user asked for it, so it
+  never lands between two images or in a gesture.
 
 ### Animation
 

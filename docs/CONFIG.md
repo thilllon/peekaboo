@@ -78,11 +78,35 @@ errors. A key made of anything other than letters, digits, `_` and `-` must be q
 | `[rating]` `auto_advance` | `false` | `true`: plain `0`–`9`, `p`, `x`, `u` also go to the next image (`shift+` always does) |
 | `[keymap]` `defaults` | `true` | `false` starts from an empty keymap: only your `[keys]` (and the vim layer, if on) apply |
 | `[keymap]` `vim` | `false` | add the [vim layer](#vim-layer) on top of the defaults |
+| `[updates]` `check` | `true` | look for a new release when online: 10 s after launch at the earliest, then every 6 h and when the network comes back, at most once an hour (see [updates](#updates)) |
+| `[updates]` `auto_install` | `true` | download a new release in the background, verify it and install it when Peekaboo quits; `false` only tells you about it |
 | `[slots]` *name* | none | a folder for `file.move:<name>` / `file.copy:<name>` (see [destinations](#move-and-copy)) |
 | `[apps]` *name* | none | an app for `file.open_with:<name>`: a bundle id, an app name or a path |
 
 `[slots]` named `1`…`9` are what `opt+1`…`opt+9` (move) and `opt+shift+1`…`opt+shift+9` (copy) use.
 `[apps] editor` is what `e` opens.
+
+### Updates
+
+Peekaboo reads the manifest of the latest release on GitHub (`latest.json`, a few hundred bytes) — never
+while it launches, and never on the main thread. When a newer release exists, a banner at the bottom of the
+window (it waits until you pause, so it never lands between two images) and an item in the Peekaboo menu
+offer it:
+
+- With `auto_install = true` the release is downloaded in the background and checked before anything else
+  happens: its SHA-256 must match the manifest, and its code signature must be valid and carry Peekaboo's
+  identifier (and, for a Developer ID signed app, come from the same team). **Restart to Update** installs it
+  now and reopens the image you were looking at; otherwise it is installed when Peekaboo quits.
+- With `auto_install = false` the banner says that a release is available; **Update** downloads and checks it
+  the same way.
+
+Peekaboo › **Check for Updates…** looks at once, whatever `check` says. The new bundle replaces the old one
+in one atomic rename. When Peekaboo cannot replace itself (it runs from the disk image or from a quarantined
+copy, or its folder is not writable), it offers the release page instead. If an install fails when Peekaboo
+quits, the next launch says why once, and that release is then offered as a download from the release page
+instead of being fetched again; **Check for Updates…** (or a newer release) tries the install again. Each release is named after its
+day: `20261125`, and `20261125.1` for a second release that day. The About panel and `peekaboo --version`
+show the version and the commit it was built from.
 
 ## Key bindings
 

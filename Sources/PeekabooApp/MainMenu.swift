@@ -12,7 +12,10 @@ final class ActionBox: NSObject {
 /// menu while the viewer window is key (the local key monitor consumes them first); the
 /// equivalents matter for display, for mouse use, and for ⌘ shortcuts in other windows.
 enum MainMenu {
-    /// `target` must implement `performMenuAction(_:)`.
+    /// The app-menu item that offers an available update.
+    static let updateItem = NSUserInterfaceItemIdentifier("update")
+
+    /// `target` must implement `performMenuAction(_:)`, `showAbout(_:)`, `checkForUpdates(_:)` and `performUpdate(_:)`.
     static func make(keymap: Keymap, target: AnyObject) -> NSMenu {
         let selector = #selector(AppDelegate.performMenuAction(_:))
         func item(_ action: Action, _ title: String? = nil) -> NSMenuItem {
@@ -37,7 +40,14 @@ enum MainMenu {
         let main = NSMenu()
 
         let appMenu = NSMenu(title: "Peekaboo")
-        appMenu.addItem(withTitle: "About Peekaboo", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(withTitle: "About Peekaboo", action: #selector(AppDelegate.showAbout(_:)), keyEquivalent: "").target = target
+        appMenu.addItem(withTitle: "Check for Updates…", action: #selector(AppDelegate.checkForUpdates(_:)), keyEquivalent: "")
+            .target = target
+        // "Update to 20261126…" / "Restart to Update to …": shown while an update is available (`UpdateController`).
+        let update = appMenu.addItem(withTitle: "Update", action: #selector(AppDelegate.performUpdate(_:)), keyEquivalent: "")
+        update.target = target
+        update.identifier = updateItem
+        update.isHidden = true
         appMenu.addItem(.separator())
         appMenu.addItem(item(.config, "Settings…"))
         appMenu.addItem(item(.reloadConfig))

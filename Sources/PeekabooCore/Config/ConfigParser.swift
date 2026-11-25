@@ -68,7 +68,7 @@ private struct ConfigReader {
     var config = AppConfig()
 
     private static let tables: Set<[String]> = [
-        ["view"], ["fullscreen"], ["hud"], ["cache"], ["rating"], ["keymap"], ["slots"], ["apps"],
+        ["view"], ["fullscreen"], ["hud"], ["cache"], ["rating"], ["keymap"], ["slots"], ["apps"], ["updates"],
         ["keys"], ["keys", "normal"], ["keys", "zoomed"],
     ]
 
@@ -137,6 +137,8 @@ private struct ConfigReader {
             case "rating.auto_advance": if let v = bool(entry) { autoAdvance = v }
             case "keymap.defaults": if let v = bool(entry) { keymapDefaults = v }
             case "keymap.vim": if let v = bool(entry) { vim = v }
+            case "updates.check": if let v = bool(entry) { config.updates.check = v }
+            case "updates.auto_install": if let v = bool(entry) { config.updates.autoInstall = v }
             default:
                 skip(entry, "unknown key \"\(name)\"\(Self.keyHint(path))")
             }
@@ -149,7 +151,7 @@ private struct ConfigReader {
     private static let settingKeys = [
         "view.background", "view.keep_zoom", "view.zoom_step", "view.refine_delay_ms", "fullscreen.mode",
         "fullscreen.avoid_notch", "hud.mode", "cache.memory_mb", "rating.storage", "rating.star",
-        "rating.auto_advance", "keymap.defaults", "keymap.vim",
+        "rating.auto_advance", "keymap.defaults", "keymap.vim", "updates.check", "updates.auto_install",
     ]
 
     /// ` (it belongs under [view])` for a known key in the wrong table, ` (key bindings go under [keys])`

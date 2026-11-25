@@ -46,6 +46,10 @@ auto_advance = false          # true: plain 0-9 / p / x / u also go to the next 
 defaults = true               # false: start from an empty keymap
 vim = false                   # add the vim layer (h j k l, g g, G, d d, y y, y p ...)
 
+[updates]
+check = true                  # look for a new release when online (never during launch, at most hourly)
+auto_install = true           # download it in the background and install it when Peekaboo quits
+
 [slots]                       # destinations for file.move:<slot> / file.copy:<slot>; opt+N moves, opt+shift+N copies
 1 = "~/Pictures/Keep"
 2 = "~/Pictures/Later"

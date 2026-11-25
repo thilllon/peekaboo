@@ -69,13 +69,22 @@ Everything below was measured on a MacBook Pro M4 Pro (see [docs/research.md](do
 
 ## Install
 
-1. Download [Peekaboo.dmg](https://github.com/thilllon/peekaboo/releases/latest/download/Peekaboo.dmg) and drag Peekaboo to
-   Applications.
-2. Peekaboo is ad-hoc signed and not notarized. On first launch macOS blocks it: open **System Settings → Privacy & Security**
-   and click **Open Anyway** — or run `xattr -dr com.apple.quarantine /Applications/Peekaboo.app`.
+1. Download [Peekaboo.dmg](https://github.com/thilllon/peekaboo/releases/latest/download/Peekaboo.dmg) (the volume is named
+   after the version, e.g. "Peekaboo 20261125") and drag Peekaboo to Applications.
+2. Releases are signed with a Developer ID and notarized by Apple, so Peekaboo opens like any other app. (The first release,
+   0.1.0, was not: if macOS refuses to open it, use **System Settings → Privacy & Security → Open Anyway**, or install the
+   current release.)
 3. Optional: make it the default viewer with Finder → Get Info → Open with → Peekaboo → Change All.
 
 Requires macOS 26 (Tahoe) on Apple Silicon.
+
+**Versions are dates**: `20261125`, and `20261125.1` for a second release that day. Peekaboo › About Peekaboo and
+`peekaboo --version` show the version and the commit it was built from.
+
+**Updates**: when it is online, Peekaboo looks for a newer release (10 s after launch at the earliest, then every 6 hours and
+when the network comes back; never while it launches or on the main thread). A new release is downloaded in the background,
+verified (SHA-256 and code signature) and installed when you quit, or at once with **Restart to Update**. Peekaboo › Check
+for Updates… looks now. Turn either part off under [`[updates]`](docs/CONFIG.md#updates).
 
 ## Usage
 
@@ -99,7 +108,7 @@ Opening one image browses its whole folder.
 
 Every binding is configurable; the full table is in [docs/CONFIG.md](docs/CONFIG.md#default-keymap).
 
-Command line: `peekaboo <image-or-folder> …` (installed into `~/.local/bin` by `mise run install`).
+Command line: `peekaboo <image-or-folder> …`, `peekaboo --version` (installed into `~/.local/bin` by `mise run install`).
 
 ## Configuration
 
@@ -115,7 +124,8 @@ mise run setup            # git hooks
 mise run install          # build the release app into ~/Applications
 ```
 
-`swift build`, `swift test`, `mise run app`, `mise run dmg`, `peekaboo-bench <anim|decode|pipeline|render>`.
+`swift build`, `swift test`, `mise run app`, `mise run dmg`, `peekaboo-bench <anim|decode|pipeline|render>`. Releases:
+`mise run release` (see [AGENTS.md](AGENTS.md#releases)).
 
 ## How it works
 

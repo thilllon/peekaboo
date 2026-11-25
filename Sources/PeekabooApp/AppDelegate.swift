@@ -11,6 +11,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var openedSomething = false
     private var selfTest: SelfTest?
     private var lastKeymap: Keymap?
+    /// In-app updates (nil outside Peekaboo.app, and in the self-test).
+    private var updates: UpdateController?
+    /// The updater's current status line, for a window that opens after the last `PeekabooUpdateStatusChanged`.
+    var updateStatus: String? { updates?.updater.status }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // The View menu carries its own full-screen items (instant and native); stop AppKit
@@ -28,6 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         configStore.onChange = { [weak self] config in
             self?.viewer?.apply(config)
             self?.rebuildMenu(config.keymap)
+            self?.updates?.updater.apply(config.updates)
         }
         configStore.onError = { [weak self] message in self?.viewer?.toast(message) }
         configStore.startWatching()
@@ -61,6 +66,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             guard let self, !self.openedSomething else { return }
             self.viewer?.showEmpty(nil)
         }
+        // In-app updates start a second after launch, behind the first frame and its sharp tier; the first check
+        // waits 10 s more.
+        if selfTest == nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.startUpdates() }
+        }
+    }
+
+    private func startUpdates() {
+        let started = Trace.now()
+        updates = Updater(settings: configStore.config.updates).map { updater in
+            UpdateController(updater: updater) { [weak self] in self?.viewer }
+        }
+        updates?.updater.start()
+        if updates != nil {
+            Trace.log(String(format: "update: set up in %.3f ms, first check in %.0f s", Trace.ms(since: started),
+                             UpdatePolicy().firstCheckDelay))
+        }
+    }
+
+    /// A ready update installs behind the quitting app (`[updates] auto_install`).
+    func applicationWillTerminate(_ notification: Notification) {
+        updates?.updater.installOnQuit()
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -128,6 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         lastKeymap = keymap
         let menu = MainMenu.make(keymap: keymap, target: self)
         NSApp.mainMenu = menu
+        updates?.refresh(menu.items.first?.submenu)
         if Trace.enabled {
             for top in menu.items {
                 let items = (top.submenu?.items ?? []).filter { !$0.isSeparatorItem }.map { item -> String in
@@ -149,7 +177,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         }
     }
 
+    /// The About panel names the version and the commit it was built from: "Version 20261125 (1a2b3c4)".
+    @objc func showAbout(_ sender: Any?) {
+        var options: [NSApplication.AboutPanelOptionKey: Any] = [.version: BuildInfo.commit ?? ""]
+        if let version = BuildInfo.version { options[.applicationVersion] = version }
+        NSApp.orderFrontStandardAboutPanel(options: options)
+    }
+
+    @objc func checkForUpdates(_ sender: Any?) { updates?.checkForUpdates() }
+
+    @objc func performUpdate(_ sender: Any?) { updates?.performUpdate() }
+
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        switch item.action {
+        case #selector(checkForUpdates(_:)): return updates != nil
+        case #selector(performUpdate(_:)): return updates?.canPerformUpdate ?? false
+        default: break
+        }
         guard let action = (item.representedObject as? ActionBox)?.action else { return true }
         // Plain-key equivalents must never fire while another window (open panel, alert) is key.
         let plain = !item.keyEquivalent.isEmpty && item.keyEquivalentModifierMask.isDisjoint(with: [.command, .control])

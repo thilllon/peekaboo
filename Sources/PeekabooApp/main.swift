@@ -2,6 +2,10 @@ import AppKit
 import PeekabooCore
 import PeekabooRender
 
+// `Peekaboo --install-update …`: the update installer, started by a quitting app (no window, no GPU).
+if CommandLine.arguments.count > 1, CommandLine.arguments[1] == UpdateInstaller.helperFlag {
+    exit(UpdateInstaller.runHelper(Array(CommandLine.arguments.dropFirst())))
+}
 LaunchClock.mainWall = LaunchClock.wallNow()
 // Programmatic entry point: no storyboard, no nib, no SwiftUI — nothing to
 // unarchive before the first window can appear. GPU setup (device + shader

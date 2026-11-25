@@ -110,10 +110,11 @@
 	<string>Peekaboo</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+	<!-- CFBundleShortVersionString, CFBundleVersion (YYYYMMDD[.N]) and PeekabooCommit are set by .mise/tasks/app. -->
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>0</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.photography</string>
 	<key>LSMinimumSystemVersion</key>
