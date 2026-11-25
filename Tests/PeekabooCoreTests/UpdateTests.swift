@@ -252,14 +252,125 @@ final class UpdateTests: XCTestCase {
         try quit.run()
         quit.waitUntilExit()
         let job = UpdateInstaller.Job(pid: quit.processIdentifier, staged: staged, target: target, version: AppVersion("20261126")!)
-        XCTAssertEqual(UpdateInstaller.runHelper(job.arguments, requirement: adHoc), 0)
+        let cache = directory.appendingPathComponent("cache")
+        XCTAssertEqual(UpdateInstaller.runHelper(job.arguments, requirement: adHoc, cache: cache), 0)
         XCTAssertEqual(try version(of: target), "20261126")
         XCTAssertFalse(FileManager.default.fileExists(atPath: staged.deletingLastPathComponent().path), "the version folder is removed")
         XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent("Updates").path))
+        XCTAssertNil(UpdateInstaller.Failure.read(in: cache), "nothing failed")
         // A running process is waited for, and nothing is installed while it runs.
         XCTAssertFalse(UpdateInstaller.waitForExit(getpid(), timeout: 0.05))
         XCTAssertTrue(UpdateInstaller.waitForExit(quit.processIdentifier, timeout: 0.05))
         XCTAssertEqual(UpdateInstaller.runHelper(["--install-update", "nope"]), 64)
+    }
+
+    func testHelperRemembersAFailedInstall() throws {
+        let target = try makeApp(directory.appendingPathComponent("Applications/Peekaboo.app"), version: "20261125")
+        let staged = try makeApp(directory.appendingPathComponent("Updates/20261126/Peekaboo.app"), version: "20261126")
+        try Data("tampered".utf8).write(to: staged.appendingPathComponent("Contents/Resources/data.txt"))
+        let job = UpdateInstaller.Job(pid: try exitedProcess(), staged: staged, target: target, version: AppVersion("20261126")!)
+        let cache = directory.appendingPathComponent("cache")
+        XCTAssertEqual(UpdateInstaller.runHelper(job.arguments, requirement: adHoc, cache: cache), 1)
+        XCTAssertEqual(try version(of: target), "20261125", "the app is left alone")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: staged.deletingLastPathComponent().path), "the download is removed")
+        let failure = try XCTUnwrap(UpdateInstaller.Failure.read(in: cache), "the next run must learn of it")
+        XCTAssertEqual(failure.version, "20261126")
+        XCTAssertEqual(failure.target, target.path)
+        XCTAssertTrue(failure.reason.hasPrefix("the download failed verification: "), failure.reason)
+        XCTAssertFalse(failure.reported)
+    }
+
+    func testFailureRecordRoundTrip() throws {
+        let cache = directory.appendingPathComponent("cache")
+        XCTAssertNil(UpdateInstaller.Failure.read(in: cache))
+        var failure = UpdateInstaller.Failure(version: AppVersion("20261126.1")!, target: URL(fileURLWithPath: "/Applications/Peekaboo.app"),
+                                              reason: "Operation not supported")
+        failure.write(in: cache)
+        XCTAssertEqual(UpdateInstaller.Failure.read(in: cache), failure)
+        failure.reported = true
+        failure.write(in: cache)
+        XCTAssertEqual(UpdateInstaller.Failure.read(in: cache)?.reported, true)
+        UpdateInstaller.Failure.remove(in: cache)
+        XCTAssertNil(UpdateInstaller.Failure.read(in: cache))
+        XCTAssertEqual(UpdateInstaller.failureReason(UpdateError.install("Cross-device link")), "Cross-device link")
+        XCTAssertEqual(UpdateInstaller.failureReason(UpdateError.verification("SHA-256 mismatch")),
+                       "the download failed verification: SHA-256 mismatch")
+    }
+
+    /// An app on another volume stages in one folder of its own there (not a new temporary folder per run), and an
+    /// update installs within that volume.
+    func testStagingOnAnotherVolume() throws {
+        let volume = try mountScratchVolume()
+        let target = try makeApp(volume.appendingPathComponent("Applications/Peekaboo.app"), version: "20261125")
+        let cache = directory.appendingPathComponent("cache")
+        let root = try UpdateInstaller.stagingRoot(for: target, cache: cache)
+        XCTAssertEqual(try UpdateInstaller.stagingRoot(for: target, cache: cache), root, "every run stages in the same folder")
+        func device(_ url: URL) throws -> Int? { try FileManager.default.attributesOfItem(atPath: url.path)[.systemNumber] as? Int }
+        XCTAssertEqual(try device(root), try device(volume), "on the app's volume, so that the install is a rename")
+        XCTAssertNotEqual(try device(root), try device(cache))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.deletingLastPathComponent().path),
+                       [root.lastPathComponent], "the temporary folders it was found with are gone")
+        // On the home folder's volume it is the cache's Updates folder.
+        let local = try makeApp(directory.appendingPathComponent("Applications/Peekaboo.app"), version: "20261125")
+        XCTAssertEqual(try UpdateInstaller.stagingRoot(for: local, cache: cache), UpdateInstaller.updatesFolder(in: cache))
+
+        // A download an earlier run left behind goes with the next one.
+        let stale = root.appendingPathComponent("20261124")
+        try FileManager.default.createDirectory(at: stale, withIntermediateDirectories: true)
+        UpdateInstaller.removeStaged(in: root)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path))
+
+        let staged = try makeApp(root.appendingPathComponent("20261126/Peekaboo.app"), version: "20261126")
+        let job = UpdateInstaller.Job(pid: try exitedProcess(), staged: staged, target: target, version: AppVersion("20261126")!)
+        XCTAssertEqual(UpdateInstaller.runHelper(job.arguments, requirement: adHoc, cache: cache), 0)
+        XCTAssertEqual(try version(of: target), "20261126")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), [])
+
+        // Staged on one volume for an app on another, the swap cannot happen: recorded with the system's reason.
+        let elsewhere = try makeApp(root.appendingPathComponent("20261127/Peekaboo.app"), version: "20261127")
+        let crossing = UpdateInstaller.Job(pid: try exitedProcess(), staged: elsewhere, target: local, version: AppVersion("20261127")!)
+        XCTAssertEqual(UpdateInstaller.runHelper(crossing.arguments, requirement: adHoc, cache: cache), 1)
+        XCTAssertEqual(try version(of: local), "20261125")
+        XCTAssertEqual(UpdateInstaller.Failure.read(in: cache)?.reason, String(cString: strerror(EXDEV)))
+    }
+
+    /// A process that has exited, standing in for the app that quit.
+    private func exitedProcess() throws -> pid_t {
+        let quit = Process()
+        quit.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try quit.run()
+        quit.waitUntilExit()
+        return quit.processIdentifier
+    }
+
+    /// A scratch APFS volume mounted in `directory` until the test ends; skips the test where disk images cannot be
+    /// attached.
+    private func mountScratchVolume() throws -> URL {
+        let image = directory.appendingPathComponent("scratch.dmg")
+        let mountPoint = directory.appendingPathComponent("volume", isDirectory: true)
+        try FileManager.default.createDirectory(at: mountPoint, withIntermediateDirectories: true)
+        guard hdiutil(["create", "-quiet", "-size", "16m", "-fs", "APFS", "-volname", "PeekabooTest", image.path]),
+              hdiutil(["attach", "-quiet", "-nobrowse", "-noverify", "-noautoopen", "-mountpoint", mountPoint.path, image.path])
+        else { throw XCTSkip("cannot attach a disk image here") }
+        addTeardownBlock { [self] in _ = hdiutil(["detach", "-force", "-quiet", mountPoint.path]) }
+        return mountPoint
+    }
+
+    /// Run hdiutil for at most 60 s; true when it succeeded.
+    private func hdiutil(_ arguments: [String]) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return false }
+        let deadline = Date().addingTimeInterval(60)
+        while process.isRunning, Date() < deadline { usleep(20_000) }
+        guard !process.isRunning else {
+            process.terminate()
+            return false
+        }
+        return process.terminationStatus == 0
     }
 
     func testHelperArgumentsRoundTrip() throws {

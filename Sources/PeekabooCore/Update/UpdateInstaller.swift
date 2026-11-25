@@ -31,22 +31,36 @@ public enum UpdateInstaller {
         return nil
     }
 
-    /// `~/Library/Caches/com.thilllon.Peekaboo/Updates`, where updates are staged (not created here).
-    public static var cachedUpdates: URL? {
+    /// `~/Library/Caches/com.thilllon.Peekaboo`, the updater's folder (not created here): `Updates/` holds the
+    /// downloads staged on the home folder's volume, `InstallFailure.plist` the last install that failed.
+    public static var cacheFolder: URL? {
         FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("\(CodeSignature.bundleIdentifier)/Updates", isDirectory: true)
+            .appendingPathComponent(CodeSignature.bundleIdentifier, isDirectory: true)
     }
 
-    /// Folder for downloaded updates, on the volume of `app` so that the install is a rename: `cachedUpdates`,
-    /// or a temporary folder on the app's volume when it lives on another one.
-    public static func stagingRoot(for app: URL) throws -> URL {
+    /// `Updates/` of `cache`: the staging root for apps on the home folder's volume.
+    public static func updatesFolder(in cache: URL) -> URL { cache.appendingPathComponent("Updates", isDirectory: true) }
+
+    /// Folder for downloaded updates, on the volume of `app` so that the install is a rename: `Updates/` of
+    /// `cache`, or, for an app on another volume, Peekaboo's folder among the system's temporary items on that
+    /// volume. That one is the same in every run, so a download an earlier run left there is deleted with the next
+    /// (`removeStaged`) instead of piling up in a new temporary folder per run.
+    public static func stagingRoot(for app: URL, cache: URL) throws -> URL {
         let fm = FileManager.default
         let folder = app.deletingLastPathComponent()
-        if let root = cachedUpdates, device(root.deletingLastPathComponent().deletingLastPathComponent()) == device(folder) {
-            try fm.createDirectory(at: root, withIntermediateDirectories: true)
-            return root
+        let updates = updatesFolder(in: cache)
+        try fm.createDirectory(at: updates, withIntermediateDirectories: true)
+        if device(updates) == device(folder) { return updates }
+        // `<volume>/.TemporaryItems/folders.<uid>/TemporaryItems/NSIRD_…`: a new folder per call; keep its parent.
+        let scratch = try fm.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: folder, create: true)
+        try? fm.removeItem(at: scratch)
+        let root = scratch.deletingLastPathComponent()
+            .appendingPathComponent("\(CodeSignature.bundleIdentifier).Updates", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        guard device(root) == device(folder) else {
+            throw UpdateError.install("no folder for the download on the volume of \(folder.path)")
         }
-        return try fm.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: folder, create: true)
+        return root
     }
 
     private static func device(_ url: URL) -> dev_t? {
@@ -144,6 +158,57 @@ public enum UpdateInstaller {
         try? fm.removeItem(at: staged)
     }
 
+    // MARK: Failed installs
+
+    /// An install the helper could not finish (a volume without `RENAME_SWAP`, a bundle edited after it was
+    /// checked, …), kept in `InstallFailure.plist` of the cache folder. The next run says so once, and automatic
+    /// checks then offer that version as a download instead of fetching it again and failing on every quit; a
+    /// manual check or a newer release tries again.
+    public struct Failure: Codable, Equatable, Sendable {
+        /// The version that did not install.
+        public var version: String
+        /// Path of the bundle it was meant to replace (another copy of the app is not concerned).
+        public var target: String
+        /// Why, for the user: e.g. `Operation not supported`.
+        public var reason: String
+        /// The user has been told (a toast, once).
+        public var reported = false
+
+        public init(version: AppVersion, target: URL, reason: String) {
+            self.version = version.description
+            self.target = target.path
+            self.reason = reason
+        }
+
+        /// The record in `cache` (`cacheFolder` in the app).
+        private static func record(in cache: URL) -> URL { cache.appendingPathComponent("InstallFailure.plist") }
+
+        /// The recorded failure in `cache`; nil when there is none (or it is unreadable).
+        public static func read(in cache: URL) -> Failure? {
+            guard let data = try? Data(contentsOf: record(in: cache)) else { return nil }
+            return try? PropertyListDecoder().decode(Failure.self, from: data)
+        }
+
+        /// Record (or replace) the failure in `cache`.
+        public func write(in cache: URL) {
+            do {
+                try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+                try PropertyListEncoder().encode(self).write(to: Self.record(in: cache), options: .atomic)
+            } catch {
+                Trace.log("update: cannot record the failed install: \(error)")
+            }
+        }
+
+        public static func remove(in cache: URL) { try? FileManager.default.removeItem(at: record(in: cache)) }
+    }
+
+    /// What the user reads after "could not be installed:": the detail of an install error, the whole message
+    /// otherwise.
+    static func failureReason(_ error: Error) -> String {
+        if case UpdateError.install(let detail) = error { return detail }
+        return "\(error)"
+    }
+
     // MARK: Helper process
 
     /// What the helper should do (parsed from its arguments).
@@ -217,8 +282,8 @@ public enum UpdateInstaller {
     }
 
     /// Body of the helper process; returns its exit status. `requirement` defaults to the one for updates of the
-    /// running app (the helper is the quitting app's own executable).
-    public static func runHelper(_ arguments: [String], requirement: String? = nil) -> Int32 {
+    /// running app (the helper is the quitting app's own executable); a failed install is recorded in `cache`.
+    public static func runHelper(_ arguments: [String], requirement: String? = nil, cache: URL? = cacheFolder) -> Int32 {
         guard let job = Job(arguments: arguments) else {
             FileHandle.standardError.write(Data("usage: Peekaboo \(helperFlag) <pid> <staged app> <target app> <version> [--relaunch] [--open <file>]\n".utf8))
             return 64
@@ -238,6 +303,8 @@ public enum UpdateInstaller {
         } catch {
             Trace.log("update: \(error)")
             status = 1
+            // Before the relaunch, so that the relaunched app can say so.
+            if let cache { Failure(version: job.version, target: job.target, reason: failureReason(error)).write(in: cache) }
         }
         // The staged app sat in a folder named after its version (`<staging root>/<version>/Peekaboo.app`); after
         // the attempt it holds the old app or a download that failed its checks.

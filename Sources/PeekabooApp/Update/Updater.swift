@@ -46,7 +46,9 @@ final class Updater {
     private let manifestURL: URL
     /// `PEEKABOO_UPDATE_URL` (a test server or file): http and file URLs are accepted, nothing is remembered.
     private let isTestManifest: Bool
-    private let policy = UpdatePolicy()
+    private let policy: UpdatePolicy
+    /// `UpdateInstaller.cacheFolder`: staged downloads and the record of a failed install.
+    private let cache: URL?
     private static let lastCheckKey = "PeekabooUpdateLastCheck"
 
     // Main thread.
@@ -70,9 +72,15 @@ final class Updater {
     private var connectivity = ConnectivityEdge()
     private var stagingRoot: URL?
     private var staged: (manifest: UpdateManifest, app: URL)?
+    /// The helper could not install this version after an earlier quit: automatic checks offer it as a download
+    /// instead of fetching it again; a manual check or a newer release tries again.
+    private var failedInstall: UpdateInstaller.Failure?
+    /// The check in flight was asked for ("Check for Updates…", "Update", Settings), not automatic.
+    private var manualCheck = false
 
     /// nil unless this is Peekaboo running from its app bundle with a version (not `swift run`, not tests).
-    init?(settings: AppConfig.Updates, bundle: Bundle = .main) {
+    init?(settings: AppConfig.Updates, bundle: Bundle = .main, cache: URL? = UpdateInstaller.cacheFolder,
+          policy: UpdatePolicy = UpdatePolicy()) {
         guard bundle.bundleIdentifier == CodeSignature.bundleIdentifier, bundle.bundleURL.pathExtension == "app",
               let executable = bundle.executableURL,
               let current = (bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String).flatMap(AppVersion.init)
@@ -83,6 +91,8 @@ final class Updater {
         let override = ProcessInfo.processInfo.environment["PEEKABOO_UPDATE_URL"].flatMap { $0.isEmpty ? nil : URL(string: $0) }
         manifestURL = override ?? Self.releaseManifest
         isTestManifest = override != nil
+        self.cache = cache
+        self.policy = policy
         self.settings = settings
         queueSettings = settings
         status = Self.statusText(.idle, current: current, settings: settings, installsOnQuit: settings.autoInstall)
@@ -92,6 +102,9 @@ final class Updater {
 
     /// Begin automatic checks (call after launch: the first check waits `firstCheckDelay`).
     func start() {
+        // An install that failed behind the last quit is told at once (one small file read on the utility queue),
+        // also after "Restart to Update", when the relaunched app's first check is still throttled.
+        queue.async { [weak self] in self?.loadFailedInstall() }
         queue.asyncAfter(deadline: .now() + policy.firstCheckDelay) { [weak self] in
             guard let self else { return }
             self.started = true
@@ -166,6 +179,29 @@ final class Updater {
 
     // MARK: Checking (on `queue`)
 
+    /// Read the record of an install that failed behind an earlier quit; tell the user once.
+    private func loadFailedInstall() {
+        guard let cache, var failure = UpdateInstaller.Failure.read(in: cache),
+              URL(fileURLWithPath: failure.target).resolvingSymlinksInPath().path == app.resolvingSymlinksInPath().path
+        else { return }
+        guard let version = AppVersion(failure.version), version > current else {
+            // Installed after all (from the disk image, say).
+            return UpdateInstaller.Failure.remove(in: cache)
+        }
+        failedInstall = failure
+        guard !failure.reported else { return }
+        failure.reported = true
+        failure.write(in: cache)
+        publish(.failed("Peekaboo \(version) could not be installed: \(failure.reason)"), show: true)
+    }
+
+    /// A newer release or a manual check: try that install again.
+    private func forgetFailedInstall() {
+        guard failedInstall != nil, let cache else { return }
+        failedInstall = nil
+        UpdateInstaller.Failure.remove(in: cache)
+    }
+
     private func updateMonitoring() {
         guard started, queueSettings.check else {
             timer?.cancel()
@@ -197,13 +233,15 @@ final class Updater {
 
     private func check(_ trigger: UpdateTrigger, show: Bool = false) {
         guard !busy else {
-            // A manual check while another is in flight gets that one's outcome.
+            // A manual check while another is in flight gets that one's outcome (and makes it a manual one).
+            if trigger == .manual { manualCheck = true }
             if show { showOutcome = true }
             return
         }
         guard policy.shouldCheck(trigger, automatic: queueSettings.check, lastCheck: lastCheck, now: Date()) else { return }
         busy = true
         showOutcome = show
+        manualCheck = trigger == .manual
         Trace.log("update: \(trigger.rawValue) check of \(manifestURL.absoluteString)")
         // A background re-check leaves a ready update on show until it has an outcome.
         if staged == nil || trigger == .manual { publish(.checking) }
@@ -240,19 +278,29 @@ final class Updater {
         guard manifest.version > current else {
             // An update staged but installed another way (the DMG), or a withdrawn release, is stale now.
             staged = nil
-            if let cached = UpdateInstaller.cachedUpdates { UpdateInstaller.removeStaged(in: cached) }
+            forgetFailedInstall()
+            if let cache { UpdateInstaller.removeStaged(in: UpdateInstaller.updatesFolder(in: cache)) }
+            if let stagingRoot { UpdateInstaller.removeStaged(in: stagingRoot) }
             return finish(.upToDate)
         }
         guard manifest.runs(on: ProcessInfo.processInfo.operatingSystemVersion) else {
             return finish(.available(manifest, blocked: "it needs macOS \(manifest.minimumSystemVersion)"))
         }
         if let reason = UpdateInstaller.cannotReplaceReason(app) { return finish(.available(manifest, blocked: reason)) }
+        if let failedInstall {
+            // Fetching it again would fail again on quit, without a word: offer the download until the user asks
+            // for another try or a newer release comes out.
+            guard manualCheck || AppVersion(failedInstall.version) != manifest.version else {
+                return finish(.available(manifest, blocked: "installing it failed (\(failedInstall.reason))"))
+            }
+            forgetFailedInstall()
+        }
         if let staged, staged.manifest.version == manifest.version, FileManager.default.fileExists(atPath: staged.app.path) {
             return finish(.ready(manifest, app: staged.app))
         }
         // Without auto-install nothing touches the disk until the user asks for the update.
         guard queueSettings.autoInstall || requestedOnQueue else { return finish(.available(manifest, blocked: nil)) }
-        if stagingRoot == nil { stagingRoot = try? UpdateInstaller.stagingRoot(for: app) }
+        if stagingRoot == nil, let cache { stagingRoot = try? UpdateInstaller.stagingRoot(for: app, cache: cache) }
         guard let root = stagingRoot, let requirement = CodeSignature.updateRequirementForRunningApp() else {
             return finish(.available(manifest, blocked: "it cannot be staged"))
         }

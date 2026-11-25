@@ -102,7 +102,9 @@ offer it:
 
 Peekaboo › **Check for Updates…** looks at once, whatever `check` says. The new bundle replaces the old one
 in one atomic rename. When Peekaboo cannot replace itself (it runs from the disk image or from a quarantined
-copy, or its folder is not writable), it offers the release page instead. Each release is named after its
+copy, or its folder is not writable), it offers the release page instead. If an install fails when Peekaboo
+quits, the next launch says why once, and that release is then offered as a download from the release page
+instead of being fetched again; **Check for Updates…** (or a newer release) tries the install again. Each release is named after its
 day: `20261125`, and `20261125.1` for a second release that day. The About panel and `peekaboo --version`
 show the version and the commit it was built from.
 
