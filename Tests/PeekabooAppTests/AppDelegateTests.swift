@@ -30,6 +30,7 @@ final class AppDelegateTests: ViewerTestCase {
         defer { CommandLine.arguments = arguments }
 
         let delegate = AppDelegate()
+        delegate.presentation = .headless
         self.delegate = delegate
         delegate.applicationWillFinishLaunching(Notification(name: NSApplication.willFinishLaunchingNotification))
         delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
@@ -42,6 +43,7 @@ final class AppDelegateTests: ViewerTestCase {
     /// Opening the file that was just closed (Esc, then a double-click in Finder within 1.5 s) shows it again.
     func testReopeningTheSameFileRightAfterClosingShowsIt() throws {
         let delegate = AppDelegate()
+        delegate.presentation = .headless
         self.delegate = delegate
         let url = writeImage(folder.appendingPathComponent("a.jpg"), width: 900, height: 600, gray: 0.4)
         delegate.application(NSApp, open: [url])

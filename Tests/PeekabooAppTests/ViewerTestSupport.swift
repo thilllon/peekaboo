@@ -9,11 +9,18 @@ import XCTest
 
 /// Base class of the tests that drive a real `ViewerWindowController` (window, Metal renderer, pipeline, folder
 /// watcher) on the main run loop. Skipped without a Metal device.
+///
+/// Nothing of a test run reaches the screen or the keyboard focus: the process can never become the active app, and
+/// viewers are `.headless` (ordered in, rendering, but transparent and off every screen). Every test fails if the
+/// process activated or a window became key or came on screen meanwhile (`assertNothingOnScreen`).
 class ViewerTestCase: XCTestCase {
     /// Scratch directory of the test; `folder` (the browsed images) lives inside it.
     private(set) var root: URL!
     private(set) var folder: URL!
     private(set) var viewer: ViewerWindowController?
+    /// Activations and windows that became key or visible during the test.
+    private var focusEvents: [String] = []
+    private var focusObservers: [NSObjectProtocol] = []
 
     override func setUpWithError() throws {
         try super.setUpWithError()
@@ -21,6 +28,9 @@ class ViewerTestCase: XCTestCase {
         // Windows need a window-server session (none for a runner started as a daemon).
         guard CGSessionCopyCurrentDictionary() != nil else { throw XCTSkip("no window-server session") }
         _ = NSApplication.shared
+        // No Dock icon, no menu bar, and `NSApp.activate()` does nothing: the user's focus stays where it is.
+        NSApp.setActivationPolicy(.prohibited)
+        watchFocus()
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("peekaboo-app-tests-\(UUID().uuidString)", isDirectory: true)
         folder = root.appendingPathComponent("images", isDirectory: true)
@@ -34,16 +44,18 @@ class ViewerTestCase: XCTestCase {
         }
         viewer = nil
         if let root { try? FileManager.default.removeItem(at: root) }
+        for observer in focusObservers { NotificationCenter.default.removeObserver(observer) }
+        focusObservers = []
         super.tearDown()
     }
 
-    /// A viewer with the default configuration, or `toml` as its config file.
+    /// A headless viewer with the default configuration, or `toml` as its config file.
     func makeViewer(toml: String? = nil) throws -> ViewerWindowController {
         let configURL = root.appendingPathComponent("config.toml")
         if let toml { try Data(toml.utf8).write(to: configURL) }
         let store = ConfigStore(url: configURL)
         store.load()
-        let viewer = ViewerWindowController(configStore: store)
+        let viewer = ViewerWindowController(configStore: store, presentation: .headless)
         self.viewer = viewer
         objc_setAssociatedObject(viewer, &Self.storeKey, store, .OBJC_ASSOCIATION_RETAIN)
         return viewer
@@ -112,6 +124,39 @@ class ViewerTestCase: XCTestCase {
                 && !viewer.isListingPendingForTests
         }
         XCTAssertTrue(ready, "\(expected) was not shown", line: line)
+    }
+
+    // MARK: Focus and screen
+
+    /// Records, until the test ends, every activation of the process and every window that becomes key or visible; a
+    /// teardown block (it runs before `tearDown`, so before subclasses close their windows) then checks the state.
+    private func watchFocus() {
+        func record(_ name: Notification.Name, _ event: @escaping (Notification) -> String?) {
+            focusObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { [weak self] note in
+                if let event = event(note) { self?.focusEvents.append(event) }
+            })
+        }
+        record(NSApplication.didBecomeActiveNotification) { _ in "the test process became the active app" }
+        record(NSWindow.didBecomeKeyNotification) { "\($0.object.map { "\($0)" } ?? "a window") became key" }
+        record(NSWindow.didChangeOcclusionStateNotification) { note in
+            guard let window = note.object as? NSWindow, window.occlusionState.contains(.visible) else { return nil }
+            return "\(window) came on screen at \(window.frame)"
+        }
+        addTeardownBlock { [weak self] in self?.assertNothingOnScreen() }
+    }
+
+    /// The process is not the active app, never was during the test, and none of its windows can be seen: every
+    /// ordered-in window is transparent, off every screen and not key.
+    func assertNothingOnScreen(file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(focusEvents, [], file: file, line: line)
+        XCTAssertFalse(NSApp.isActive, "the test process is the active app", file: file, line: line)
+        let screens = NSScreen.screens.map(\.frame)
+        for window in NSApp.windows where window.isVisible {
+            XCTAssertEqual(window.alphaValue, 0, "\(window) is not transparent", file: file, line: line)
+            XCTAssertFalse(screens.contains { $0.intersects(window.frame) }, "\(window) is on a screen at \(window.frame)",
+                           file: file, line: line)
+            XCTAssertFalse(window.isKeyWindow, "\(window) is key", file: file, line: line)
+        }
     }
 
     // MARK: Introspection
