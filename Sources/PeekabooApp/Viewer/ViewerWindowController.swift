@@ -1198,7 +1198,9 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             player.pause()
             hud.showToast("Paused · frame \(player.index + 1)/\(player.frameCount)")
         } else {
-            if !player.isPlaying, let frame = player.play(at: CACurrentMediaTime()) { showFrame(frame, index: player.index, playing: true) }
+            if !player.isPlaying, let frame = player.play(at: CACurrentMediaTime()) {
+                showFrame(frame, index: player.index, playing: true)
+            }
             hud.showToast("Playing")
         }
         animationStateChanged()
