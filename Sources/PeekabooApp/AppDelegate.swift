@@ -22,18 +22,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     /// First launch: macOS asks for Desktop, Documents and Downloads then (built a second after launch; tests set it).
     lazy var folderAccess = FolderAccessRequest()
     /// This launch installs Peekaboo into Applications instead of opening a window: it was started from a disk image or
-    /// a translocated path (tests set one). nil again once Peekaboo stays here after all.
+    /// a translocated path (main.swift decides; tests set one). nil again once Peekaboo stays here after all.
     var installation: Installation?
     /// Ejects the Peekaboo disk images in a copy that one of them installed (tests set one).
     lazy var diskImageEjector = DiskImageEjector()
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         let arguments = Array(CommandLine.arguments.dropFirst())
-        // All a normal launch pays for it: two C string comparisons on the executable's path (tests: not even that).
-        if presentation == .interactive, installation == nil, let executable = CommandLine.unsafeArgv[0],
-           AppInstall.mayNeedInstalling(executable: executable) {
-            installation = Installation.forLaunch(arguments: arguments)
-        }
         if let installation {
             // No window: the files go to the installed copy.
             return installation.collect(Self.paths(in: arguments))
@@ -128,11 +123,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     /// Started by the copy that installed this one (`--eject-disk-images=<pid>`): eject the Peekaboo disk images on a
-    /// utility queue and say so. Never headless: tests eject nothing.
+    /// utility queue (never one that holds a file opened here) and say so. Never headless: tests eject nothing.
     private func ejectDiskImages() {
-        guard presentation == .interactive, let pid = AppInstall.installingProcess(in: CommandLine.arguments) else { return }
-        diskImageEjector.run(after: pid) { [weak self] toast, failed in
-            self?.viewer?.toast(toast, seconds: failed ? 6 : 2)
+        let arguments = CommandLine.arguments
+        guard presentation == .interactive, let pid = AppInstall.installingProcess(in: arguments) else { return }
+        let installed = DiskImageEjector.installedText(version: BuildInfo.version, app: Bundle.main.bundleURL,
+                                                       keptNewer: arguments.contains(AppInstall.keptNewerFlag))
+        diskImageEjector.run(after: pid, keeping: { [weak self] in
+            self?.recentlyOpened.keys.map { URL(fileURLWithPath: $0) } ?? []
+        }) { [weak self] failures in
+            self?.viewer?.toast(DiskImageEjector.toast(installed, failures: failures), seconds: failures.isEmpty ? 2 : 6)
         }
     }
 

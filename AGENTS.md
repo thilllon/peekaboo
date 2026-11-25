@@ -49,7 +49,7 @@ mise run deps      # static libjpeg-turbo and libwebp for the deployment target 
 | Debug build | `swift build` (`mise run build`) |
 | Unit tests | `swift test` (`mise run test`) |
 | Release app bundle | `mise run app` → `build/Peekaboo.app` (version and build number of `HEAD`; `VERSION=` / `BUILD=` override) |
-| Install locally | `mise run install` → `/Applications/Peekaboo.app`, replacing it (`~/Applications` when `/Applications` is not writable, `DEST=` overrides), + `peekaboo` CLI in `~/.local/bin`; removes the `~/Applications/Peekaboo.app` older builds of the task left |
+| Install locally | `mise run install` → `/Applications/Peekaboo.app`, replacing the Peekaboo there (`~/Applications`, as the app itself does, when `/Applications` is not writable or holds a Peekaboo.app the user may not replace; never a running copy: quit it first), + `peekaboo` CLI in `~/.local/bin`; removes the `~/Applications/Peekaboo.app` older builds of the task left. `DEST=` installs there and touches nothing else |
 | DMG + updater zip | `mise run dmg` → `build/Peekaboo-<version>.dmg`, `build/Peekaboo-<version>.zip` |
 | Release | `mise run release`: version of `HEAD`, notarized DMG, tag `v<version>`, GitHub Release (see [Releases](#releases)) |
 | Secret scan (history + tree) | `mise run secrets` |
@@ -141,12 +141,15 @@ signature carries the running app's identifier and team.
 
 There is always one Peekaboo.app (`Sources/PeekabooCore/Update/AppInstall.swift`,
 `Sources/PeekabooApp/Update/Installation.swift`): a copy started from a disk image (a read-only volume under
-`/Volumes`) or an App Translocation path installs itself into `/Applications` (`~/Applications` when that is not
-writable), verified like an update and without its quarantine flag, opens its files in the installed copy with
-`--eject-disk-images=<pid>` and quits; the installed copy ejects every read-only volume with a Peekaboo.app of this
-bundle identifier at its top. Keep the disk image's layout (Peekaboo.app at the top of the volume) and that argument
-stable: every released version relies on them. A normal launch pays two C string comparisons on `argv[0]` for it.
-To try it, open the app from a disk image of `mise run dmg`: it replaces `/Applications/Peekaboo.app`.
+`/Volumes`) or an App Translocation path installs itself into `/Applications` (`~/Applications` when it may not
+replace the Peekaboo there), verified like an update and without its quarantine flag, after quitting an older copy
+that runs there; a newer copy in either Applications folder is kept instead. It opens its files in the installed copy
+with `--eject-disk-images=<pid>` (and `--kept-newer` when it installed nothing) and quits; the installed copy quits
+the older copies that run from the disk images and ejects every read-only disk image with a Peekaboo.app of this
+bundle identifier at its top. Keep the disk image's layout (Peekaboo.app at the top of the volume) and those arguments
+stable: every released version relies on them. main.swift decides before any warm-up: a normal launch pays two C
+string comparisons on `argv[0]` for it, a copy on a writable drive under `/Volumes` one `statfs` more. To try it,
+open the app from a disk image of `mise run dmg`: it replaces `/Applications/Peekaboo.app`.
 
 ## Performance rules
 
@@ -174,8 +177,8 @@ To try it, open the app from a disk image of `mise run dmg`: it replaces `/Appli
 - Tests never show a window or take the keyboard focus: derive window tests from `ViewerTestCase` (`.prohibited`
   activation policy; a test fails if the process activates, a window comes on screen, or the test leaves a window
   open) and build controllers with `presentation: .headless` (ordered in transparent and off every screen, never
-  key; frames still render). They never install, open, eject or quit anything either: headless, the app delegate
-  neither installs from a disk image nor ejects one, and tests of that flow fake the `Installation` and
-  `DiskImageEjector` hooks.
+  key; frames still render). They never install, open, eject or quit anything either: only main.swift (which tests
+  never run) starts an installation, a headless app delegate never ejects, and tests of that flow fake the
+  `Installation` and `DiskImageEjector` hooks.
 - Prefer Apple frameworks (ImageIO, Metal, Accelerate) and static C libraries over new
   dependencies.

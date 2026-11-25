@@ -73,8 +73,9 @@ Everything below was measured on a MacBook Pro M4 Pro (see [docs/research.md](do
 1. Download `Peekaboo-<version>.dmg` from the [latest release](https://github.com/thilllon/peekaboo/releases/latest)
    (the volume is named after the version too, e.g. "Peekaboo 20261125-ab2342") and drag Peekaboo to Applications, or
    just open it from the disk image: it then installs itself into Applications (`~/Applications` when you may not
-   write to `/Applications`), replacing an older copy but never a newer one, opens your files from there and ejects
-   the Peekaboo disk images. There is always one Peekaboo; only its version changes.
+   write to `/Applications`), replacing an older copy (an older Peekaboo that is still open is quit first) but never
+   a newer one, opens your files from there and ejects the Peekaboo disk images. There is always one Peekaboo; only
+   its version changes.
 2. Releases are signed with a Developer ID and notarized by Apple, so Peekaboo opens like any other app, and they update
    themselves.
 3. At first launch macOS asks, once for each, whether Peekaboo may access your Desktop, Documents and Downloads folders:

@@ -24,41 +24,39 @@ final class AppInstallTests: XCTestCase {
     func testOnlyADiskImageOrATranslocatedCopyInstalls() {
         var looked: [String] = []
         func needs(_ path: String, readOnly: Bool) -> Bool {
-            AppInstall.needsInstalling(URL(fileURLWithPath: path)) { url in
-                looked.append(url.path)
+            AppInstall.needsInstalling(executable: path) { volume in
+                looked.append(String(cString: volume))
                 return readOnly
             }
         }
-        // Normal launches: the string check says no, and no volume is looked at.
+        // Normal launches: the string checks say no, and no volume is looked at.
         let home = NSHomeDirectory()
         for path in ["/Applications/Peekaboo.app", home + "/Applications/Peekaboo.app", home + "/Downloads/Peekaboo.app",
-                     "/VolumesX/Peekaboo.app", "/private/Volumes/x/Peekaboo.app", "/Applications/AppTranslocation.app/Peekaboo.app"] {
-            XCTAssertFalse(AppInstall.mayNeedInstalling(path), path)
+                     "/Applications/Peekaboo.app/Contents/MacOS/Peekaboo", "/VolumesX/Peekaboo.app",
+                     "/private/Volumes/x/Peekaboo.app", "/Applications/AppTranslocation.app/Peekaboo.app",
+                     "Peekaboo" /* a relative path from a terminal */] {
             XCTAssertFalse(needs(path, readOnly: true), path)
         }
-        XCTAssertEqual(looked, [], "a normal launch pays the string check alone")
-        // The launch checks the executable's path (argv[0]).
-        func executable(_ path: String) -> Bool { path.withCString { AppInstall.mayNeedInstalling(executable: $0) } }
-        XCTAssertFalse(executable("/Applications/Peekaboo.app/Contents/MacOS/Peekaboo"))
-        XCTAssertTrue(executable("/Volumes/Peekaboo 20261126-69a847/Peekaboo.app/Contents/MacOS/Peekaboo"))
-        XCTAssertTrue(executable("/private/var/folders/xy/T/AppTranslocation/0F2A/d/Peekaboo.app/Contents/MacOS/Peekaboo"))
-        XCTAssertFalse(executable("Peekaboo"), "a relative path from a terminal")
+        XCTAssertEqual(looked, [], "a normal launch pays the string checks alone")
 
         // Under /Volumes: a read-only volume (a disk image) installs, a writable one (an external drive) does not.
-        let image = "/Volumes/Peekaboo 20261126-69a847/Peekaboo.app"
+        let image = "/Volumes/Peekaboo 20261126-69a847/Peekaboo.app/Contents/MacOS/Peekaboo"
         let drive = "/Volumes/SSD/Apps/Peekaboo.app"
-        XCTAssertTrue(AppInstall.mayNeedInstalling(image))
-        XCTAssertTrue(AppInstall.mayNeedInstalling(drive))
         XCTAssertTrue(needs(image, readOnly: true))
         XCTAssertFalse(needs(drive, readOnly: false))
         XCTAssertEqual(looked, [image, drive])
 
         // App Translocation's read-only copy installs, wherever it is mounted, without a volume lookup.
         looked = []
-        let translocated = "/private/var/folders/xy/abc123/T/AppTranslocation/0F2A5C1E-9B7D-4E7A/d/Peekaboo.app"
-        XCTAssertTrue(AppInstall.mayNeedInstalling(translocated))
-        XCTAssertTrue(needs(translocated, readOnly: false))
+        for translocated in ["/private/var/folders/xy/abc123/T/AppTranslocation/0F2A5C1E-9B7D-4E7A/d/Peekaboo.app",
+                             "/private/var/folders/xy/T/AppTranslocation/0F2A/d/Peekaboo.app/Contents/MacOS/Peekaboo"] {
+            XCTAssertTrue(needs(translocated, readOnly: false), translocated)
+        }
         XCTAssertEqual(looked, [])
+
+        // The real volume check (`statfs`): the scratch folder is writable (the read-only one: the disk image test).
+        XCTAssertFalse(AppInstall.isOnReadOnlyVolume(directory.path))
+        XCTAssertFalse(AppInstall.isOnReadOnlyVolume(directory.appendingPathComponent("missing").path), "no such file")
     }
 
     func testTheInstalledCopyIsToldWhichProcessToWaitFor() {
@@ -74,24 +72,55 @@ final class AppInstallTests: XCTestCase {
 
     // MARK: Target
 
-    func testTargetIsApplicationsWhenWritableElseTheHomeFolders() {
-        let applications = URL(fileURLWithPath: "/Applications", isDirectory: true)
-        let home = URL(fileURLWithPath: "/home/someone", isDirectory: true)
+    func testTargetIsApplicationsWhenWritableElseTheHomeFolders() throws {
+        // Scratch folders stand in for /Applications and the home folder (the real ones are never looked at).
+        let applications = directory.appendingPathComponent("System Applications", isDirectory: true)
+        let home = directory.appendingPathComponent("home", isDirectory: true)
+        let system = applications.appendingPathComponent("Peekaboo.app", isDirectory: true)
+        let user = home.appendingPathComponent("Applications/Peekaboo.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: applications, withIntermediateDirectories: true)
+        XCTAssertEqual(AppInstall.locations(applications: applications, home: home), [system, user])
         var asked: [String] = []
-        XCTAssertEqual(AppInstall.target(applications: applications, home: home) { asked.append($0.path); return true }.path,
-                       "/Applications/Peekaboo.app")
-        XCTAssertEqual(AppInstall.target(applications: applications, home: home) { asked.append($0.path); return false }.path,
-                       "/home/someone/Applications/Peekaboo.app")
-        XCTAssertEqual(asked, ["/Applications", "/Applications"], "only /Applications is checked")
-        // The real check (`access`): a folder of the user's is writable, one made read-only is not.
-        let writable = directory.appendingPathComponent("Applications", isDirectory: true)
-        try? FileManager.default.createDirectory(at: writable, withIntermediateDirectories: true)
-        XCTAssertEqual(AppInstall.target(applications: writable, home: home).path, writable.path + "/Peekaboo.app")
-        try? FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: writable.path)
-        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: writable.path) }
-        if access(writable.path, W_OK) != 0 {
-            XCTAssertEqual(AppInstall.target(applications: writable, home: home).path, "/home/someone/Applications/Peekaboo.app")
+        func target(writable: Bool) -> URL {
+            AppInstall.target(applications: applications, home: home) { asked.append($0.lastPathComponent); return writable }
         }
+        XCTAssertEqual(target(writable: true), system, "an administrator, nothing installed yet")
+        XCTAssertEqual(target(writable: false), user)
+        XCTAssertEqual(asked, ["System Applications", "System Applications"])
+
+        // A bundle there must be a Peekaboo the user may replace: another app of that name is never replaced.
+        try makeApp(system, version: releaseVersion(25), sign: false)
+        asked = []
+        XCTAssertEqual(target(writable: true), system)
+        XCTAssertEqual(asked, ["System Applications", "Peekaboo.app"])
+        try FileManager.default.removeItem(at: system)
+        try makeApp(system, version: releaseVersion(25), identifier: "com.example.Peekaboo", sign: false)
+        XCTAssertEqual(target(writable: true), user, "another app named Peekaboo.app")
+        try FileManager.default.removeItem(at: system)
+
+        // The real check (`access`). A bundle folder the user cannot write (another account's, an installer package's)
+        // cannot be moved out of the way: the swap would fail with EACCES on every launch.
+        try makeApp(system, version: releaseVersion(25), sign: false)
+        XCTAssertEqual(AppInstall.target(applications: applications, home: home), system)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: system.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: system.path) }
+        guard access(system.path, W_OK) != 0 else { throw XCTSkip("read-only folders are writable here (root?)") }
+        XCTAssertEqual(AppInstall.target(applications: applications, home: home), user, "a bundle folder it cannot move")
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: system.path)
+        // Nor can anything go into a read-only Applications folder.
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: applications.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: applications.path) }
+        XCTAssertEqual(AppInstall.target(applications: applications, home: home), user, "a folder it cannot write")
+    }
+
+    func testPlacesAreNamedForTheUser() {
+        let home = URL(fileURLWithPath: "/home/someone", isDirectory: true)
+        XCTAssertEqual(AppInstall.place(URL(fileURLWithPath: "/Applications"), home: home), "Applications")
+        XCTAssertEqual(AppInstall.place(URL(fileURLWithPath: "/home/someone/Applications/"), home: home),
+                       "Applications in your home folder")
+        XCTAssertEqual(AppInstall.place(URL(fileURLWithPath: "/Volumes/SSD/Apps"), home: home), "Apps")
+        XCTAssertEqual(AppInstall.describe(URL(fileURLWithPath: "/Applications/Peekaboo.app"), home: home),
+                       "Peekaboo.app in Applications")
     }
 
     // MARK: Install
@@ -102,11 +131,14 @@ final class AppInstallTests: XCTestCase {
     }
 
     private var target: URL { directory.appendingPathComponent("Applications/Peekaboo.app", isDirectory: true) }
+    /// The other Applications folder's Peekaboo.app.
+    private var other: URL { directory.appendingPathComponent("home/Applications/Peekaboo.app", isDirectory: true) }
 
+    /// `AppInstall.install` at `target`, with `other` as the other Applications folder; `running`: the target runs.
     private func install(_ app: URL, _ version: AppVersion, running: Bool = false) throws -> AppInstall.Outcome {
-        try AppInstall.install(app, version: version, at: target, requirement: adHoc) { url in
-            XCTAssertEqual(url, self.target)
-            return running
+        try AppInstall.install(app, version: version, at: target, elsewhere: [other], requirement: adHoc) { url in
+            XCTAssertTrue([self.target, self.other].contains(url), url.path)
+            return running && url == self.target
         }
     }
 
@@ -151,23 +183,102 @@ final class AppInstallTests: XCTestCase {
     func testKeepsANewerBuild() throws {
         try makeApp(target, version: releaseVersion(27))
         let before = try FileManager.default.attributesOfItem(atPath: target.path)[.systemFileNumber] as? Int
-        XCTAssertEqual(try install(try source(releaseVersion(26)), releaseVersion(26)), .newerInstalled(build: 27))
+        XCTAssertEqual(try install(try source(releaseVersion(26)), releaseVersion(26)), .kept(target, build: 27))
         XCTAssertEqual(AppInstall.peekabooVersion(target), releaseVersion(27))
         XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: target.path)[.systemFileNumber] as? Int, before,
                        "the very same bundle")
     }
 
+    func testKeepsANewerBuildInTheOtherApplicationsFolder() throws {
+        // A standard user's target is ~/Applications, an administrator may have put a newer one into /Applications (and
+        // the other way round): that one is used, and nothing is installed.
+        let app = try source(releaseVersion(26))
+        try makeApp(other, version: releaseVersion(27))
+        XCTAssertEqual(try install(app, releaseVersion(26)), .kept(other, build: 27))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path), "no second Peekaboo")
+        // Running, it gets the files.
+        XCTAssertEqual(try AppInstall.install(app, version: releaseVersion(26), at: target, elsewhere: [other], requirement: adHoc,
+                                              isRunning: { $0 == self.other }), .running(other, build: 27))
+        // The same build there counts as installed too: installing it would make two.
+        try FileManager.default.removeItem(at: other)
+        try makeApp(other, version: releaseVersion(26))
+        XCTAssertEqual(try install(app, releaseVersion(26)), .kept(other, build: 26))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+        // Unless the target holds it as well: that one is replaced (repaired) as before.
+        try makeApp(target, version: releaseVersion(26))
+        XCTAssertEqual(try install(app, releaseVersion(26)), .installed)
+        // Of two newer ones the newest wins; an older one there, or another app, changes nothing.
+        try FileManager.default.removeItem(at: target)
+        try makeApp(target, version: releaseVersion(27))
+        try FileManager.default.removeItem(at: other)
+        try makeApp(other, version: releaseVersion(28))
+        XCTAssertEqual(try install(app, releaseVersion(26)), .kept(other, build: 28))
+        for (version, identifier) in [(releaseVersion(25), "com.thilllon.Peekaboo"), (releaseVersion(28), "com.example.Peekaboo")] {
+            try FileManager.default.removeItem(at: target)
+            try FileManager.default.removeItem(at: other)
+            try makeApp(other, version: version, identifier: identifier, sign: false)
+            XCTAssertEqual(try install(app, releaseVersion(26)), .installed, identifier)
+            XCTAssertEqual(AppInstall.peekabooVersion(target), releaseVersion(26))
+            XCTAssertEqual(try UpdateInstaller.bundleInfo(other).identifier, identifier, "the other copy is left alone")
+        }
+    }
+
     func testLeavesARunningTargetAlone() throws {
         try makeApp(target, version: releaseVersion(25))
-        XCTAssertEqual(try install(try source(releaseVersion(26)), releaseVersion(26), running: true), .running)
+        XCTAssertEqual(try install(try source(releaseVersion(26)), releaseVersion(26), running: true), .running(target, build: 25))
         XCTAssertEqual(AppInstall.peekabooVersion(target), releaseVersion(25), "nothing is swapped under a running app")
+    }
+
+    /// What `install` finds is checked again right before the swap, and what the swap moved out must still be what was
+    /// checked: another disk image's copy, or the installed copy's update installer, may change the target meanwhile.
+    func testAChangedTargetIsNeverReplaced() throws {
+        let app = try source(releaseVersion(26))
+        let newer = try makeApp(directory.appendingPathComponent("Newer/Peekaboo.app"), version: releaseVersion(27))
+        let another = try makeApp(directory.appendingPathComponent("Another/Peekaboo.app"), version: releaseVersion(28),
+                                  identifier: "com.example.Peekaboo")
+        /// Install over build 25, while `change` replaces the target after the first check.
+        func install(changing change: @escaping () throws -> Void, running: [Bool] = [false, false]) throws -> AppInstall.Outcome {
+            try? FileManager.default.removeItem(at: target)
+            try makeApp(target, version: releaseVersion(25))
+            var calls = 0
+            return try AppInstall.install(app, version: releaseVersion(26), at: target, requirement: adHoc) { _ in
+                defer { calls += 1 }
+                if calls == 0 { try? change() }
+                return running[min(calls, running.count - 1)]
+            }
+        }
+        func put(_ bundle: URL) throws {
+            try FileManager.default.removeItem(at: target)
+            try FileManager.default.copyItem(at: bundle, to: target)
+        }
+        // A newer build put there meanwhile: the swap is undone, and that one is kept (it gets the files if it runs by then).
+        XCTAssertEqual(try install(changing: { try put(newer) }), .kept(target, build: 27))
+        XCTAssertEqual(AppInstall.peekabooVersion(target), releaseVersion(27))
+        XCTAssertNoThrow(try CodeSignature.check(target, requirement: adHoc))
+        XCTAssertEqual(try install(changing: { try put(newer) }, running: [false, false, true]), .running(target, build: 27))
+        XCTAssertEqual(AppInstall.peekabooVersion(target), releaseVersion(27))
+        // Another app put there meanwhile: undone too, and never touched.
+        XCTAssertThrowsError(try install(changing: { try put(another) })) { error in
+            XCTAssertEqual(AppInstall.failureReason(error), "Peekaboo.app in Applications is another app")
+        }
+        XCTAssertEqual(try UpdateInstaller.bundleInfo(target).identifier, "com.example.Peekaboo")
+        XCTAssertEqual(try resource(target), "resource of \(releaseVersion(28))")
+        // An older build put there meanwhile is replaced, like the one it replaced.
+        let older = try makeApp(directory.appendingPathComponent("Older/Peekaboo.app"), version: releaseVersion(24))
+        XCTAssertEqual(try install(changing: { try put(older) }), .installed)
+        XCTAssertEqual(AppInstall.peekabooVersion(target), releaseVersion(26))
+        // Started meanwhile: it keeps its bundle.
+        XCTAssertEqual(try install(changing: {}, running: [false, true]), .running(target, build: 25))
+        XCTAssertEqual(AppInstall.peekabooVersion(target), releaseVersion(25))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: target.deletingLastPathComponent().path),
+                       ["Peekaboo.app"], "nothing is left next to it")
     }
 
     func testNeverTouchesAnotherAppOfThatName() throws {
         try makeApp(target, version: releaseVersion(25), identifier: "com.example.Peekaboo")
         let app = try source(releaseVersion(26))
         XCTAssertThrowsError(try install(app, releaseVersion(26))) { error in
-            XCTAssertEqual(AppInstall.failureReason(error), "\(self.target.path) is another app")
+            XCTAssertEqual(AppInstall.failureReason(error), "Peekaboo.app in Applications is another app")
         }
         XCTAssertEqual(try UpdateInstaller.bundleInfo(target).identifier, "com.example.Peekaboo")
         XCTAssertEqual(try resource(target), "resource of \(releaseVersion(25))")
@@ -183,7 +294,7 @@ final class AppInstallTests: XCTestCase {
         // Edited after it was signed.
         try Data("tampered".utf8).write(to: app.appendingPathComponent("Contents/Resources/data.txt"))
         XCTAssertThrowsError(try install(app, releaseVersion(26))) { error in
-            XCTAssertTrue(AppInstall.failureReason(error).hasPrefix("the copy failed verification: "), "\(error)")
+            XCTAssertTrue(AppInstall.failureReason(error).hasPrefix("The copy failed verification: "), "\(error)")
         }
         XCTAssertEqual(AppInstall.peekabooVersion(target), releaseVersion(25))
         XCTAssertEqual(try resource(target), "resource of \(releaseVersion(25))")
@@ -255,15 +366,25 @@ final class AppInstallTests: XCTestCase {
         addTeardownBlock { _ = hdiutil(["detach", "-force", "-quiet", mountPoint.path]) }
         let mounted = mountPoint.appendingPathComponent("Peekaboo.app", isDirectory: true)
 
-        XCTAssertTrue(AppInstall.isOnReadOnlyVolume(mounted), "a disk image reads as read-only")
-        XCTAssertFalse(AppInstall.isOnReadOnlyVolume(app))
-        XCTAssertTrue(hasQuarantine(mounted.appendingPathComponent("Contents/MacOS/Peekaboo").path))
+        // The launch's check on the executable's path, as main.swift makes it (with the image under the scratch folder).
+        let executable = mounted.appendingPathComponent("Contents/MacOS/Peekaboo").path
+        XCTAssertTrue(AppInstall.isOnReadOnlyVolume(executable), "a disk image reads as read-only")
+        XCTAssertTrue(AppInstall.isOnReadOnlyVolume(mounted.path))
+        XCTAssertFalse(AppInstall.isOnReadOnlyVolume(app.path))
+        XCTAssertTrue(hasQuarantine(executable))
 
         let values = try mountPoint.resourceValues(forKeys: [.volumeIsReadOnlyKey, .volumeIsLocalKey])
         let volume = AppInstall.Volume(url: mountPoint, isReadOnly: values.volumeIsReadOnly == true,
                                        isLocal: values.volumeIsLocal == true)
+        // DiskArbitration tells a disk image from a drive: the startup disk is none.
+        XCTAssertTrue(AppInstall.isDiskImage(mountPoint))
+        XCTAssertFalse(AppInstall.isDiskImage(URL(fileURLWithPath: "/")))
+        XCTAssertFalse(AppInstall.isDiskImage(directory), "a folder of the startup disk")
         XCTAssertEqual(AppInstall.diskImages(in: [volume], under: directory.path + "/"), [mountPoint],
                        "a Peekaboo disk image, as the system describes it")
+        XCTAssertEqual(AppInstall.diskImages(in: [volume], under: directory.path + "/",
+                                             keeping: [mountPoint.appendingPathComponent("Peekaboo.app/Contents/Info.plist")]), [],
+                       "not while a file on it is shown")
 
         XCTAssertEqual(try install(mounted, releaseVersion(26)), .installed)
         XCTAssertEqual(AppInstall.peekabooVersion(target), releaseVersion(26))
@@ -287,18 +408,62 @@ final class AppInstallTests: XCTestCase {
         let older = try volume("Peekaboo 20261126-69a847")
         let first = try volume("Peekaboo", app: nil)  // 0.1.0's image was named "Peekaboo"
         try makeApp(first.url.appendingPathComponent("Peekaboo.app"), version: releaseVersion(1), shortVersion: "0.1.0", sign: false)
+        let drive = try volume("USB")  // read-only too (NTFS, a locked card), with a Peekaboo.app on it, but no disk image
+        let photos = try volume("Photos 2026")  // a read-only image of photos that ships a Peekaboo.app
         let volumes = [
-            current, older, first,
+            current, older, first, drive, photos,
             try volume("SSD", readOnly: false),                       // a writable drive the user keeps the app on
             try volume("Peekaboo Share", local: false),               // a network share
             try volume("Other", app: "com.example.Peekaboo"),         // another app of that name
             try volume("Photos", app: nil),                           // a read-only image without Peekaboo
             try volume("Elsewhere", at: directory.appendingPathComponent("mnt", isDirectory: true)),  // not under the root
         ]
-        XCTAssertEqual(AppInstall.diskImages(in: volumes, under: root.path + "/"), [current.url, older.url, first.url])
+        var asked: [String] = []
+        let isDiskImage = { (url: URL) -> Bool in
+            asked.append(url.lastPathComponent)
+            return url != drive.url
+        }
+        let shown = [photos.url.appendingPathComponent("IMG_0001.HEIC"), URL(fileURLWithPath: "/home/someone/b.jpg")]
+        XCTAssertEqual(AppInstall.diskImages(in: volumes, under: root.path + "/", keeping: shown, isDiskImage: isDiskImage),
+                       [current.url, older.url, first.url])
+        XCTAssertEqual(asked, [current, older, first, drive].map(\.url.lastPathComponent), "only Peekaboo images are asked about")
+        XCTAssertEqual(AppInstall.diskImages(in: volumes, under: root.path + "/", isDiskImage: isDiskImage),
+                       [current.url, older.url, first.url, photos.url], "once its photos are not shown")
         // By default only volumes under /Volumes count: never the system volume, nor one mounted elsewhere.
-        XCTAssertEqual(AppInstall.diskImages(in: volumes), [])
-        XCTAssertEqual(AppInstall.diskImages(in: [AppInstall.Volume(url: URL(fileURLWithPath: "/"), isReadOnly: true, isLocal: true)]), [])
+        asked = []
+        XCTAssertEqual(AppInstall.diskImages(in: volumes, isDiskImage: isDiskImage), [])
+        XCTAssertEqual(AppInstall.diskImages(in: [AppInstall.Volume(url: URL(fileURLWithPath: "/"), isReadOnly: true, isLocal: true)],
+                                             isDiskImage: isDiskImage), [])
+        XCTAssertEqual(asked, [])
+    }
+
+    // MARK: Processes
+
+    func testFindsTheProcessesThatRunABundle() throws {
+        // A bundle whose executable is a copy of sleep(1), running for the test.
+        let bundle = directory.appendingPathComponent("Running/Peekaboo.app", isDirectory: true)
+        let executable = bundle.appendingPathComponent("Contents/MacOS/Peekaboo")
+        try FileManager.default.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: URL(fileURLWithPath: "/bin/sleep"), to: executable)
+        XCTAssertEqual(AppInstall.processes(runningFrom: bundle), [])
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = ["30"]
+        do { try process.run() } catch { throw XCTSkip("cannot run a copy of sleep here: \(error)") }
+        defer { if process.isRunning { process.terminate() } }
+        XCTAssertEqual(AppInstall.processes(runningFrom: bundle), [process.processIdentifier])
+        XCTAssertEqual(AppInstall.processes(runningFrom: bundle.appendingPathComponent("Contents", isDirectory: true)),
+                       [process.processIdentifier], "anywhere inside")
+        // Neither a folder next to it whose name starts the same, nor a missing one.
+        let namesake = directory.appendingPathComponent("Running/Peekaboo", isDirectory: true)
+        try FileManager.default.createDirectory(at: namesake, withIntermediateDirectories: true)
+        XCTAssertEqual(AppInstall.processes(runningFrom: namesake), [])
+        XCTAssertEqual(AppInstall.processes(runningFrom: directory.appendingPathComponent("Missing.app", isDirectory: true)), [])
+        process.terminate()
+        process.waitUntilExit()
+        XCTAssertEqual(AppInstall.processes(runningFrom: bundle), [])
+        // Never this process: the test runner's own executable lies in its bundle.
+        XCTAssertFalse(AppInstall.processes(runningFrom: Bundle.main.bundleURL).contains(getpid()))
     }
 
     func testMountedVolumesListTheStartupDisk() {

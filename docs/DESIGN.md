@@ -247,22 +247,34 @@ viewers score 21–26 dB and alias 10–25× more.
   folder is refused, the window becoming key lists it again (back from System Settings), off the main thread.
 - One Peekaboo.app (`AppInstall`, `Installation`): a copy that runs from a disk image (a read-only volume under
   `/Volumes`) or from App Translocation's read-only path cannot update itself, and each downloaded version used to
-  leave one more Peekaboo. Such a copy builds no window: it keeps the launch's files (command line, open-documents
-  events) and, once launching has finished, a user-initiated queue installs it at `/Applications/Peekaboo.app`
-  (`~/Applications` when `/Applications` is not writable). An older or the same build there is replaced: copied into a
-  new folder on the target's volume, its quarantine flag removed (Gatekeeper would ask again, or translocate it),
-  verified like an update (identifier, version and build, the running app's signing requirement) and swapped in with
-  one `renamex_np(RENAME_SWAP)`; 21–128 ms from a quarantined UDZO image for the 4.4 MB release bundle, 14–53 ms of it
-  the signature check. A newer build is kept, a running copy is left alone and gets the files, another app of that
-  name is never touched. The copy then opens the files in the installed one, a new instance
-  (`NSWorkspace.OpenConfiguration.createsNewApplicationInstance`) started with `--eject-disk-images=<pid>` (it never
-  installs again), and quits. A second after launch, on a utility queue, the installed copy waits for that process to
-  exit and ejects every read-only local volume under `/Volumes` with a Peekaboo.app of this identifier at its top
+  leave one more Peekaboo. main.swift decides first, on `argv[0]`: two C string comparisons, 0.1–0.4 µs on the first
+  call (Foundation's `String.contains` on `Bundle.main.bundlePath` took 30–55 µs), plus one `statfs` for a path under
+  `/Volumes` (2.5–6.5 µs, so a copy kept on a writable drive stays where it is). Such a copy skips the GPU, ImageIO and
+  HEVC warm-ups and builds no window: it keeps the launch's files (command line, open-documents events) and, once
+  launching has finished, a user-initiated queue installs it at `/Applications/Peekaboo.app`, or at
+  `~/Applications/Peekaboo.app` when `/Applications` is not writable or the bundle there is not one the user may
+  replace (another app of that name, another account's copy). An older or the same build there is replaced: copied
+  into a new folder on the target's volume, its quarantine flag removed (Gatekeeper would ask again, or translocate
+  it), verified like an update (identifier, version and build, the running app's signing requirement) and swapped in
+  with one `renamex_np(RENAME_SWAP)`; 21–128 ms from a quarantined UDZO image for the 4.4 MB release bundle, 14–53 ms
+  of it the signature check. The target is checked again right before the swap, and the bundle the swap moved out
+  must be the one checked (not a newer build another installer put there meanwhile), or the swap is undone. A newer
+  build in either Applications folder (or the same build in the other one) is kept and gets the files; another app of
+  that name is never touched. Peekaboo stays open after its last window closes, so an older copy usually runs at the
+  target: it is quit (`NSRunningApplication.terminate`), and the install waits until no process runs that bundle
+  (`proc_pidpath` of every process, 1.6–2.3 ms a scan, so the update installer the quitting copy may start counts too)
+  for at most 10 s, then reads the target again; a copy that does not quit leaves Peekaboo here with a toast. A copy
+  of the same or a newer build that runs gets the files as they are. Otherwise the copy opens the files in the
+  installed one, a new instance (`NSWorkspace.OpenConfiguration.createsNewApplicationInstance`) started with
+  `--eject-disk-images=<pid>` (it never installs again; `--kept-newer` when nothing was installed), sends the files
+  opened meanwhile after them, and quits. A second after launch, on a utility queue, the installed copy waits for that
+  process to exit, quits the older Peekaboo copies that run from a disk image, and ejects every read-only local volume
+  under `/Volumes` with a Peekaboo.app of this identifier at its top that is a disk image (DiskArbitration's device
+  model, 0.24–0.41 ms: never an NTFS drive or a locked card) and holds no file it shows
   (`NSWorkspace.unmountAndEjectDevice`: 86 ms; an image still in use fails after ~1 s with `fBsyErr` and is tried
-  once more 2 s later), then says so in one toast that names the images left. If the install or the start fails, the
-  copy launches as usual, with a toast. A normal launch pays two C string comparisons on `argv[0]`, 0.3–0.6 µs on the
-  first call (Foundation's `String.contains` on `Bundle.main.bundlePath` took 30–55 µs); tests (headless),
-  `--selftest` and `PEEKABOO_ACTIONS` never install or eject.
+  once more 2 s later). One toast says which version is installed where and names the images left. If the install
+  or the start fails, the copy launches as usual, with a toast that gives the reason on its own line. Tests
+  (headless), `--selftest` and `PEEKABOO_ACTIONS` never install or eject.
 
 ### Animation
 
