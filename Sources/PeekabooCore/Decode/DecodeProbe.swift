@@ -21,6 +21,9 @@ struct DecodeProbe {
         let kind: Kind
         let info: ImageInfo
         let hasThumbnailItem: Bool
+        let hdrTransfer: Bool
+        let bitDepth: Int
+        let nclxMatrix: Int?
     }
 
     let source: CGImageSource
@@ -29,8 +32,18 @@ struct DecodeProbe {
     let info: ImageInfo
     /// HEIF thumbnail item(s) listed in the container (cheap embedded preview).
     let hasThumbnailItem: Bool
+    /// Pixels encoded with an HDR transfer function (BT.2100 PQ or HLG: 10-bit HEIF from cameras, HDR AVIF): shown
+    /// through ImageIO's tone-mapped SDR rendition, or decoded to HDR with `decodeHDR`.
+    let hdrTransfer: Bool
+    /// Bits per component as stored (`kCGImagePropertyDepth`; 8 when absent).
+    let bitDepth: Int
+    /// HEIF / AVIF: the YCbCr matrix the file declares (`HEIFColour`), nil when it declares none.
+    let nclxMatrix: Int?
 
-    var facts: Facts { Facts(index: index, kind: kind, info: info, hasThumbnailItem: hasThumbnailItem) }
+    var facts: Facts {
+        Facts(index: index, kind: kind, info: info, hasThumbnailItem: hasThumbnailItem, hdrTransfer: hdrTransfer,
+              bitDepth: bitDepth, nclxMatrix: nclxMatrix)
+    }
 
     static let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
 
@@ -41,17 +54,20 @@ struct DecodeProbe {
         kind = facts.kind
         info = facts.info
         hasThumbnailItem = facts.hasThumbnailItem
+        hdrTransfer = facts.hdrTransfer
+        bitDepth = facts.bitDepth
+        nclxMatrix = facts.nclxMatrix
     }
 
     init(url: URL) throws {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, Self.sourceOptions) else {
             throw DecodeError.unreadable(url.lastPathComponent)
         }
-        try self.init(source: source, url: url, jpegBytes: nil)
+        try self.init(source: source, url: url, bytes: nil)
     }
 
-    /// `jpegBytes`: in-memory JPEG (CR3 previews) to scan instead of the file.
-    init(source: CGImageSource, url: URL, jpegBytes: UnsafeRawBufferPointer?) throws {
+    /// `bytes`: the file in memory (CR3 previews: a JPEG, or a HEIF around HEVC tiles), read instead of `url`.
+    init(source: CGImageSource, url: URL, bytes: UnsafeRawBufferPointer?) throws {
         self.source = source
         let type = (CGImageSourceGetType(source) as String?) ?? ""
         guard !type.isEmpty else { throw DecodeError.unsupported(url.lastPathComponent) }
@@ -68,15 +84,17 @@ struct DecodeProbe {
         var kind = Kind.other
         var hasThumbnailItem = false
         var hasGainMap = false
+        var nclxMatrix: Int?
         let utType = UTType(type)
         if type == UTType.jpeg.identifier {
-            let scan = jpegBytes.flatMap { JPEGScan.scan(bytes: $0) } ?? JPEGScan.scan(url: url)
+            let scan = bytes.flatMap { JPEGScan.scan(bytes: $0) } ?? JPEGScan.scan(url: url)
             if let scan {
                 kind = .jpeg(scan)
                 hasGainMap = scan.gainMapHint || (scan.hasMPF && Self.auxiliaryGainMap(source, index))
             }
         } else if ["public.heic", "public.heif", "public.avif", "public.heics", "public.avci", "public.avis"].contains(type) {
             kind = .heif
+            nclxMatrix = bytes.map { HEIFColour.matrixCoefficients(file: $0) } ?? HEIFColour.matrixCoefficients(url: url)
             let container = Self.containerImage(source, index)
             hasThumbnailItem = !((container?[kCGImagePropertyThumbnailImages] as? [Any])?.isEmpty ?? true)
             if let aux = container?[kCGImagePropertyAuxiliaryData] as? [[CFString: Any]] {
@@ -97,6 +115,16 @@ struct DecodeProbe {
         exif["format"] = Self.formatName(kind: kind, type: type, make: tiff[kCGImagePropertyTIFFMake] as? String)
 
         let alpha = props[kCGImagePropertyHasAlpha] as? Bool ?? false
+        // Only deep images can carry PQ / HLG; the colour space comes from the lazy, header-only CGImage (not for RAW:
+        // creating one there sets up the RAW pipeline).
+        bitDepth = props[kCGImagePropertyDepth] as? Int ?? 8
+        var hdrTransfer = false
+        if bitDepth > 8, kind == .heif || kind == .other,
+           let image = CGImageSourceCreateImageAtIndex(source, index, Self.sourceOptions), let space = image.colorSpace {
+            hdrTransfer = CGColorSpaceUsesITUR_2100TF(space)
+        }
+        self.hdrTransfer = hdrTransfer
+        self.nclxMatrix = nclxMatrix
         self.kind = kind
         self.hasThumbnailItem = hasThumbnailItem
         info = ImageInfo(pixelWidth: width, pixelHeight: height, orientation: orientation, typeIdentifier: type,

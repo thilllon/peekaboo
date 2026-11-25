@@ -1,6 +1,7 @@
 import CPeekabooDecode
 import CoreGraphics
 import ImageIO
+import IOSurface
 import Metal
 import XCTest
 import zlib
@@ -349,6 +350,58 @@ final class PNGDecodeTests: XCTestCase {
             let image = try decoder.decode(url, tier: .full, targetLongSide: 0, pool: pool)
             XCTAssertNotEqual(image.pixels.layout, .rgba8, "\(url.lastPathComponent): ImageIO's path")
             XCTAssertEqual(image.pixels.width, w)
+        }
+    }
+
+    /// 16-bit PQ / HLG PNGs (ImageIO writes them with a BT.2100 profile) show ImageIO's tone-mapped SDR rendition in
+    /// Display P3, like PQ / HLG HEIF: the own decoder would hand over the PQ / HLG code values in their BT.2100 space
+    /// (0.7 here; the PQ rendition is 0.94), which the renderer shows far too dark.
+    func testHDRTransferPNGsShowTheirSDRRendition() throws {
+        let (w, h) = (64, 32)
+        for name in [CGColorSpace.itur_2100_PQ, CGColorSpace.itur_2100_HLG] {
+            var data = Data(count: w * h * 8)
+            data.withUnsafeMutableBytes { raw in
+                for i in 0..<(w * h * 4) {
+                    raw.storeBytes(of: UInt16(i % 4 == 3 ? 65535 : 45875).littleEndian, toByteOffset: i * 2, as: UInt16.self)
+                }
+            }
+            let image = try XCTUnwrap(CGImage(
+                width: w, height: h, bitsPerComponent: 16, bitsPerPixel: 64, bytesPerRow: w * 8,
+                space: try XCTUnwrap(CGColorSpace(name: name)),
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder16Little.rawValue),
+                provider: try XCTUnwrap(CGDataProvider(data: data as CFData)), decode: nil, shouldInterpolate: false,
+                intent: .defaultIntent))
+            let url = dir.appendingPathComponent("\(name).png")
+            let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil))
+            CGImageDestinationAddImage(destination, image, nil)
+            XCTAssertTrue(CGImageDestinationFinalize(destination))
+            guard try DecodeProbe(url: url).hdrTransfer else { throw XCTSkip("ImageIO wrote no BT.2100 transfer into the PNG") }
+            let source = try XCTUnwrap(CGImageSourceCreateWithURL(url as CFURL, nil))
+            let sdr = try XCTUnwrap(CGImageSourceCreateImageAtIndex(
+                source, 0, [kCGImageSourceDecodeRequest: kCGImageSourceDecodeToSDR] as CFDictionary))
+            let reference = try red(NativeImage.pixels(sdr, pool: pool, opaque: true))
+            if name == CGColorSpace.itur_2100_PQ { XCTAssertGreaterThan(reference, 0.8, "PQ: brighter than its code values") }
+            for (tier, target) in [(Tier.preview, 16), (.screen, 32), (.full, 0)] {
+                let pixels = try decoder.decode(url, tier: tier, targetLongSide: target, pool: pool).pixels
+                XCTAssertEqual(pixels.colorSpace.name, CGColorSpace.displayP3, "\(name) \(tier)")
+                XCTAssertEqual(try red(pixels), reference, accuracy: 0.02, "\(name) \(tier)")
+            }
+        }
+    }
+
+    /// Red of the centre pixel, 0…1, of a decoded buffer in any 8- or 16-bit RGB layout.
+    private func red(_ pb: PixelBuffer) throws -> Double {
+        if case .surface(let surface) = pb.storage { IOSurfaceLock(surface, .readOnly, nil) }
+        defer { if case .surface(let surface) = pb.storage { IOSurfaceUnlock(surface, .readOnly, nil) } }
+        let p = pb.baseAddress.advanced(by: pb.height / 2 * pb.bytesPerRow + pb.width / 2 * pb.layout.bytesPerPixel)
+        switch pb.layout {
+        case .rgba8: return Double(p.load(as: UInt8.self)) / 255
+        case .bgra8: return Double(p.load(fromByteOffset: 2, as: UInt8.self)) / 255
+        case .argb8: return Double(p.load(fromByteOffset: 1, as: UInt8.self)) / 255
+        case .rgba16: return Double(p.load(as: UInt16.self)) / 65535
+        case .rgba16f, .bgr10a2:
+            XCTFail("unexpected layout \(pb.layout)")
+            return -1
         }
     }
 

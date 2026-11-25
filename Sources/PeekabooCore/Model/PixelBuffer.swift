@@ -17,15 +17,24 @@ public enum PixelLayout: Sendable, Equatable {
     case rgba16
     /// 16-bit float RGBA, little-endian (HDR / extended range). Metal `.rgba16Float`.
     case rgba16f
+    /// 10-bit RGB packed in 32 bits, little-endian: blue in bits 0–9, green 10–19, red 20–29, 2 unused bits (always
+    /// opaque). 10-bit HEIF / AVIF decodes (`YCbCrConverter`). Metal `.bgr10a2Unorm`; CG `noneSkipFirst | byteOrder32Little`
+    /// at 10 bits per component.
+    case bgr10a2
 
     public var bytesPerPixel: Int {
         switch self {
-        case .rgba8, .bgra8, .argb8: return 4
+        case .rgba8, .bgra8, .argb8, .bgr10a2: return 4
         case .rgba16, .rgba16f: return 8
         }
     }
 
-    public var bitsPerComponent: Int { bytesPerPixel == 4 ? 8 : 16 }
+    public var bitsPerComponent: Int {
+        switch self {
+        case .bgr10a2: return 10
+        default: return bytesPerPixel == 4 ? 8 : 16
+        }
+    }
 
     /// Metal format to wrap the bytes with (pair with `metalSwizzle`).
     public var metalFormat: MTLPixelFormat {
@@ -34,6 +43,7 @@ public enum PixelLayout: Sendable, Equatable {
         case .bgra8: return .bgra8Unorm
         case .rgba16: return .rgba16Unorm
         case .rgba16f: return .rgba16Float
+        case .bgr10a2: return .bgr10a2Unorm
         }
     }
 
@@ -45,7 +55,7 @@ public enum PixelLayout: Sendable, Equatable {
         }
     }
 
-    /// CGBitmapInfo for drawing into a buffer of this layout (alpha premultiplied).
+    /// CGBitmapInfo for drawing into a buffer of this layout (alpha premultiplied; `.bgr10a2` has none).
     public var cgBitmapInfo: UInt32 {
         switch self {
         case .rgba8: return CGImageAlphaInfo.premultipliedLast.rawValue
@@ -55,6 +65,10 @@ public enum PixelLayout: Sendable, Equatable {
         case .rgba16f:
             return CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.floatComponents.rawValue
                 | CGBitmapInfo.byteOrder16Little.rawValue
+        case .bgr10a2:
+            // CoreGraphics' RGB101010 pixel format (no alpha: the layout is always opaque).
+            return CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+                | CGImagePixelFormatInfo.RGB101010.rawValue
         }
     }
 }
@@ -157,12 +171,14 @@ public final class PixelBufferPool: @unchecked Sendable {
     private var free: [Int: [MTLBuffer]] = [:]
     private var retainedBytes = 0
     private let lock = NSLock()
-    /// Allocation granularity: rounding sizes up improves reuse across aspect ratios.
-    private static let granule = 1 << 20
+    /// Allocation granularity: rounding sizes up improves reuse across aspect ratios (1 MB for decoded tiers; animation
+    /// frames, all of one size, use pages).
+    private let granule: Int
 
-    public init(device: MTLDevice, maxRetainedBytes: Int = 768 << 20) {
+    public init(device: MTLDevice, maxRetainedBytes: Int = 768 << 20, granule: Int = 1 << 20) {
         self.device = device
         self.maxRetainedBytes = maxRetainedBytes
+        self.granule = max(granule, 1)
     }
 
     public func rowBytes(width: Int, layout: PixelLayout) -> Int {
@@ -175,7 +191,7 @@ public final class PixelBufferPool: @unchecked Sendable {
                      colorSpace: CGColorSpace) -> PixelBuffer? {
         precondition(width > 0 && height > 0)
         let bpr = rowBytes(width: width, layout: layout)
-        let length = (bpr * height + Self.granule - 1) / Self.granule * Self.granule
+        let length = (bpr * height + granule - 1) / granule * granule
         guard let buffer = take(length) ?? device.makeBuffer(length: length, options: [.storageModeShared]) else {
             return nil
         }

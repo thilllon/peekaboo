@@ -203,7 +203,7 @@ final class KeyboardLayoutTests: XCTestCase {
         let harmless: (Action) -> Bool = { action in
             switch action {
             case .jump, .zoomIn, .zoomOut, .zoomSet, .zoomFit, .zoomFill, .zoomActual, .help, .config, .rotateClockwise,
-                 .rotateCounterClockwise, .flipHorizontal, .flipVertical:
+                 .rotateCounterClockwise, .flipHorizontal, .flipVertical, .frameNext, .framePrevious:
                 return true
             default:
                 return false
@@ -212,7 +212,7 @@ final class KeyboardLayoutTests: XCTestCase {
         let wanted: [[Action]] = [
             [.help], [.zoomIn], [.zoomOut], [.zoomActual], [.zoomFit], [.zoomFill], [.zoomSet(2)], [.zoomSet(4)],
             [.rate(1)], [.rate(1), .next], [.label("red")], [.move("1")], [.copy("1")], [.config], [.flipVertical],
-            [.rotateClockwise], [.rotateCounterClockwise],
+            [.rotateClockwise], [.rotateCounterClockwise], [.playPause], [.frameNext], [.framePrevious],
         ]
         for (name, installed) in found {
             var reached = Set<[Action]>()

@@ -60,9 +60,10 @@ brew install jpeg-turbo   # static libturbojpeg linked into PeekabooCore
 | `PEEKABOO_ACTIONS="nav.next,zoom.toggle,…"` | run action ids 1 s after launch, 400 ms apart (smoke runs, screenshots) |
 | `Peekaboo --selftest <folder>` | open the folder, measure launch → first frame and action → frame latency, print one JSON line, exit |
 | `PEEKABOO_NO_IOSURFACE_SPI=1` | force the public ImageIO path instead of the private IOSurface fast path |
-| `PEEKABOO_HDR=1` | decode gain-map photos to HDR (off by default: 13× the SDR cost) |
+| `PEEKABOO_HDR=1` | decode gain-map and PQ / HLG photos to HDR (off by default: 13× the SDR cost) |
 | `PEEKABOO_CONFIG=<file>` | use another config file |
 | `peekaboo-bench decode / pipeline [--cold] / render [--png DIR]` | regression benches (corpus from `PEEKABOO_CORPUS`, built by `mise run corpus`) |
+| `peekaboo-bench anim [file …]` | headless animation playback: on-screen duration vs declared delay, late frames, decode per frame, memory |
 
 ## Layout
 

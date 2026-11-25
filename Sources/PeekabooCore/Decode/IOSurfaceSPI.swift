@@ -25,11 +25,24 @@ enum IOSurfaceSPI {
     /// Whether the SPI is present at runtime (tests and the bench report it).
     static var isAvailable: Bool { create != nil }
 
-    /// Decode `index` of `source` into an IOSurface (`subsample` ∈ {1, 2, 4, 8}).
-    static func surface(_ source: CGImageSource, index: Int, subsample: Int) -> IOSurfaceRef? {
+    /// ImageIO's private `kCGImageSurfaceFormatRequest` option: asked for `'420f'`, an 8-bit HEIF decodes to its native
+    /// YCbCr instead of BGRA (12 MP 10 vs 32 ms, 50 MP 22 vs 83 ms: ImageIO's conversion runs on the CPU).
+    private static let formatRequestKey: CFString? = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "kCGImageSurfaceFormatRequest")
+        .map { $0.assumingMemoryBound(to: CFString.self).pointee }
+
+    /// Whether `surface(…, format:)` can ask for a pixel format.
+    static var canRequestFormat: Bool { create != nil && formatRequestKey != nil }
+
+    /// Decode `index` of `source` into an IOSurface (`subsample` ∈ {1, 2, 4, 8}). `request`: a
+    /// `kCGImageSourceDecodeRequest` value (`kCGImageSourceDecodeToSDR` for PQ / HLG images, which the SPI honours).
+    /// `format`: a surface pixel format to ask for (`canRequestFormat`).
+    static func surface(_ source: CGImageSource, index: Int, subsample: Int, request: CFString? = nil,
+                        format: OSType? = nil) -> IOSurfaceRef? {
         guard let create else { return nil }
         var options: [CFString: Any] = [kCGImageSourceShouldCache: false]
         if subsample > 1 { options[kCGImageSourceSubsampleFactor] = subsample }
+        if let request { options[kCGImageSourceDecodeRequest] = request }
+        if let format, let formatRequestKey { options[formatRequestKey] = NSNumber(value: format) }
         return create(source, index, options as CFDictionary)?.takeRetainedValue()
     }
 
@@ -40,7 +53,7 @@ enum IOSurfaceSPI {
         case 0x4247_5241: return IOSurfaceGetBytesPerElement(surface) == 4 ? .bgra8 : nil  // 'BGRA'
         case 0x6C36_3472: return IOSurfaceGetBytesPerElement(surface) == 8 ? .rgba16 : nil  // 'l64r' 16-bit RGBA LE
         case 0x5247_6841: return IOSurfaceGetBytesPerElement(surface) == 8 ? .rgba16f : nil  // 'RGhA' half float
-        default: return nil  // YCbCr ('xf20', '420f'), 10-bit, …: let the public path handle it
+        default: return nil  // bi-planar YCbCr ('xf20', '420f'): `YCbCrConverter`; anything else: the public path
         }
     }
 }

@@ -32,7 +32,8 @@
 Everything below was measured on a MacBook Pro M4 Pro (see [docs/research.md](docs/research.md)).
 
 - **Hardware decoding, zero copies.** Baseline JPEGs go through the Apple Silicon JPEG engines (24 MP in 50 ms vs 109 ms for
-  libjpeg-turbo), HEIC through the hardware HEVC decoder, and the decoded pixels are handed to the GPU without a single copy.
+  libjpeg-turbo), HEIC and AVIF through the hardware decoders with their YCbCr converted on the GPU (a 12 MP HEIC in 12 ms,
+  10-bit ones 20× faster than before), and the decoded pixels are handed to the GPU without a single copy.
 - **No slow format left behind.** PNGs go through Peekaboo's own decoder (inflate on one core, unfilter on another),
   about twice as fast as ImageIO with identical pixels: 24 MP in ~145 ms instead of ~300. Progressive JPEGs, which no
   hardware decodes, show their first-pass scans while the exact decode finishes on another core: a 101 MP photo looks
@@ -52,8 +53,12 @@ Everything below was measured on a MacBook Pro M4 Pro (see [docs/research.md](do
 
 ## Features
 
-- Opens one file and browses its whole folder in Finder order; JPEG, HEIC, AVIF, PNG, WebP, TIFF, GIF, JPEG XL, PSD, EXR and
-  camera RAW (embedded previews first).
+- Opens one file and browses its whole folder in Finder order; JPEG, HEIC / HEIF (10-bit and HDR PQ / HLG camera files,
+  grids, sequences, depth and Live Photo stills, `.hif`), AVIF, PNG, WebP, TIFF, GIF, JPEG XL, PSD, EXR and camera RAW
+  (embedded previews first).
+- Plays animated GIF, APNG, animated WebP and HEIC / AVIF sequences with their frame timing and loop counts: `k` pauses,
+  `,` and `.` step a frame. Stills pay nothing for it. (Large animated WebPs play below their frame rate: ImageIO
+  re-composites every WebP frame from the first one.)
 - Keyboard-first, fully remappable in a TOML file that reloads as you save it; shortcuts keep working with non-Latin input
   methods (Korean, Japanese, …).
 - Culling keys borrowed from Lightroom: 0–5 stars, 6–9 colour labels, P / X / U flags, Shift to act and advance — stored as
@@ -86,6 +91,7 @@ Opening one image browses its whole folder.
 | `f` / Return · Esc | instant full screen · leave |
 | `i` · Tab · `b` · `?` | HUD (minimal → EXIF) · hide overlays · background · all shortcuts |
 | `r` `shift+r` · `\|` `_` | rotate · flip |
+| `k` · `,` `.` | play / pause an animation · previous / next frame |
 | `0`–`5` · `6`–`9` · `p` `x` `u` (+Shift = and advance) | stars · colour labels · pick / reject / clear |
 | ⌘⌫ · ⌘Z | move to Trash · undo |
 | `m` · `c` · ⌥1–9 | move / copy to a slot |
@@ -109,13 +115,13 @@ mise run setup            # git hooks
 mise run install          # build the release app into ~/Applications
 ```
 
-`swift build`, `swift test`, `mise run app`, `mise run dmg`, `peekaboo-bench <decode|pipeline|render>`.
+`swift build`, `swift test`, `mise run app`, `mise run dmg`, `peekaboo-bench <anim|decode|pipeline|render>`.
 
 ## How it works
 
 | Module | Responsibility |
 |---|---|
-| `PeekabooCore` | decoding routes (ImageIO hardware paths, libjpeg-turbo lane, own PNG decoder, embedded previews), predictive prefetch scheduler, tiered cache, folder model, config & keymap |
+| `PeekabooCore` | decoding routes (ImageIO hardware paths, libjpeg-turbo lane, own PNG decoder, embedded previews), predictive prefetch scheduler, tiered cache, animation player, folder model, config & keymap |
 | `CPeekabooDecode` | C decoders where ImageIO is slow: PNG (system zlib, two-thread pipeline), early renditions of progressive JPEGs |
 | `PeekabooRender` | Metal renderer: zero-copy textures, Lanczos-3 pyramid, residual resampler, colour management, settle-time refinement |
 | `PeekabooApp` | AppKit shell: window, input, HUD, full screen, file actions |

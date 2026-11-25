@@ -71,6 +71,18 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             self?.afterGeometryChange()
         })
     private lazy var motion = MotionDriver(view: viewerView)
+    /// Paces the animation on screen (idle for stills).
+    private let animationClock: AnimationClock
+    /// The animated image on screen plays here; nil for stills, which pay nothing.
+    private var player: AnimationPlayer?
+    /// Frame of `player` on screen (nil: the pipeline's still of frame 0).
+    private var shownFrame: Int?
+    /// Playback paused because the window is hidden, occluded or minimised: it resumes when the window is visible.
+    private var pausedWhileHidden = false
+    /// Starts the animation on screen once a skim past it is over.
+    private var startAnimationWork: DispatchWorkItem?
+    /// When the full HUD last showed a playing frame: it follows playback at most 10 times a second.
+    private var frameHUDUpdated: UInt64 = 0
 
     /// Open requests from the window (drag & drop) and the `app.open` action.
     var onOpenURLs: (([URL]) -> Void)?
@@ -176,6 +188,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         window.contentView = rootView
         renderer = Renderer(layer: viewerView.metalLayer)
         hud = HUD(parent: viewerView.overlayLayer)
+        animationClock = AnimationClock(view: viewerView)
         let pool = PixelBufferPool(device: RenderContext.shared.device)
         let pipelineConfig = Self.pipelineConfig(
             configStore.config, base: PipelineConfig(screenLongSide: Self.largestScreenLongSide()))
@@ -196,6 +209,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         motion.onActiveChanged = { [weak self] active in
             if active { self?.gate.acquire() } else { self?.gate.release() }
         }
+        animationClock.onTick = { [weak self] target, period in self?.animationTick(target: target, period: period) }
         installKeyMonitor()
         installSystemObservers()
         tracksFrames = Trace.enabled
@@ -210,6 +224,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
         memoryPressure?.cancel()
         motion.invalidate()
+        animationClock.invalidate()
+        player?.stop()
     }
 
     /// Apply a (re)loaded configuration.
@@ -410,6 +426,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
 
     /// Nothing to show: an empty folder, or no file opened yet.
     func showEmpty(_ folder: URL?) {
+        stopAnimation()
         replaceFiles([], index: 0)
         shownFile = nil
         shownTier = nil
@@ -432,7 +449,12 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         wakeFromClosed()
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
-        if pipeline.currentFile == nil, shownFile == nil { showEmpty(nil) } else { renderFrame() }
+        if pipeline.currentFile == nil, shownFile == nil {
+            showEmpty(nil)
+        } else {
+            presentCurrent()   // an animation closed with the window shows its still again and plays from there
+            renderFrame()
+        }
     }
 
     // MARK: Pipeline → screen
@@ -475,6 +497,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         // A new version of the file on screen is another image to the renderer: it must not keep the old version's
         // geometry, texture or canvas while the new one's pyramid builds.
         if shownFile == file, !isShowing(file) { contentRevision &+= 1 }
+        // Another file, another version of it, or its error: the animation on screen ends.
+        if let player, player.url != file.url || !isShowing(file) || image == nil { stopAnimation() }
         renderer.setImage(image, key: RenderKey(url: file.url, revision: contentRevision))
         shownFile = file
         shownTier = image?.tier
@@ -605,6 +629,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         let t2 = Trace.now()
         requestFullResolutionIfNeeded()
         prepareNeighbours()
+        startAnimationIfNeeded(file)
         updateHUD()
         if Trace.enabled {
             Trace.log(String(format: "show main thread: setImage %.3f  render %.3f  hud %.3f ms",
@@ -731,6 +756,10 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         if let info, info.hasGainMap { format = (format ?? "") + " · HDR gain map" }
         if let info, info.frameCount > 1 { format = (format ?? "") + " · \(info.frameCount) frames" }
         add("Format", format)
+        if let player, player.url == file.url {
+            add("Frame", "\(player.index + 1)/\(player.frameCount)"
+                + (player.isPlaying ? "" : player.isFinished ? " · ended" : " · paused"))
+        }
         if let info {
             let mp = Double(info.pixelWidth * info.pixelHeight) / 1e6
             add("Pixels", "\(info.orientedWidth)×\(info.orientedHeight) (\(String(format: "%.1f", mp)) MP)")
@@ -879,7 +908,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// Actions that run again on key auto-repeat (a held pan key moves from key state instead).
     private static func repeats(_ action: Action) -> Bool {
         switch action {
-        case .next, .previous, .jump, .zoomIn, .zoomOut: return true
+        case .next, .previous, .jump, .zoomIn, .zoomOut, .frameNext, .framePrevious: return true
         default: return false
         }
     }
@@ -936,6 +965,9 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         case .rotateCounterClockwise: renderer.rotate(clockwise: false); afterGeometryChange()
         case .flipHorizontal: renderer.flip(horizontal: true); renderFrame()
         case .flipVertical: renderer.flip(horizontal: false); renderFrame()
+        case .playPause: togglePlayback()
+        case .frameNext: stepFrame(1)
+        case .framePrevious: stepFrame(-1)
         case .background:
             let all = Background.allCases
             let next = all[((all.firstIndex(of: renderer.settings.background) ?? 0) + 1) % all.count]
@@ -1055,6 +1087,168 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private func isInBrowsingSet(_ file: ImageFile) -> Bool {
         if case .files = browseSource { return true }
         return isInBrowsedFolder(file.url)
+    }
+
+    // MARK: Animation
+
+    /// Decoded frames an animation keeps: all of them when they fit (later loops decode nothing), else a window ahead.
+    private var animationBudget: Int { min(pipeline.config.screenBudget / 8, 256 << 20) }
+
+    /// `file` shows its first pixels: play it if it is an animation, once a skim past it is over and while the window is
+    /// visible (`visibilityChanged` starts it later), on an exact tier (an early rendition's exact decode shows, and
+    /// starts it, next). `asked`: a play / step action, which starts it in any case.
+    private func startAnimationIfNeeded(_ file: ImageFile, asked: Bool = false) {
+        guard player == nil, file == pipeline.currentFile, let info = pipeline.info(for: file), info.isAnimated,
+              AnimationPlayer.fits(info, budgetBytes: animationBudget) else { return }
+        startAnimationWork?.cancel()
+        startAnimationWork = nil
+        guard asked || (isWindowVisible && !shownApproximate) else { return }
+        if !asked, pipeline.isSkimming {
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.isShowing(file) else { return }
+                self.startAnimationIfNeeded(file)
+            }
+            startAnimationWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(pipeline.config.tuning.skimIntervalMs) + 2),
+                                          execute: work)
+            return
+        }
+        let player = AnimationPlayer(url: file.url, info: info, device: pipeline.pool.device, budgetBytes: animationBudget)
+        player.onFrameDecoded = { [weak self, weak player] i in
+            guard let self, let player, player === self.player else { return }
+            if player.isPlaying {
+                self.animationClock.schedule(player.deadline)   // the first frame also brings the timing
+            } else if i == player.index, self.shownFrame != i, let frame = player.frame(i) {
+                self.showFrame(frame, index: i, playing: false)   // the frame a step asked for
+            }
+        }
+        player.onFailed = { [weak self, weak player] _ in
+            guard let self, let player, player === self.player else { return }
+            self.animationStateChanged()
+        }
+        self.player = player
+        shownFrame = nil
+        player.start(at: CACurrentMediaTime())
+        animationStateChanged()
+        Trace.log("animation \(file.name): \(info.frameCount) frames, \(player.keepsAllFrames ? "every frame kept" : "a window kept")")
+    }
+
+    private func stopAnimation() {
+        startAnimationWork?.cancel()
+        startAnimationWork = nil
+        guard let player else { return }
+        player.stop()
+        self.player = nil
+        // A frame of the player is on screen: the pipeline's still replaces it on the next present.
+        if shownFrame != nil {
+            shownTier = nil
+            shownApproximate = false
+        }
+        shownFrame = nil
+        pausedWhileHidden = false
+        animationClock.schedule(nil)
+        renderer.isAnimating = false
+    }
+
+    /// Playing, paused or finished: pace the clock, present vsync-aligned while playing, refine the frame on screen to
+    /// full quality when it stops, refresh the HUD.
+    private func animationStateChanged() {
+        guard let player else { return }
+        renderer.isAnimating = player.isPlaying
+        animationClock.schedule(player.isPlaying ? player.deadline : nil)
+        if !player.isPlaying, let i = shownFrame, let frame = player.frame(i) {
+            renderer.setFrame(frame, playing: false)
+            setNeedsRender()
+        }
+        updateHUD()
+    }
+
+    private func animationTick(target: CFTimeInterval, period: CFTimeInterval) {
+        guard let player else {
+            animationClock.schedule(nil)
+            return
+        }
+        if let frame = player.advance(to: target, tolerance: period / 2) {
+            showFrame(frame, index: player.index, playing: true)
+        }
+        if player.isPlaying { animationClock.schedule(player.deadline) } else { animationStateChanged() }
+    }
+
+    private func showFrame(_ frame: DecodedImage, index: Int, playing: Bool) {
+        renderer.setFrame(frame, playing: playing)
+        // Frames are exact: an early rendition shown before must not outlive them (neighbours would stay unprepared, and
+        // its exact tier would replace the frame).
+        shownTier = .full
+        shownApproximate = false
+        shownFrame = index
+        renderFrame()
+        guard hud.mode == .full, !playing || Trace.ms(since: frameHUDUpdated) >= 100 else { return }
+        frameHUDUpdated = Trace.now()
+        updateHUD()
+    }
+
+    /// The player of the image on screen, started now if it is an animation that has not started yet.
+    private func currentPlayer() -> AnimationPlayer? {
+        if player == nil, let file = pipeline.currentFile, isShowing(file) { startAnimationIfNeeded(file, asked: true) }
+        return player
+    }
+
+    private func togglePlayback() {
+        // An animation that has not started yet (a skim just ended on it, the window was hidden) starts playing.
+        let wasPlaying = self.player?.isPlaying ?? false
+        guard let player = currentPlayer() else {
+            hud.showToast(noPlayerToast)
+            return
+        }
+        pausedWhileHidden = false
+        if wasPlaying {
+            player.pause()
+            hud.showToast("Paused · frame \(player.index + 1)/\(player.frameCount)")
+        } else {
+            if !player.isPlaying, let frame = player.play(at: CACurrentMediaTime()) {
+                showFrame(frame, index: player.index, playing: true)
+            }
+            hud.showToast("Playing")
+        }
+        animationStateChanged()
+    }
+
+    private func stepFrame(_ delta: Int) {
+        guard let player = currentPlayer() else {
+            hud.showToast(noPlayerToast)
+            return
+        }
+        pausedWhileHidden = false
+        if let frame = player.step(delta) { showFrame(frame, index: player.index, playing: false) }
+        animationStateChanged()
+    }
+
+    /// Why a play / step key found no player: the image is a still, or an animation too large to play.
+    private var noPlayerToast: String {
+        guard let file = pipeline.currentFile, let info = pipeline.info(for: file), info.isAnimated,
+              !AnimationPlayer.fits(info, budgetBytes: animationBudget) else { return "Not an animation" }
+        return "Too large to animate"
+    }
+
+    private var isWindowVisible: Bool {
+        guard let window else { return false }
+        return window.isVisible && !window.isMiniaturized && window.occlusionState.contains(.visible)
+    }
+
+    private func visibilityChanged() {
+        guard let player else {
+            if isWindowVisible, let file = pipeline.currentFile, isShowing(file) { startAnimationIfNeeded(file) }
+            return
+        }
+        if !isWindowVisible, player.isPlaying {
+            player.pause()
+            pausedWhileHidden = true
+            animationStateChanged()
+        } else if isWindowVisible, pausedWhileHidden {
+            pausedWhileHidden = false
+            if let frame = player.play(at: CACurrentMediaTime()) { showFrame(frame, index: player.index, playing: true) }
+            animationStateChanged()
+        }
     }
 
     // MARK: Zoom & pan
@@ -1234,6 +1428,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     // MARK: NSWindowDelegate
 
     func windowWillClose(_ notification: Notification) {
+        stopAnimation()
         exitInstantFullscreen(reorder: false)
         motion.releaseAllKeys()
         motion.stopMomentum()
@@ -1259,6 +1454,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
 
     func windowDidChangeScreen(_ notification: Notification) {
         motion.screenChanged()
+        animationClock.screenChanged()
         if instantFullscreen != nil, let screen = window?.screen {
             window?.setFrame(screen.frame, display: true)
             rootView.topInset = notchInset(screen)
@@ -1349,11 +1545,16 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         observers.append(center.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
             self?.screensChanged()
         })
+        // Hidden, occluded (another window, a locked screen) or minimised: the animation pauses.
+        observers.append(center.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main) { [weak self] _ in
+            self?.visibilityChanged()
+        })
         let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .main)
         source.setEventHandler { [weak self, weak source] in
             guard let self, let source else { return }
             let critical = source.data.contains(.critical)
             Trace.log("memory pressure: \(critical ? "critical" : "warning")")
+            self.player?.trimToCurrent()
             self.pipeline.handleMemoryPressure(critical: critical)
         }
         source.activate()

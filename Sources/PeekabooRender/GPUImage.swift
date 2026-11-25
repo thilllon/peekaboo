@@ -63,6 +63,8 @@ final class GPUImage {
     private var cancelledFlag = false
     private var buildStarted = false
     private var pendingPyramid: RenderContext?
+    /// A frame of a playing animation: no pyramid until playback pauses on it (`Renderer.setFrame`).
+    var defersPyramid = false
     /// Retains the bytesNoCopy wrapper of an IOSurface that the tiles of a tiled surface view (never read).
     private var surfaceBuffer: MTLBuffer?
 
@@ -232,7 +234,7 @@ final class GPUImage {
     /// Start building the pyramid on the background queue (idempotent). After `dropLevels` it continues from the
     /// highest level kept.
     func startPyramid(context: RenderContext) {
-        guard !buildStarted, isUsable, maxLevel >= firstLevel, readyLevel < maxLevel else { return }
+        guard !defersPyramid, !buildStarted, isUsable, maxLevel >= firstLevel, readyLevel < maxLevel else { return }
         guard colorReady else { pendingPyramid = context; return }
         buildStarted = true
         let start = readyLevel >= firstLevel ? readyLevel + 1 : firstLevel

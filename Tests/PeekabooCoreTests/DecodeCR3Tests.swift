@@ -358,8 +358,8 @@ final class DecodeCR3Tests: XCTestCase {
     }
 
     /// The EOS R5 Mark II in HDR PQ stores its full-size rendition as 4 × 6 HEVC tiles of 2048 × 960. `.screen` now
-    /// decodes it on the hardware HEVC path (M4 Pro, release: 88 ms) instead of decoding the RAW (421 ms, 16-bit),
-    /// and shows the same picture as the PRVW preview.
+    /// decodes it on the hardware HEVC path (M4 Pro, release: 48 ms as native YCbCr, 75 ms through ImageIO's SDR
+    /// CGImage) instead of decoding the RAW (421 ms, 16-bit), and shows the same picture as the PRVW preview.
     func testCorpusCR3ScreenTierFromHEVCGrid() throws {
         let url = try corpusCR3()
         guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("no Metal device") }
