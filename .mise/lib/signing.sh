@@ -75,6 +75,7 @@ notary_auth() {
     echo "notarytool profile $profile cannot be read (locked screen?): using the App Store Connect API key" >&2
     NOTARY_AUTH=(--key "$key" --key-id "$APP_STORE_CONNECT_API_KEY_ID" --issuer "$APP_STORE_CONNECT_API_ISSUER_ID")
   else
+    echo "notarytool profile $profile cannot be read and no App Store Connect API key is set (.env.production)" >&2
     NOTARY_AUTH=(--keychain-profile "$profile")  # notarytool says what is missing
   fi
 }
