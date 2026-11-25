@@ -46,10 +46,10 @@ brew install jpeg-turbo   # static libturbojpeg linked into PeekabooCore
 |---|---|
 | Debug build | `swift build` (`mise run build`) |
 | Unit tests | `swift test` (`mise run test`) |
-| Release app bundle | `mise run app` → `build/Peekaboo.app` (version: today, `VERSION=` overrides) |
+| Release app bundle | `mise run app` → `build/Peekaboo.app` (version and build number of `HEAD`; `VERSION=` / `BUILD=` override) |
 | Install locally | `mise run install` → `~/Applications/Peekaboo.app` + `peekaboo` CLI in `~/.local/bin` |
 | DMG + updater zip | `mise run dmg` → `build/Peekaboo-<version>.dmg`, `build/Peekaboo-<version>.zip` |
-| Release | `mise run release`: date version, notarized DMG, tag, GitHub Release (see [Releases](#releases)) |
+| Release | `mise run release`: version of `HEAD`, notarized DMG, tag `v<version>`, GitHub Release (see [Releases](#releases)) |
 | Secret scan (history + tree) | `mise run secrets` |
 | Latency trace | `PEEKABOO_TRACE=1 build/Peekaboo.app/Contents/MacOS/Peekaboo <image>` |
 | Benchmark corpus | `mise run corpus` → `~/Library/Caches/peekaboo-corpus` (override with `PEEKABOO_CORPUS`) |
@@ -82,32 +82,40 @@ brew install jpeg-turbo   # static libturbojpeg linked into PeekabooCore
 - `Sources/PeekabooApp` — programmatic AppKit shell (no storyboards, nibs or SwiftUI); `Settings/` is the Settings
   window, which writes config.toml through `ConfigEditor` (minimal text edits) and is built on first use only.
 - `Sources/PeekabooBench` — `peekaboo-bench` performance regression CLI.
-- `Resources/Info.plist` — bundle metadata and document types; `Resources/peekaboo` — CLI launcher shipped in the bundle; `.mise/tasks/` — app bundle, DMG, install and release tasks (`.mise/lib/signing.sh`: signing and notarization helpers).
+- `Resources/Info.plist` — bundle metadata and document types; `Resources/peekaboo` — CLI launcher shipped in the bundle; `.mise/tasks/` — app bundle, DMG, install and release tasks (`.mise/lib/signing.sh`: signing and notarization helpers; `.mise/lib/version.sh`: version and build number of `HEAD`).
 
 ## Releases
 
-Versions are dates: `YYYYMMDD`, and `YYYYMMDD.N` for a further release the same day. The git tag is the bare
-version (`20261125`, no `v`), the release title `Peekaboo 20261125`; the legacy `v0.1.0` is older than every date.
-`CFBundleShortVersionString` and `CFBundleVersion` both hold the version, `PeekabooCommit` the short commit (About
-panel, `peekaboo --version`, and the Settings window through `BuildInfo.versionLine`).
+A version is `YYYYMMDD-<sha6>` of the released commit: its committer day in Asia/Seoul
+(`TZ=Asia/Seoul git show -s --format=%cd --date=format-local:%Y%m%d HEAD`) and the first six hex digits of its SHA,
+e.g. `20261125-ab2342`. One commit always gets one version, on any machine; there is no same-day counter. It is
+`CFBundleShortVersionString` (About panel, `peekaboo --version`, and the Settings window through
+`BuildInfo.versionLine`), the disk image `Peekaboo-<version>.dmg`,
+the tag `v<version>` and the release title `Peekaboo <version>`. A SHA is not orderable, so `CFBundleVersion` is the
+**build number**, `git rev-list --count HEAD` on `main`, and the updater compares only that: a release must have a
+higher build than the latest one, and an update must carry the build its `latest.json` names.
 
 One-time setup on the maintainer's Mac (never commit any of it):
 
 1. A **Developer ID Application** certificate in the login keychain: Xcode › Settings › Accounts › the team ›
    Manage Certificates… › + › Developer ID Application (the Account Holder can create it). Check with
    `security find-identity -v -p codesigning`.
-2. A **notarytool keychain profile** named `peekaboo-notary` (`NOTARY_PROFILE=` picks another):
-   `xcrun notarytool store-credentials peekaboo-notary --apple-id <Apple ID> --team-id <TEAMID>` with an
-   app-specific password from account.apple.com (or `--key/--key-id/--issuer` for an App Store Connect API key).
+2. A **notarytool keychain profile** named `peekaboo` (`NOTARY_PROFILE=` picks another):
+   `xcrun notarytool store-credentials peekaboo --key <AuthKey_….p8> --key-id <key ID> --issuer <issuer ID>` for an
+   App Store Connect API key (or `--apple-id <Apple ID> --team-id <TEAMID>` with an app-specific password).
+3. Optionally `.env.production` (git-ignored, mode 600, keys as in `.env.example`): the release tasks read
+   `DEVELOPER_ID_SHA1` (the identity to sign with), `NOTARY_KEYCHAIN_PROFILE` and `APPLE_TEAM_ID` (the team the
+   release must be signed by) from it; without it they use the keychain's Developer ID and the profile `peekaboo`.
 
 `mise run release`, from a clean `main` in sync with `origin/main`:
 
-1. picks the version: today, or the next free `.N` (`mise run release 20261125.2` names one; it must be newer);
+1. takes the version and build number of `HEAD`; stops if its tag exists or its build is not above the latest
+   release's (from that release's `latest.json`);
 2. builds `build/Peekaboo.app`, signed with the Developer ID (hardened runtime, no entitlements, secure timestamp);
 3. zips it, notarizes the zip, staples the app and zips it again: `Peekaboo-<v>.zip`, the updater's payload;
 4. builds `Peekaboo-<v>.dmg` (volume `Peekaboo <v>`, the app and an Applications link), signs, notarizes, staples it;
-5. writes `latest.json` (`version`, `minimumSystemVersion`, `url`, `sha256`, `size`, `dmg`, `notes`, `published`);
-6. tags, pushes the tag and publishes the GitHub Release with `Peekaboo-<v>.dmg`, `Peekaboo.dmg` (same bytes, for the
+5. writes `latest.json` (`version`, `build`, `minimumSystemVersion`, `url`, `sha256`, `size`, `dmg`, `notes`, `published`);
+6. tags `v<version>`, pushes the tag and publishes the GitHub Release with `Peekaboo-<v>.dmg`, `Peekaboo.dmg` (same bytes, for the
    README's `releases/latest/download/Peekaboo.dmg` link), `Peekaboo-<v>.zip` and `latest.json`.
 
 Without a Developer ID it refuses to publish unless `ALLOW_ADHOC=1` (other Macs then need "Open Anyway").

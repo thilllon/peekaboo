@@ -4,12 +4,14 @@ import Foundation
 /// `https://github.com/thilllon/peekaboo/releases/latest/download/latest.json`:
 ///
 /// ```json
-/// {"version": "20261125", "minimumSystemVersion": "26.0",
-///  "url": "https://github.com/thilllon/peekaboo/releases/download/20261125/Peekaboo-20261125.zip",
+/// {"version": "20261125-ab2342", "build": 35, "minimumSystemVersion": "14.0",
+///  "url": "https://github.com/thilllon/peekaboo/releases/download/v20261125-ab2342/Peekaboo-20261125-ab2342.zip",
 ///  "sha256": "…64 hex digits…", "size": 2412345,
-///  "dmg": "https://github.com/thilllon/peekaboo/releases/download/20261125/Peekaboo-20261125.dmg",
-///  "notes": "https://github.com/thilllon/peekaboo/releases/tag/20261125", "published": "2026-11-25T09:30:00Z"}
+///  "dmg": "https://github.com/thilllon/peekaboo/releases/download/v20261125-ab2342/Peekaboo-20261125-ab2342.dmg",
+///  "notes": "https://github.com/thilllon/peekaboo/releases/tag/v20261125-ab2342", "published": "2026-11-25T09:30:00Z"}
 /// ```
+///
+/// `version` is the name shown to the user, `build` the `CFBundleVersion` that orders releases (see `AppVersion`).
 public struct UpdateManifest: Equatable, Sendable {
     public let version: AppVersion
     /// `LSMinimumSystemVersion` of the release, e.g. `26.0`.
@@ -31,6 +33,7 @@ public struct UpdateManifest: Equatable, Sendable {
 
     private struct Fields: Decodable {
         let version: String
+        let build: Int
         let minimumSystemVersion: String
         let url: String
         let sha256: String
@@ -49,8 +52,8 @@ public struct UpdateManifest: Equatable, Sendable {
         } catch {
             throw UpdateError.invalidManifest("not a release manifest")
         }
-        guard let version = AppVersion(fields.version) else {
-            throw UpdateError.invalidManifest("bad version \"\(fields.version)\"")
+        guard let version = AppVersion(name: fields.version, build: fields.build) else {
+            throw UpdateError.invalidManifest("bad version \"\(fields.version)\" (build \(fields.build))")
         }
         guard Self.systemVersion(fields.minimumSystemVersion) != nil else {
             throw UpdateError.invalidManifest("bad minimumSystemVersion \"\(fields.minimumSystemVersion)\"")

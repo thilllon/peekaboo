@@ -231,10 +231,10 @@ final class SettingsWindowTests: ViewerTestCase {
     /// `[updates]` is read like every table (no unknown-key warning); the pane shows the updater's status when it opens
     /// and each one it posts after, and Check Now asks the updater through its notification.
     func testUpdatesPaneFollowsTheUpdater() throws {
-        let controller = try makeController(toml: "", updateStatus: { "Peekaboo 20261125 · checks for updates automatically" })
+        let controller = try makeController(toml: "", updateStatus: { "Peekaboo 20261125-000025 · checks for updates automatically" })
         controller.select(.updates)
         let pane = try XCTUnwrap(controller.pane(.updates) as? UpdatesPane)
-        XCTAssertEqual(pane.status.stringValue, "Peekaboo 20261125 · checks for updates automatically", "the status now")
+        XCTAssertEqual(pane.status.stringValue, "Peekaboo 20261125-000025 · checks for updates automatically", "the status now")
         try checkbox("Check for updates automatically", in: pane.view).performClick(nil)
         XCTAssertTrue(spin(3) { !self.store.config.updates.check }, "written and applied")
         XCTAssertEqual(fileText(), "[updates]\ncheck = false\n")
@@ -245,8 +245,8 @@ final class SettingsWindowTests: ViewerTestCase {
         XCTAssertTrue(checkNow.isEnabled)
         checkNow.performClick(nil)
         wait(for: [checked], timeout: 1)
-        NotificationCenter.default.post(name: Updater.statusNotification, object: nil, userInfo: ["status": "Up to date (20261125)"])
-        XCTAssertEqual(pane.status.stringValue, "Up to date (20261125)")
+        NotificationCenter.default.post(name: Updater.statusNotification, object: nil, userInfo: ["status": "Up to date (20261125-000025)"])
+        XCTAssertEqual(pane.status.stringValue, "Up to date (20261125-000025)")
     }
 
     /// Without an updater (a development build) Check Now is off; the updater's first status turns it on (it starts a
@@ -268,17 +268,17 @@ final class SettingsWindowTests: ViewerTestCase {
     /// Settings › Updates against a real updater (a fake Peekaboo.app and a manifest file, no network): the status when
     /// the pane opens, Check Now, and the outcome.
     func testCheckNowRunsTheUpdatersCheck() throws {
-        try publishManifest(in: root, version: "20261125")
+        try publishManifest(in: root, version: releaseVersion(25))
         defer { unsetenv("PEEKABOO_UPDATE_URL") }
-        let updater = try XCTUnwrap(Updater(settings: AppConfig.Updates(check: false), bundle: try fakePeekabooApp(in: root, version: "20261125"),
+        let updater = try XCTUnwrap(Updater(settings: AppConfig.Updates(check: false), bundle: try fakePeekabooApp(in: root, version: releaseVersion(25)),
                                             cache: root.appendingPathComponent("cache")))
         let updates = UpdateController(updater: updater) { nil }
         let controller = try makeController(toml: "[updates]\ncheck = false\n", updateStatus: { updater.status })
         controller.select(.updates)
         let pane = try XCTUnwrap(controller.pane(.updates) as? UpdatesPane)
-        XCTAssertEqual(pane.status.stringValue, "Peekaboo 20261125 · automatic update checks are off")
+        XCTAssertEqual(pane.status.stringValue, "Peekaboo 20261125-000025 · automatic update checks are off")
         try XCTUnwrap(pane.checkNow).performClick(nil)
-        XCTAssertTrue(spin(10) { pane.status.stringValue == "Up to date (20261125)" }, pane.status.stringValue)
+        XCTAssertTrue(spin(10) { pane.status.stringValue == "Up to date (20261125-000025)" }, pane.status.stringValue)
         XCTAssertEqual(updater.phase, .upToDate)
         withExtendedLifetime(updates) {}
     }

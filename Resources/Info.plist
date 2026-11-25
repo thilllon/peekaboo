@@ -110,7 +110,7 @@
 	<string>Peekaboo</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
-	<!-- CFBundleShortVersionString, CFBundleVersion (YYYYMMDD[.N]) and PeekabooCommit are set by .mise/tasks/app. -->
+	<!-- .mise/tasks/app sets CFBundleShortVersionString (YYYYMMDD-<sha6>) and CFBundleVersion (commit count). -->
 	<key>CFBundleShortVersionString</key>
 	<string>0</string>
 	<key>CFBundleVersion</key>

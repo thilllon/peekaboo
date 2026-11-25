@@ -1,6 +1,6 @@
 import AppKit
 
-/// Non-modal notice at the bottom of the viewer window, e.g. "Peekaboo 20261126 is ready  [Restart to Update]
+/// Non-modal notice at the bottom of the viewer window, e.g. "Peekaboo 20261126-ab2342 is ready  [Restart to Update]
 /// [Later]". Created only when there is an update to act on (never during launch); frames are set by hand, so
 /// the window keeps its constraint-free layout. It takes no keys: the viewer's key monitor keeps every binding.
 final class UpdateBanner: NSView {

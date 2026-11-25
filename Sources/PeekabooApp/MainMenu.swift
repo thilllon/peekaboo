@@ -43,7 +43,7 @@ enum MainMenu {
         appMenu.addItem(withTitle: "About Peekaboo", action: #selector(AppDelegate.showAbout(_:)), keyEquivalent: "").target = target
         appMenu.addItem(withTitle: "Check for Updates…", action: #selector(AppDelegate.checkForUpdates(_:)), keyEquivalent: "")
             .target = target
-        // "Update to 20261126…" / "Restart to Update to …": shown while an update is available (`UpdateController`).
+        // "Update to 20261126-ab2342…" / "Restart to Update to …": shown while an update is available (`UpdateController`).
         let update = appMenu.addItem(withTitle: "Update", action: #selector(AppDelegate.performUpdate(_:)), keyEquivalent: "")
         update.target = target
         update.identifier = updateItem

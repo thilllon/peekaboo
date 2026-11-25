@@ -35,7 +35,7 @@ final class Updater {
     /// The verified update waiting to be installed (main thread). Unlike `phase` it survives a re-check that is in
     /// flight or fails, so quitting at that moment still installs it.
     private(set) var ready: (manifest: UpdateManifest, app: URL)?
-    /// One line for the Settings window and the toasts, e.g. `Up to date (20261125)`.
+    /// One line for the Settings window and the toasts, e.g. `Up to date (20261125-ab2342)`.
     private(set) var status = ""
     /// Main thread, after every phase change; `show` is true when the user asked for this outcome.
     var onChange: ((Phase, _ show: Bool) -> Void)?
@@ -83,7 +83,8 @@ final class Updater {
           policy: UpdatePolicy = UpdatePolicy()) {
         guard bundle.bundleIdentifier == CodeSignature.bundleIdentifier, bundle.bundleURL.pathExtension == "app",
               let executable = bundle.executableURL,
-              let current = (bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String).flatMap(AppVersion.init)
+              let current = AppVersion(shortVersion: bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString"),
+                                       bundleVersion: bundle.object(forInfoDictionaryKey: "CFBundleVersion"))
         else { return nil }
         self.current = current
         app = bundle.bundleURL
@@ -184,7 +185,7 @@ final class Updater {
         guard let cache, var failure = UpdateInstaller.Failure.read(in: cache),
               URL(fileURLWithPath: failure.target).resolvingSymlinksInPath().path == app.resolvingSymlinksInPath().path
         else { return }
-        guard let version = AppVersion(failure.version), version > current else {
+        guard let version = AppVersion(failure.version), version.build > current.build else {
             // Installed after all (from the disk image, say).
             return UpdateInstaller.Failure.remove(in: cache)
         }
@@ -275,7 +276,8 @@ final class Updater {
     }
 
     private func evaluate(_ manifest: UpdateManifest) {
-        guard manifest.version > current else {
+        // Releases are ordered by build number alone (`CFBundleVersion`); the name's SHA is not orderable.
+        guard manifest.version.build > current.build else {
             // An update staged but installed another way (the DMG), or a withdrawn release, is stale now.
             staged = nil
             forgetFailedInstall()
@@ -305,7 +307,7 @@ final class Updater {
             return finish(.available(manifest, blocked: "it cannot be staged"))
         }
         // Downloaded by an earlier run that quit before installing it: check it again (the cache is the user's).
-        let folder = root.appendingPathComponent(manifest.version.description, isDirectory: true)
+        let folder = root.appendingPathComponent(manifest.version.token, isDirectory: true)
         let previous = folder.appendingPathComponent("Peekaboo.app", isDirectory: true)
         if (try? UpdateInstaller.verify(previous, version: manifest.version, requirement: requirement)) != nil {
             staged = (manifest, previous)
