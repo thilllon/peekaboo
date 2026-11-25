@@ -80,6 +80,8 @@ public enum UpdateInstaller {
         let ditto = Process()
         ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
         ditto.arguments = ["-x", "-k", zip.path, directory.path]
+        // Background work like the rest of the updater (a child process otherwise runs at the default QoS).
+        ditto.qualityOfService = .utility
         ditto.standardOutput = FileHandle.nullDevice
         ditto.standardError = FileHandle.nullDevice
         try ditto.run()
