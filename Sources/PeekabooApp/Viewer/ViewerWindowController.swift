@@ -4,8 +4,15 @@ import PeekabooRender
 
 /// Borderless windows cannot become key by default; instant full screen needs them to.
 final class ViewerWindow: NSWindow {
+    /// Headless (tests): the frame stays where it is put, off every screen (`Presentation`).
+    var staysOffScreen = false
+
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        staysOffScreen ? frameRect : super.constrainFrameRect(frameRect, to: screen)
+    }
 }
 
 /// One rendered frame, for tracing and the self-test.
@@ -136,6 +143,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// waits for the first tier on the main thread and presents it at once, because AppKit's launch does not
     /// service the main queue for ~70 ms (`finishLaunching`, the open-documents event).
     var presentsSynchronously = false
+    /// In front and key, or out of sight for tests (`.headless`).
+    let presentation: Presentation
 
     // Full screen and chrome
     private var instantFullscreen: (frame: NSRect, style: NSWindow.StyleMask)?
@@ -167,8 +176,9 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private var lastTitle = ""
     private var pendingTitle: String?
 
-    init(configStore: ConfigStore) {
+    init(configStore: ConfigStore, presentation: Presentation = .interactive) {
         self.configStore = configStore
+        self.presentation = presentation
         NSWindow.allowsAutomaticWindowTabbing = false
         let window = ViewerWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1280, height: 820),
@@ -184,6 +194,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         window.collectionBehavior.insert(.fullScreenPrimary)
         window.setFrameAutosaveName("PeekabooViewer")
         if window.frame.origin == .zero { window.center() }
+        window.staysOffScreen = presentation == .headless
 
         rootView = ViewerRootView(frame: NSRect(origin: .zero, size: window.contentLayoutRect.size))
         viewerView = rootView.viewerView
@@ -319,7 +330,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             browseSource = urls.count == 1 ? .folder(first) : .files
         }
         showWindow(nil)
-        window?.makeKeyAndOrderFront(nil)
+        makeKeyAndOrderFront()
         hud.setMessage(nil)
         let synchronous = presentsSynchronously
         if synchronous {
@@ -403,7 +414,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// the cache, instead of starting over (which would free the cache on the main thread and decode it all again).
     private func openWithinBrowsingSet(_ index: Int) {
         showWindow(nil)
-        window?.makeKeyAndOrderFront(nil)
+        makeKeyAndOrderFront()
         if index != pipeline.index {
             navigate(to: index, isRepeat: false)
         } else {
@@ -471,13 +482,23 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     func reopen() {
         wakeFromClosed()
         showWindow(nil)
-        window?.makeKeyAndOrderFront(nil)
+        makeKeyAndOrderFront()
         if pipeline.currentFile == nil, shownFile == nil {
             showEmpty(nil)
         } else {
             presentCurrent()   // an animation closed with the window shows its still again and plays from there
             renderFrame()
         }
+    }
+
+    /// In front and key; headless: ordered in out of sight (`Presentation`).
+    override func showWindow(_ sender: Any?) {
+        if presentation == .headless { window?.orderInOutOfSight() } else { super.showWindow(sender) }
+    }
+
+    /// `window.makeKeyAndOrderFront(nil)`; headless: ordered in out of sight, like `showWindow`.
+    private func makeKeyAndOrderFront() {
+        if presentation == .headless { window?.orderInOutOfSight() } else { window?.makeKeyAndOrderFront(nil) }
     }
 
     // MARK: Pipeline → screen
@@ -1368,9 +1389,11 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             window.setFrameAutosaveName("")  // never persist the full-screen frame
             NSApp.presentationOptions = [.autoHideMenuBar, .autoHideDock]
             window.styleMask = [.borderless]
-            window.setFrame(screen.frame, display: true)
+            var frame = screen.frame
+            if presentation == .headless { frame.origin = NSWindow.offScreenOrigin(for: frame.size) }
+            window.setFrame(frame, display: true)
             rootView.topInset = notchInset(screen)
-            window.makeKeyAndOrderFront(nil)
+            makeKeyAndOrderFront()
             window.makeFirstResponder(viewerView)
             lastPointerMove = Trace.now()
             scheduleIdleCheck()
@@ -1389,7 +1412,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         window.setFrameAutosaveName("PeekabooViewer")
         rootView.topInset = 0
         if reorder {
-            window.makeKeyAndOrderFront(nil)
+            makeKeyAndOrderFront()
             window.makeFirstResponder(viewerView)
         }
         showChrome()
@@ -1397,7 +1420,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
 
     private func toggleNativeFullscreen() {
         if instantFullscreen != nil { toggleInstantFullscreen() }
-        window?.toggleFullScreen(nil)
+        // A Space of its own on a screen: never for a headless window.
+        if presentation == .interactive { window?.toggleFullScreen(nil) }
     }
 
     // MARK: Cursor & chrome auto-hide
@@ -1577,6 +1601,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         observers.append(center.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main) { [weak self] _ in
             self?.visibilityChanged()
         })
+        if presentation == .headless, let window { observers.append(window.keepOffScreen()) }
         let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .main)
         source.setEventHandler { [weak self, weak source] in
             guard let self, let source else { return }

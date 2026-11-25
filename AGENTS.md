@@ -157,5 +157,9 @@ signature carries the running app's identifier and team.
   (see `linkedSDK` in Package.swift). Metal source compiled at runtime must stay within MSL 3.1, macOS 14's newest:
   add every such source to `testShadersCompileAsMetal31ForMacOS14`.
 - Tests that need Metal, a display or the benchmark corpus must `XCTSkip` when it is unavailable.
+- Tests never show a window or take the keyboard focus: derive window tests from `ViewerTestCase` (`.prohibited`
+  activation policy; a test fails if the process activates, a window comes on screen, or the test leaves a window
+  open) and build controllers with `presentation: .headless` (ordered in transparent and off every screen, never
+  key; frames still render).
 - Prefer Apple frameworks (ImageIO, Metal, Accelerate) and static C libraries over new
   dependencies.
