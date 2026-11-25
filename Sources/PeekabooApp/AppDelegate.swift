@@ -13,6 +13,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var lastKeymap: Keymap?
     /// In-app updates (nil outside Peekaboo.app, and in the self-test).
     private var updates: UpdateController?
+    /// The updater's current status line, for a window that opens after the last `PeekabooUpdateStatusChanged`.
+    var updateStatus: String? { updates?.updater.status }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // The View menu carries its own full-screen items (instant and native); stop AppKit
