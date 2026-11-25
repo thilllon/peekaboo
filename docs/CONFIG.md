@@ -173,6 +173,8 @@ Ids are `namespace.verb`, optionally followed by `:argument`.
 | `view.hud`, `view.hud_hide` | cycle the HUD / hide everything |
 | `view.background` | cycle black → gray → checker |
 | `view.rotate_cw`, `view.rotate_ccw`, `view.flip_h`, `view.flip_v` | rotate / flip the view (the file is not changed) |
+| `view.play_pause` | play or pause an animation (GIF, APNG, WebP, HEIC / AVIF sequence); after its last loop, play again |
+| `view.frame_next`, `view.frame_prev` | pause the animation and step one frame (wraps around; hold to keep stepping) |
 | `view.help` | the key cheat sheet |
 
 ### Files
@@ -231,6 +233,7 @@ Ids are `namespace.verb`, optionally followed by `:argument`.
 | `view.background` | `b` |
 | `view.rotate_cw` / `view.rotate_ccw` | `r` `cmd+r` `>` / `shift+r` `cmd+l` `<` |
 | `view.flip_h` / `view.flip_v` | `\|` / `_` |
+| `view.play_pause` / `view.frame_prev` / `view.frame_next` | `k` / `,` / `.` |
 | `file.trash` | `cmd+backspace` `forwarddelete` (fn+⌫) |
 | `app.undo` / `app.redo` | `cmd+z` / `cmd+shift+z` |
 | `file.move:ask` / `file.copy:ask` | `m` / `c` |
@@ -280,6 +283,8 @@ keys for them if you use them:
 | `pan.center` | `M` |
 | zoomed: `pan.left` `pan.down` `pan.up` `pan.right` | `h` `j` `k` `l` |
 | zoomed: `pan.edge:left` `bottom` `top` `right` | `H` `J` `K` `L` |
+
+The vim layer's `k` replaces `view.play_pause`; bind another key for it if you use both (`"s" = "view.play_pause"`).
 
 ## File actions in detail
 

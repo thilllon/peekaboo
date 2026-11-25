@@ -42,6 +42,21 @@ ImageIO facts that drive the routing:
   with ImageIO: libwebp itself, built from source with threads and scaling, is only 16–25 % faster on lossy and not at
   all on lossless (one token partition: parsing is serial), not worth 35k lines of parser that the OS patches for us.
   HEIC cost is independent of output size (always full decode, HW).
+- HEIF orientation lives in `irot` / `imir`: ImageIO writes both those and the EXIF tag, reports the orientation from the
+  transform properties (a libheif-style file with `irot` and EXIF 1 reports the `irot` value) and decodes stored pixels;
+  embedded thumbnails come back rotated. All 8 orientations, with and without thumbnail items, match ImageIO's oriented
+  thumbnail in every tier (tested end to end).
+- The surface SPI's BGRA for HEIF / AVIF is ImageIO converting the decoder's YCbCr on the CPU. Its private
+  `kCGImageSurfaceFormatRequest = '420f'` hands over the native bi-planar YCbCr instead (12 MP HEIC 10 vs 32 ms, 50 MP 22
+  vs 83 ms, best of 5); 10-bit sources come out bi-planar anyway (`'xf20'`, 16-bit containers: 24 MP 7.5 ms; asking them
+  for `'420f'` makes ImageIO convert on the CPU, 39 ms). Reduced decodes (`SubsampleFactor`) are CPU work too (12 MP /4
+  30 ms; 10-bit 24 MP /2…/8 36–75 ms): decode at /1 and reduce on the GPU. Before, 10-bit images took the public path,
+  which drew them into 8-bit BGRA on the CPU: 24 MP 115 ms (Display P3) to 212 ms (PQ).
+- PQ / HLG images (camera HIF, HDR AVIF) decoded by default keep PQ code values in a BT.2100 space: shown as SDR they were
+  ~6× too dark. The SPI honours `kCGImageSourceDecodeToSDR` (ImageIO's tone-mapped SDR rendition, `'420f'`, Display P3,
+  24 MP 15 ms).
+- The first HEVC decode of a process waits for the hardware decoder: 62 ms wall (12 ms CPU) for a 16 px HEIC, then ~2 ms;
+  it stays warm (45 s idle measured) and costs 3.4 MB.
 - Default outputs are not BGRA (full decode = RGBX, thumbnails = XRGB); converting by drawing costs +62 ms per
   24 MP. **Never convert on the CPU**: `PixelLayout` + texture swizzle cover every native layout.
 - Metadata (`CopyPropertiesAtIndex`) costs 0.07–0.6 ms (RAW 1.3–2.6 ms); creating a source does not read the file.
@@ -83,13 +98,17 @@ palette indices past the palette.
 | JPEG baseline ≤ HW limit | embedded EXIF/MPF thumb if present (0.2–1 ms); else `Subsample 4` (24 MP 40 ms) — never 8 | `Subsample 2` when W/2 ≥ screen (24 MP 44.6 ms), else full | HW: IOSurface path or lazy decode drawn into own buffer (49.8 ms @ 24 MP) |
 | JPEG progressive | `Subsample 8` (DC-only, 32 ms @ 24 MP, 88 ms @ 101 MP) | libjpeg-turbo, DCT scale covering the screen (24 MP: full size, 300 ms); on screen the first-pass rendition first (76 ms) | libjpeg-turbo (290 ms @ 24 MP); when zoomed, the same early rendition |
 | JPEG baseline > 102 MP | embedded thumb, else `Subsample 4` | libjpeg-turbo, DCT scale covering the screen | libjpeg-turbo (tiles above 16384 px) |
-| HEIC / HEIF / AVIF | embedded thumbnail item (~2 ms); else thumbnail 1024 (70–76 ms @ 50 MP) | thumbnail at the screen long side (62–73 ms @ 50 MP) | ImageIO full via IOSurface (94–110 ms; 195–227 ms if copied out) |
+| HEIC / HEIF / AVIF | embedded thumbnail item (~2 ms); else native YCbCr at /1 reduced on the GPU (/≤8) | native YCbCr (SPI `'420f'`; 10-bit `'xf20'`; PQ / HLG: the SDR rendition) at /1 → one Metal pass, reduced to cover the screen → `bgra8` / `bgr10a2` | same, unreduced |
 | Camera RAW | embedded preview, thumbnail without `Always` (ARW 15, RAF 19, NEF 43 ms); CR3 via own BMFF parse | embedded preview at screen size if it covers the screen (RAF 70, NEF 93 ms), else RAW decode in the background | RAW decode (ProRAW 133 … ARW 61 MP 886 ms), only on zoom |
 | PNG (RGB, RGBA, palette; not interlaced) | own decoder, box filter /8 (24 MP 143 ms) | own decoder, box filter covering the screen (24 MP 143 ms) | own decoder (16-bit stays 16-bit; 24 MP 145–154 ms) |
 | WebP / TIFF / GIF / JXL / PSD / EXR, other PNG | thumbnail ≤ 512 (TIFF 23, AVIF 48, WebP 350 ms) | IOSurface SPI /n (lazy draw as fallback) | IOSurface SPI (lazy draw as fallback) |
 
-HDR (gain-map HEIC/JPEG): `kCGImageSourceDecodeRequest = DecodeToHDR` (10-bit PQ / half-float) when the screen
-reports EDR headroom > 1, displayed through the EDR path of the renderer. SDR otherwise.
+HDR (gain-map HEIC/JPEG, PQ / HLG HEIF): `kCGImageSourceDecodeRequest = DecodeToHDR` (10-bit PQ / half-float) when the screen
+reports EDR headroom > 1, displayed through the EDR path of the renderer. SDR otherwise (PQ / HLG: ImageIO's SDR rendition).
+
+`main()` decodes a 16 px HEIC (`HEVCWarmUp`) on a utility thread while AppKit starts, so a HEIC opened at launch decodes
+warm: process start → first committed frame of a 36 MP HEIC without a thumbnail item 226 → 140 ms (median of 8
+interleaved runs, its first decode 112 → 55 ms); a JPEG launch is unchanged (137 vs 134 ms).
 
 ## 3. Pipeline — predictive prefetch & tiered cache ("P4")
 
@@ -176,6 +195,34 @@ viewers score 21–26 dB and alias 10–25× more.
   stars/labels/flags as Finder tags.
 - HUD as `CATextLayer`s above the Metal layer (no blur views), updated only on state changes; toasts.
 - Full screen: instant borderless (notch-aware) by default; native as an option.
+
+### Animation
+
+GIF, APNG, animated WebP, HEICS and AVIS (`ImageInfo.isAnimated`: more than one frame in one of those types; HEIC
+collections such as dynamic wallpapers, TIFF pages and ICO sizes stay stills). The pipeline decodes frame 0 like any
+still, so an animation shows as fast as a photo and its neighbours are prefetched as usual; once it is on screen (and
+the user is not skimming past it), an `AnimationPlayer` takes over. Stills never create one.
+
+- **Frames**: ImageIO composites them (disposal none / background / previous, blending source / over), checked against
+  hand-made GIF, APNG and WebP files. One quirk: ImageIO declares some composited GIF frames opaque although an earlier
+  "restore to background" left them transparent; their fourth byte is the canvas alpha and is honoured.
+- **Timing**: per-frame unclamped delays (APNG needs the frame's own properties; its container holds ImageIO's clamp at
+  50 ms), browser clamping (≤ 10 ms plays as 100 ms), ImageIO's loop counts (plays; 0 = forever; a GIF without the
+  NETSCAPE extension plays once), the last frame stays after the last play.
+- **Decoding**: one serial queue, in order, into a page-granular pool of the player's own. When all frames fit
+  `min(screen budget / 8, 256 MB)` each is decoded once and kept (later loops decode nothing); otherwise a window of up to
+  8 frames ahead. Corpus: 400×400 GIF 0.8 ms / WebP 11 ms per frame, 44 frames = 27.5 MB kept.
+- **Pacing**: the view's display link, running only around frame deadlines (paused between them, woken by a timer 1.5
+  refreshes early). A frame due within half a refresh is shown at that refresh; the timeline does not drift and is
+  re-anchored when a frame is more than one frame late (no catch-up burst). Headless at 120 Hz over 3 loops of the corpus
+  GIF / WebP (90 ms frames): on-screen duration − declared mean +0.03 ms, |error| p95 6.7 ms (the 8.3 ms refresh grid),
+  no late frames. Playback pauses while the window is hidden, occluded or minimised and stops on navigation.
+- **Rendering**: frames bypass the prepared-neighbour cache. While playing no pyramid is built: views that would read one
+  (frame shown below half size) draw bilinear from level 0, all others take their usual path (level-0 HQ canvas, 1:1,
+  sharp bilinear). GPU per frame at 3456×2234 / 1440×900 (M4 Pro): pyramid of a 3840×2160 frame 4.1 ms (9 ms wall),
+  level-0 canvas 0.4–1.6 ms, bilinear 0.1–0.7 ms. Paused, stepped or finished: the full PPR path, pyramid included.
+- **Keys**: `view.play_pause` (`k`), `view.frame_prev` / `view.frame_next` (`,` / `.`, pause and step, repeat while
+  held); the full HUD shows `Frame i/N`.
 
 ## 6. Performance budget
 

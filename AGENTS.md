@@ -63,6 +63,7 @@ brew install jpeg-turbo   # static libturbojpeg linked into PeekabooCore
 | `PEEKABOO_HDR=1` | decode gain-map photos to HDR (off by default: 13× the SDR cost) |
 | `PEEKABOO_CONFIG=<file>` | use another config file |
 | `peekaboo-bench decode / pipeline [--cold] / render [--png DIR]` | regression benches (corpus from `PEEKABOO_CORPUS`, built by `mise run corpus`) |
+| `peekaboo-bench anim [file …]` | headless animation playback: on-screen duration vs declared delay, late frames, decode per frame, memory |
 
 ## Layout
 
