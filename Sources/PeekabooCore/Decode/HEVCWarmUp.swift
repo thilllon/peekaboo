@@ -2,7 +2,7 @@ import Foundation
 import ImageIO
 
 /// The first HEVC decode of a process waits for the hardware decoder: 62 ms wall (12 ms of it CPU) for a 16 px HEIC,
-/// then ~2 ms (M4 Pro, macOS 26.6). `main` runs one on a 16 px HEIC in the background while AppKit starts, so a HEIC
+/// then ~2 ms (M4 Pro, macOS 26.6). `main` runs one on a 16 px HEIC at utility QoS while AppKit starts, so a HEIC
 /// opened at launch decodes warm. It stays warm (measured after 45 s idle) and costs 3.4 MB.
 public enum HEVCWarmUp {
     public static func run() {

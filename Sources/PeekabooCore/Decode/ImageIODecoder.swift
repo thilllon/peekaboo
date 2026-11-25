@@ -26,11 +26,11 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     /// Parsed metadata per file version: `probe` and the decodes of every tier share one parse.
     let probes = DecodeProbeCache()
 
-    /// Decode gain-map images (`hasGainMap`) to HDR (`kCGImageSourceDecodeToHDR`, extended-linear
-    /// Display P3 `.rgba16f`, `isHDR = true`) for `.screen`/`.full`. Off by default: the HDR rendition
-    /// costs 10–15× the SDR decode (1.4–2.1 vs 21–27 ms on a 384×512 Apple gain-map JPEG: gain-map
-    /// application plus a converting draw; see `peekaboo-bench decode`), above the 2× budget.
-    /// Enable with `PEEKABOO_HDR=1` or by setting it.
+    /// Decode gain-map images (`hasGainMap`) and PQ / HLG ones (`DecodeProbe.hdrTransfer`) to HDR
+    /// (`kCGImageSourceDecodeToHDR`, extended-linear Display P3 `.rgba16f`, `isHDR = true`) for
+    /// `.screen`/`.full`. Off by default: the HDR rendition costs 10–15× the SDR decode (1.4–2.1 vs
+    /// 21–27 ms on a 384×512 Apple gain-map JPEG: gain-map application plus a converting draw; see
+    /// `peekaboo-bench decode`), above the 2× budget. Enable with `PEEKABOO_HDR=1` or by setting it.
     nonisolated(unsafe) public static var decodeHDR = ProcessInfo.processInfo.environment["PEEKABOO_HDR"] != nil
 
     /// Baseline JPEGs up to this many pixels go to the hardware JPEG engines. Measured on M4 Pro /
