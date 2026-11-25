@@ -84,6 +84,11 @@ and hands it over as an approximate tier (`DecodedImage.isApproximate`) while th
 | 101 MP 4:4:4 (1/2) | 0.3 ms (160 px EXIF thumb) | 94 ms | 51.9 dB | 682 ms |
 | 22705 px panorama (1/4) | 0.2 ms (157 px EXIF thumb) | 146 ms | 49.8 dB | 933 ms |
 
+(Measured with Homebrew's `-Os` libjpeg-turbo. With the `-O3` build from `mise run deps` the exact tiers of these files
+decode 6–25 % faster (101 MP 717 → 539 ms) and the early renditions keep their PSNR to 0.01 dB; they land as early or
+up to 5 ms sooner, except the 101 MP one, 5 ms later beside its exact decode (92 → 98 ms; alone 94 → 96 ms: `-O3` code
+for its first-pass path, an `-Os` build of the same source takes 93 ms).)
+
 Rejected (measured, docs/research.md): libjpeg buffered-image mode in the same decode (same early time, exact +10 %),
 also skipping only the luma refinements (+1.4–4 dB for 2–4× the time), `TJPARAM_FASTUPSAMPLE`/`FASTDCT` for the
 screen tier (24 MP 4:2:0: −18 % but 38 dB at 100 %, which is that tier), decoding independent scan chains in
