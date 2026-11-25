@@ -209,8 +209,10 @@ final class Updater {
         if staged == nil || trigger == .manual { publish(.checking) }
         var request = URLRequest(url: manifestURL)
         request.cachePolicy = .reloadIgnoringLocalCacheData
-        // Automatic checks wait for a connection; a manual one reports at once that there is none.
-        let session = makeSession(waitsForConnectivity: trigger != .manual, resourceTimeout: trigger == .manual ? 30 : 600)
+        // No check waits for a connection: a waiting check would hold every later one (a manual "Check for
+        // Updates…" too, without a word) for up to its resource timeout. Offline it fails at once, and the network
+        // monitor checks again when the connection is back.
+        let session = makeSession(waitsForConnectivity: false, resourceTimeout: 30)
         session.dataTask(with: request) { [weak self] data, response, error in
             self?.queue.async { self?.received(data, response, error) }
         }.resume()
