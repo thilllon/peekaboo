@@ -37,6 +37,8 @@ struct DecodeOutcome: Sendable {
     let changedDuringDecode: Bool
     /// When `stamp` was read (`Trace.now()`), to tell whether it is newer than the listing.
     let stampedAt: UInt64
+    /// When the decode itself began (`Trace.now()`): it saw the decoder settings of that moment.
+    let started: UInt64
     let wallMs: Double
     /// Decodes running when this one started, itself included.
     let concurrency: Int
@@ -296,8 +298,8 @@ final class DecodeScheduler: @unchecked Sendable {
                 wanted: { [weak self] in self?.wantsPartial(key) ?? false },
                 deliver: { [weak self] image in
                     self?.deliver(DecodeOutcome(job: snapshot, result: .success(image), info: snapshot.info, stamp: before,
-                                                changedDuringDecode: false, stampedAt: Trace.now(), wallMs: 0,
-                                                concurrency: 0, partial: true))
+                                                changedDuringDecode: false, stampedAt: Trace.now(), started: start,
+                                                wallMs: 0, concurrency: 0, partial: true))
                 })
             result = Result {
                 try autoreleasepool {
@@ -310,7 +312,7 @@ final class DecodeScheduler: @unchecked Sendable {
         let wallMs = Trace.ms(since: start)
         let after = FileStamp.read(url)
         return DecodeOutcome(job: job, result: result, info: job.info, stamp: before == after ? after : nil,
-                             changedDuringDecode: before != after, stampedAt: Trace.now(), wallMs: wallMs,
+                             changedDuringDecode: before != after, stampedAt: Trace.now(), started: start, wallMs: wallMs,
                              concurrency: concurrency)
     }
 

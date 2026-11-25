@@ -135,7 +135,7 @@ final class UpdaterTests: XCTestCase {
 }
 
 /// A bundle in `root` that passes for Peekaboo.app `version` (unsigned: nothing may be installed from or over it).
-private func fakePeekabooApp(in root: URL, version: String) throws -> Bundle {
+func fakePeekabooApp(in root: URL, version: String) throws -> Bundle {
     let contents = root.appendingPathComponent("Peekaboo.app/Contents")
     try FileManager.default.createDirectory(at: contents.appendingPathComponent("MacOS"), withIntermediateDirectories: true)
     let info: [String: Any] = ["CFBundleIdentifier": "com.thilllon.Peekaboo", "CFBundleShortVersionString": version,
@@ -147,7 +147,7 @@ private func fakePeekabooApp(in root: URL, version: String) throws -> Bundle {
 }
 
 /// Serve a `latest.json` in `root` announcing `version` (its zip at `zip`) through `PEEKABOO_UPDATE_URL`.
-private func publishManifest(in root: URL, version: String, zip: String = "https://example.com/Peekaboo.zip") throws {
+func publishManifest(in root: URL, version: String, zip: String = "https://example.com/Peekaboo.zip") throws {
     let url = root.appendingPathComponent("latest.json")
     let json: [String: Any] = ["version": version, "minimumSystemVersion": "26.0", "url": zip,
                                "sha256": String(repeating: "0", count: 64), "size": 10]

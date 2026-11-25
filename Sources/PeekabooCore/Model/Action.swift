@@ -29,8 +29,8 @@ public enum Action: Hashable, Sendable {
     case rate(Int)
     case label(String)
     case flag(String)
-    // app
-    case undo, redo, config, reloadConfig, escape, close, quit, open, makeDefault
+    // app (`config` opens the Settings window, `configFile` the file in an editor)
+    case undo, redo, config, configFile, reloadConfig, escape, close, quit, open, makeDefault
     /// Shell template with `{path} {dir} {name} {stem} {ext} {index} {count}` placeholders; each becomes a quoted
     /// `${PEEKABOO_*}` reference and the values travel through the environment, never through the shell string.
     case exec(String)
@@ -53,7 +53,8 @@ public enum Action: Hashable, Sendable {
         "view.play_pause": .playPause, "view.frame_next": .frameNext, "view.frame_prev": .framePrevious,
         "file.trash": .trash, "file.delete": .delete, "file.reveal": .reveal, "file.copy_path": .copyPath,
         "file.copy_name": .copyName, "file.copy_image": .copyImage, "file.open_with_chooser": .openWithChooser,
-        "app.undo": .undo, "app.redo": .redo, "app.config": .config, "app.reload_config": .reloadConfig,
+        "app.undo": .undo, "app.redo": .redo, "app.config": .config, "app.config_file": .configFile,
+        "app.reload_config": .reloadConfig,
         "app.escape": .escape, "app.close": .close, "app.quit": .quit, "app.open": .open,
         "app.make_default": .makeDefault,
         "none": .none,
@@ -119,6 +120,12 @@ public enum Action: Hashable, Sendable {
 
     /// Every parameterless id, for validation messages and the help overlay.
     public static var simpleIDs: [String] { simple.keys.sorted() }
+
+    /// The namespace of the id (`nav`, `zoom`, …, `exec`), for grouping actions.
+    public var namespace: String {
+        let id = self.id
+        return String(id.prefix { $0 != "." && $0 != ":" })
+    }
 }
 
 /// Modifier set of a key chord.

@@ -51,12 +51,14 @@ public struct ImageInfo: Sendable {
     public let typeIdentifier: String
     public let hasAlpha: Bool
     public let hasGainMap: Bool
+    /// Pixels encoded with an HDR transfer function (BT.2100 PQ or HLG: 10-bit HEIF from cameras, HDR AVIF, HDR PNG).
+    public let hdrTransfer: Bool
     public let frameCount: Int
     public let colorProfileName: String?
     public let exif: [String: String]
 
     public init(pixelWidth: Int, pixelHeight: Int, orientation: CGImagePropertyOrientation,
-                typeIdentifier: String, hasAlpha: Bool, hasGainMap: Bool, frameCount: Int,
+                typeIdentifier: String, hasAlpha: Bool, hasGainMap: Bool, hdrTransfer: Bool = false, frameCount: Int,
                 colorProfileName: String?, exif: [String: String]) {
         self.pixelWidth = pixelWidth
         self.pixelHeight = pixelHeight
@@ -64,10 +66,14 @@ public struct ImageInfo: Sendable {
         self.typeIdentifier = typeIdentifier
         self.hasAlpha = hasAlpha
         self.hasGainMap = hasGainMap
+        self.hdrTransfer = hdrTransfer
         self.frameCount = frameCount
         self.colorProfileName = colorProfileName
         self.exif = exif
     }
+
+    /// Whether HDR decoding (`[decode] hdr`) changes its `.screen` and `.full` tiers: a gain map, or PQ / HLG pixels.
+    public var hasHDRRendition: Bool { hasGainMap || hdrTransfer }
 
     /// Whether the orientation swaps width and height (EXIF 5–8).
     public var swapsAxes: Bool { orientation.rawValue >= 5 && orientation.rawValue <= 8 }

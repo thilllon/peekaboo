@@ -34,6 +34,18 @@ public struct AppConfig: Sendable, Equatable {
     public var ratingStorage: RatingStorage = .finderTags
     /// `rating.star`: a rating of 3 is the Finder tag of three of these.
     public var starCharacter = "★"
+    /// `keymap.defaults`, `keymap.vim` and `rating.auto_advance` as the file sets them (`keymap` is built from them).
+    public var keymapDefaults = true
+    public var vimKeys = false
+    public var autoAdvance = false
+    /// `decode.hdr`: decode gain-map photos and PQ / HLG images to HDR (10–15× the SDR cost). `PEEKABOO_HDR=1` turns it
+    /// on whatever this says.
+    public var decodeHDR = false
+    /// `decode.fast_path`: decode through ImageIO's private IOSurface entry point. `PEEKABOO_NO_IOSURFACE_SPI=1` turns
+    /// it off whatever this says.
+    public var fastPath = true
+    /// `debug.trace`: timestamped trace lines on stderr. `PEEKABOO_TRACE=1` turns it on whatever this says.
+    public var trace = false
     /// `[updates]`.
     public var updates = Updates()
 
@@ -71,11 +83,18 @@ public final class ConfigStore {
         return base.appendingPathComponent("peekaboo/config.toml")
     }
 
-    /// The store that loaded most recently: `app.reload_config` and `app.config` act on it.
+    /// The store that loaded most recently: `app.reload_config` and `app.config_file` act on it.
     public private(set) static weak var current: ConfigStore?
+
+    /// Posted (main thread, the store as object) after every load that changed something — applied, or failed with
+    /// `lastError` — whether it came from the file watcher, `load()` or `edit(_:completion:)`. For any number of
+    /// observers (the Settings window) next to the owner's `onChange` / `onError`.
+    public static let didLoadNotification = Notification.Name("PeekabooConfigDidLoad")
 
     public let url: URL
     public private(set) var config = AppConfig.default
+    /// Text of the file `config` was loaded from (nil: no file, the built-in defaults).
+    public private(set) var text: String?
     /// Main thread, after every successful (re)load.
     public var onChange: ((AppConfig) -> Void)?
     /// Main thread, with a message such as `config.toml:17: unknown action "nav.nxt"`; the previous config stays active.
@@ -138,11 +157,81 @@ public final class ConfigStore {
         return url
     }
 
+    /// The value of `key` in `table` as the applied file writes it; nil when the file does not set it (the Settings
+    /// window shows it, and tells a default from an explicit value with it).
+    public func storedValue(_ key: String, in table: String) -> TOMLValue? {
+        guard let text else { return nil }
+        if storedDocument?.text != text { storedDocument = (text, try? TOMLDocument(parsing: text)) }
+        return storedDocument?.document?.value(table.split(separator: ".").map(String.init) + [key])
+    }
+
+    /// `text` parsed again, on the first `storedValue` after a load (never on the launch path).
+    private var storedDocument: (text: String, document: TOMLDocument?)?
+
+    // MARK: Editing
+
+    /// Change the file through `ConfigEditor` (minimal edits of its text; a missing file starts as the commented
+    /// starter file), then write it and apply it. The result must load: an edit that would leave the file with an
+    /// error — or one made while the file has one, or is not UTF-8 — is not written, and `completion` gets the error,
+    /// e.g. `config.toml:17: unknown action "nav.nxt"`. The write is atomic and goes to the file a symbolic link points
+    /// to, keeping the link and the file's permissions. Runs on the store's queue (no file I/O on the main thread);
+    /// `completion` runs on the main thread after the new configuration is applied.
+    public func edit(_ change: @escaping (inout ConfigEditor) throws -> Void, completion: ((Error?) -> Void)? = nil) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let started = Trace.now()
+            let result: Result<Outcome, Error> = Result {
+                let name = self.url.lastPathComponent
+                let existing = try? Data(contentsOf: self.url)
+                let original = existing.map { String(decoding: $0, as: UTF8.self) } ?? ConfigStore.sampleConfig
+                // Decoding replaces invalid UTF-8 (a Latin-1 comment) all over the text: writing it back would change
+                // lines the edit never touched.
+                if let existing, !original.utf8.elementsEqual(existing) {
+                    throw ConfigEditError(line: nil, message: "\(name): not UTF-8 text (save it as UTF-8 to change it here)")
+                }
+                var editor = ConfigEditor(text: original)
+                do {
+                    try change(&editor)
+                } catch let error as ConfigEditError {
+                    // `config.toml:17: …` like the load errors.
+                    guard let line = error.line else { throw ConfigEditError(line: nil, message: "\(name): \(error.message)") }
+                    throw ConfigError(fileName: name, errors: [TOMLError(line: line, column: 1, message: error.message)])
+                }
+                // A change that changes nothing writes nothing (and creates no file).
+                guard editor.text != original else { return .unchanged }
+                _ = try AppConfig.parse(toml: editor.text, fileName: name)
+                try self.write(Data(editor.text.utf8))
+                Trace.log("config edited in \(String(format: "%.2f", Trace.ms(since: started))) ms")
+                return self.read(force: true)
+            }
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let outcome):
+                    self.apply(outcome)
+                    completion?(nil)
+                case .failure(let error):
+                    completion?(error)
+                }
+            }
+        }
+    }
+
+    /// Replace the file's contents atomically (on `queue`).
+    private func write(_ data: Data) throws {
+        let fm = FileManager.default
+        let target = url.resolvingSymlinksInPath()
+        try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let permissions = (try? fm.attributesOfItem(atPath: target.path))?[.posixPermissions]
+        try data.write(to: target, options: .atomic)
+        if let permissions { try? fm.setAttributes([.posixPermissions: permissions], ofItemAtPath: target.path) }
+        if watching { arm() }  // a new inode, or a file that did not exist
+    }
+
     // MARK: Loading
 
     private enum Outcome {
         case unchanged
-        case loaded(AppConfig, warnings: [String])
+        case loaded(AppConfig, warnings: [String], text: String?)
         case failed(String)
     }
 
@@ -151,13 +240,14 @@ public final class ConfigStore {
         let data = try? Data(contentsOf: url)
         if !force, let lastData, lastData == data { return .unchanged }
         lastData = .some(data)
-        guard let data else { return .loaded(.default, warnings: []) }
+        guard let data else { return .loaded(.default, warnings: [], text: nil) }
         let started = Trace.now()
+        let text = String(decoding: data, as: UTF8.self)
         do {
-            let (config, warnings) = try AppConfig.parse(toml: String(decoding: data, as: UTF8.self), fileName: url.lastPathComponent)
+            let (config, warnings) = try AppConfig.parse(toml: text, fileName: url.lastPathComponent)
             Trace.log("config loaded \(url.lastPathComponent) (\(data.count) B) in \(String(format: "%.2f", Trace.ms(since: started))) ms")
             if !warnings.isEmpty { Trace.log("config warnings: \(warnings.joined(separator: "; "))") }
-            return .loaded(config, warnings: warnings)
+            return .loaded(config, warnings: warnings, text: text)
         } catch let error as ConfigError {
             Trace.log("config error: \(error.messages.joined(separator: "; "))")
             return .failed(error.description)
@@ -169,16 +259,18 @@ public final class ConfigStore {
     private func apply(_ outcome: Outcome) {
         switch outcome {
         case .unchanged: return
-        case .loaded(let config, let warnings):
+        case .loaded(let config, let warnings, let text):
             lastError = nil
             self.warnings = warnings
             self.config = config
+            self.text = text
             onChange?(config)
             if let warning = lastWarning { (onWarning ?? onError)?(warning) }
         case .failed(let message):
             lastError = message
             onError?(message)
         }
+        NotificationCenter.default.post(name: Self.didLoadNotification, object: self)
     }
 
     // MARK: Watching (all on `queue`)

@@ -26,12 +26,27 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     /// Parsed metadata per file version: `probe` and the decodes of every tier share one parse.
     let probes = DecodeProbeCache()
 
-    /// Decode gain-map images (`hasGainMap`) and PQ / HLG ones (`DecodeProbe.hdrTransfer`) to HDR
+    /// Decode gain-map images and PQ / HLG ones (`ImageInfo.hasHDRRendition`) to HDR
     /// (`kCGImageSourceDecodeToHDR`, extended-linear Display P3 `.rgba16f`, `isHDR = true`) for
     /// `.screen`/`.full`. Off by default: the HDR rendition costs 10–15× the SDR decode (1.4–2.1 vs
     /// 21–27 ms on a 384×512 Apple gain-map JPEG: gain-map application plus a converting draw; see
-    /// `peekaboo-bench decode`), above the 2× budget. Enable with `PEEKABOO_HDR=1` or by setting it.
-    nonisolated(unsafe) public static var decodeHDR = ProcessInfo.processInfo.environment["PEEKABOO_HDR"] != nil
+    /// `peekaboo-bench decode`), above the 2× budget. Set from `[decode] hdr` when the config is applied;
+    /// `PEEKABOO_HDR=1` turns it on regardless.
+    nonisolated(unsafe) public static var decodeHDR = hdrForcedByEnvironment
+
+    /// `PEEKABOO_HDR` is set: HDR decoding is on whatever the config says (`getenv`, like `Trace.forcedByEnvironment`:
+    /// the config apply before the first frame reads it on the main thread).
+    public static let hdrForcedByEnvironment = getenv("PEEKABOO_HDR") != nil
+
+    /// `[decode] fast_path`: decode through ImageIO's private IOSurface entry point (`IOSurfaceSPI`). Turning it off
+    /// sends every decode through the public CGImage path; `PEEKABOO_NO_IOSURFACE_SPI=1` keeps it off regardless.
+    public static var usesFastPath: Bool {
+        get { IOSurfaceSPI.enabled }
+        set { IOSurfaceSPI.enabled = newValue }
+    }
+
+    /// The private entry point exists on this system and the environment allows it.
+    public static var fastPathAvailable: Bool { IOSurfaceSPI.isPresent }
 
     /// Baseline JPEGs up to this many pixels go to the hardware JPEG engines. Measured on M4 Pro /
     /// macOS 26.6 with the IOSurface path (CPU time ≪ wall time = hardware): 12–101.5 MP and
@@ -140,7 +155,7 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     private func decode(_ probe: DecodeProbe, url: URL, tier: Tier, target: Int, pool: PixelBufferPool,
                         early: EarlyRendition?) throws -> Output {
         let info = probe.info
-        if Self.decodeHDR, info.hasGainMap || probe.hdrTransfer, tier != .preview,
+        if Self.decodeHDR, info.hasHDRRendition, tier != .preview,
            let hdr = hdrDecode(probe, target: target, pool: pool) {
             return hdr
         }
@@ -520,7 +535,7 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     static let displayP3 = CGColorSpace(name: CGColorSpace.displayP3)!
     static let extendedLinearDisplayP3 = CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)!
 
-    /// Gain-map HDR rendition as extended-linear Display P3 half floats (behind `decodeHDR`).
+    /// HDR rendition of a gain-map or PQ / HLG image as extended-linear Display P3 half floats (behind `decodeHDR`).
     private func hdrDecode(_ probe: DecodeProbe, target: Int, pool: PixelBufferPool) -> Output? {
         let factor = subsample(probe, target)
         var options: [CFString: Any] = [kCGImageSourceShouldCache: false,

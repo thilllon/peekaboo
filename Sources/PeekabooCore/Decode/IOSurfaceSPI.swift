@@ -22,8 +22,14 @@ enum IOSurfaceSPI {
         return unsafeBitCast(symbol, to: CreateFn.self)
     }()
 
-    /// Whether the SPI is present at runtime (tests and the bench report it).
-    static var isAvailable: Bool { create != nil }
+    /// `[decode] fast_path`, set when the config is applied (a plain flag the decode lanes read).
+    nonisolated(unsafe) static var enabled = true
+
+    /// Whether the SPI is present at runtime and allowed (`PEEKABOO_NO_IOSURFACE_SPI` unset).
+    static var isPresent: Bool { create != nil }
+
+    /// Whether decodes use the SPI (tests and the bench report it).
+    static var isAvailable: Bool { enabled && create != nil }
 
     /// ImageIO's private `kCGImageSurfaceFormatRequest` option: asked for `'420f'`, an 8-bit HEIF decodes to its native
     /// YCbCr instead of BGRA (12 MP 10 vs 32 ms, 50 MP 22 vs 83 ms: ImageIO's conversion runs on the CPU).
@@ -31,14 +37,14 @@ enum IOSurfaceSPI {
         .map { $0.assumingMemoryBound(to: CFString.self).pointee }
 
     /// Whether `surface(…, format:)` can ask for a pixel format.
-    static var canRequestFormat: Bool { create != nil && formatRequestKey != nil }
+    static var canRequestFormat: Bool { isAvailable && formatRequestKey != nil }
 
-    /// Decode `index` of `source` into an IOSurface (`subsample` ∈ {1, 2, 4, 8}). `request`: a
-    /// `kCGImageSourceDecodeRequest` value (`kCGImageSourceDecodeToSDR` for PQ / HLG images, which the SPI honours).
-    /// `format`: a surface pixel format to ask for (`canRequestFormat`).
+    /// Decode `index` of `source` into an IOSurface (`subsample` ∈ {1, 2, 4, 8}); nil while `enabled` is off.
+    /// `request`: a `kCGImageSourceDecodeRequest` value (`kCGImageSourceDecodeToSDR` for PQ / HLG images, which the SPI
+    /// honours). `format`: a surface pixel format to ask for (`canRequestFormat`).
     static func surface(_ source: CGImageSource, index: Int, subsample: Int, request: CFString? = nil,
                         format: OSType? = nil) -> IOSurfaceRef? {
-        guard let create else { return nil }
+        guard enabled, let create else { return nil }
         var options: [CFString: Any] = [kCGImageSourceShouldCache: false]
         if subsample > 1 { options[kCGImageSourceSubsampleFactor] = subsample }
         if let request { options[kCGImageSourceDecodeRequest] = request }

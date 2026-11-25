@@ -49,7 +49,8 @@ enum MainMenu {
         update.identifier = updateItem
         update.isHidden = true
         appMenu.addItem(.separator())
-        appMenu.addItem(item(.config, "Settings…"))
+        appMenu.addItem(item(.config))
+        appMenu.addItem(item(.configFile))
         appMenu.addItem(item(.reloadConfig))
         appMenu.addItem(item(.makeDefault))
         appMenu.addItem(.separator())

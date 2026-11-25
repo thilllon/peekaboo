@@ -15,6 +15,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var updates: UpdateController?
     /// The updater's current status line, for a window that opens after the last `PeekabooUpdateStatusChanged`.
     var updateStatus: String? { updates?.updater.status }
+    /// Built the first time `app.config` (⌘,) runs, never at launch.
+    private(set) var settings: SettingsWindowController?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // The View menu carries its own full-screen items (instant and native); stop AppKit
@@ -29,6 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         viewer.presentsSynchronously = true
         viewer.onOpenURLs = { [weak self] urls in self?.open(urls, dedupe: false) }
         viewer.onOpenPanel = { [weak self] in self?.showOpenPanel() }
+        viewer.onOpenSettings = { [weak self] in self?.showSettings() }
         configStore.onChange = { [weak self] config in
             self?.viewer?.apply(config)
             self?.rebuildMenu(config.keymap)
@@ -133,6 +136,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         }
     }
 
+    // MARK: Settings
+
+    /// `app.config`: the Settings window, built on first use (internal for tests).
+    func showSettings(_ pane: SettingsWindowController.Pane? = nil) {
+        let started = Trace.now()
+        let built = settings == nil
+        let controller = settings ?? SettingsWindowController(store: configStore, updateStatus: { [weak self] in
+            self?.updateStatus
+        }) { [weak self] in
+            self?.viewer?.perform(.configFile)
+        }
+        settings = controller
+        controller.show(pane)
+        controller.window?.displayIfNeeded()
+        Trace.log(String(format: "settings window %@ in %.2f ms", built ? "built" : "shown", Trace.ms(since: started)))
+    }
+
     // MARK: Open panel
 
     func showOpenPanel() {
@@ -173,6 +193,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         switch action {
         case .open: showOpenPanel()
         case .quit: NSApp.terminate(nil)
+        case .config: showSettings()
+        case .close where NSApp.keyWindow.map { $0 !== viewer?.window } == true:
+            NSApp.keyWindow?.performClose(nil)  // File › Close Window closes the window in front (Settings)
         default: viewer?.perform(action)
         }
     }
