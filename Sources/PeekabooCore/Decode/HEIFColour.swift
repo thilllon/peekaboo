@@ -4,36 +4,46 @@ import Foundation
 /// `colr` (`nclx`) item property, or of the first tile's when the primary is a grid without one. ImageIO decodes with
 /// that matrix (it overrides the codec's own colour description), and its surface SPI hands the YCbCr over in it — but
 /// tags every bi-planar surface `ITU_R_601_4` whatever the file says, so `YCbCrConverter` takes the matrix from here.
-/// Reads the box headers and the `meta` box only (a few KB; bounded at 4 MB).
+/// Reads the file's first 16 KB (where `meta` follows `ftyp`), more only for a larger `meta` (bounded at 4 MB): one
+/// `pread` of the page-cached header ImageIO has just parsed, 10–20 µs.
 enum HEIFColour {
     private static let maxMeta = 4 << 20
+    private static let headBytes = 16 << 10
 
     /// The primary image's `matrix_coefficients`, nil when the file declares none (or is not ISO-BMFF).
     static func matrixCoefficients(url: URL) -> Int? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? handle.close() }
-        var offset: UInt64 = 0
-        // `meta` follows `ftyp` (sometimes after a `free` or `uuid` box); never search past a few top-level boxes.
-        for _ in 0..<8 {
-            guard (try? handle.seek(toOffset: offset)) != nil, let data = try? handle.read(upToCount: 16), data.count >= 8 else {
-                return nil
-            }
-            let header = [UInt8](data)
-            var size = UInt64(be32(header, 0)), headerSize: UInt64 = 8
-            if size == 1 {
-                guard header.count >= 16 else { return nil }
-                size = UInt64(be32(header, 8)) << 32 | UInt64(be32(header, 12))
-                headerSize = 16
-            }
-            guard size >= headerSize else { return nil }   // 0 (to the end of the file) never precedes `meta`
-            if be32(header, 4) == fourCC("meta") {
-                guard size - headerSize <= maxMeta, (try? handle.seek(toOffset: offset + headerSize)) != nil,
-                      let body = try? handle.read(upToCount: Int(size - headerSize)) else { return nil }
-                return [UInt8](body).withUnsafeBytes { matrixCoefficients(meta: $0) }
-            }
-            offset += size
+        let fd = url.withUnsafeFileSystemRepresentation { $0.map { open($0, O_RDONLY | O_CLOEXEC) } ?? -1 }
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        var count = 0
+        let head = [UInt8](unsafeUninitializedCapacity: headBytes) { buffer, initialized in
+            count = max(pread(fd, buffer.baseAddress, buffer.count, 0), 0)
+            initialized = count
         }
-        return nil
+        guard count >= 16 else { return nil }
+        return head.withUnsafeBytes { d -> Int? in
+            // `meta` follows `ftyp` (sometimes after a `free` or `uuid` box): a few top-level boxes at most.
+            var offset = 0
+            for _ in 0..<8 where offset + 16 <= d.count {
+                var size = be32(d, offset), header = 8
+                if size == 1 { size = be32(d, offset + 8) << 32 | be32(d, offset + 12); header = 16 }
+                guard size >= header else { return nil }   // 0 (to the end of the file) never precedes `meta`
+                if be32(d, offset + 4) == fourCC("meta") {
+                    guard size - header <= maxMeta else { return nil }
+                    if offset + size <= d.count {
+                        return matrixCoefficients(meta: UnsafeRawBufferPointer(rebasing: d[(offset + header)..<(offset + size)]))
+                    }
+                    let body = [UInt8](unsafeUninitializedCapacity: size - header) { buffer, initialized in
+                        initialized = max(pread(fd, buffer.baseAddress, buffer.count, off_t(offset + header)), 0)
+                    }
+                    guard body.count == size - header else { return nil }
+                    return body.withUnsafeBytes { matrixCoefficients(meta: $0) }
+                }
+                guard size <= d.count - offset else { return nil }
+                offset += size
+            }
+            return nil
+        }
     }
 
     /// The same from a whole file in memory.
@@ -135,8 +145,5 @@ enum HEIFColour {
     private static func be16(_ d: UnsafeRawBufferPointer, _ o: Int) -> Int { Int(d[o]) << 8 | Int(d[o + 1]) }
     private static func be32(_ d: UnsafeRawBufferPointer, _ o: Int) -> Int {
         Int(d[o]) << 24 | Int(d[o + 1]) << 16 | Int(d[o + 2]) << 8 | Int(d[o + 3])
-    }
-    private static func be32(_ d: [UInt8], _ o: Int) -> UInt32 {
-        UInt32(d[o]) << 24 | UInt32(d[o + 1]) << 16 | UInt32(d[o + 2]) << 8 | UInt32(d[o + 3])
     }
 }

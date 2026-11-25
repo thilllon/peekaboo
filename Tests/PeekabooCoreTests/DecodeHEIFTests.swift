@@ -274,6 +274,19 @@ final class DecodeHEIFTests: XCTestCase {
         try Data(head.prefix(200)).write(to: truncated)
         XCTAssertNil(HEIFColour.matrixCoefficients(url: truncated))
         XCTAssertNil(HEIFColour.matrixCoefficients(url: dir.appendingPathComponent("missing.heic")))
+        // A `meta` larger than the first read (a 20 KB `free` box appended to it) is read in full.
+        let ftyp = Int(bytes[0]) << 24 | Int(bytes[1]) << 16 | Int(bytes[2]) << 8 | Int(bytes[3])
+        let metaSize = Int(bytes[ftyp]) << 24 | Int(bytes[ftyp + 1]) << 16 | Int(bytes[ftyp + 2]) << 8 | Int(bytes[ftyp + 3])
+        guard Array(bytes[(ftyp + 4)..<(ftyp + 8)]) == Array("meta".utf8) else { throw XCTSkip("meta does not follow ftyp") }
+        let padding = 20 << 10, grown = metaSize + padding
+        var large = Array(bytes[0..<ftyp]) + [UInt8(grown >> 24 & 0xff), UInt8(grown >> 16 & 0xff), UInt8(grown >> 8 & 0xff), UInt8(grown & 0xff)]
+        large += bytes[(ftyp + 4)..<(ftyp + metaSize)]
+        large += [UInt8(padding >> 24 & 0xff), UInt8(padding >> 16 & 0xff), UInt8(padding >> 8 & 0xff), UInt8(padding & 0xff)]
+            + Array("free".utf8) + [UInt8](repeating: 0, count: padding - 8)
+        large += bytes[(ftyp + metaSize)...]
+        let largeURL = dir.appendingPathComponent("large-meta.heic")
+        try Data(large).write(to: largeURL)
+        XCTAssertEqual(HEIFColour.matrixCoefficients(url: largeURL), 6)
     }
 
     // MARK: Containers
