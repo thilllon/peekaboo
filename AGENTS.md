@@ -111,6 +111,8 @@ One-time setup on the maintainer's Mac (never commit any of it):
 3. Optionally `.env.production` (git-ignored, mode 600, keys as in `.env.example`): the release tasks read
    `DEVELOPER_ID_SHA1` (the identity to sign with), `NOTARY_KEYCHAIN_PROFILE` and `APPLE_TEAM_ID` (the team the
    release must be signed by) from it; without it they use the keychain's Developer ID and the profile `peekaboo`.
+   A locked screen locks notarytool's keychain item: notarization then uses the App Store Connect API key named there
+   (`APP_STORE_CONNECT_API_KEY_PATH`, `…_KEY_ID`, `…_ISSUER_ID`), so a release also runs unattended.
 
 `mise run release`, from a clean `main` in sync with `origin/main`:
 
