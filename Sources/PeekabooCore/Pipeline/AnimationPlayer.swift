@@ -40,8 +40,8 @@ public final class AnimationPlayer {
     private var inFlight: Int?
     private var generation = 0
     private var plays = 0
-    private let keepAll: Bool
-    private let window: Int
+    private var keepAll: Bool
+    private var window: Int
     /// When `start` was called before the timing was known.
     private var pendingStart: Double?
     /// The shown frame is the pipeline's still, not one of ours: decode the next frames first.
@@ -164,13 +164,16 @@ public final class AnimationPlayer {
         return frame(index)
     }
 
-    /// Give back every decoded frame except the one shown (memory pressure); they are decoded again when needed.
+    /// Give back every decoded frame except the one shown, and keep a window of 2 from now on (memory pressure).
     public func trimToCurrent() {
+        keepAll = false
+        window = min(window, 2)
         var released: [PixelBuffer] = []
         for i in frames.indices where i != index {
             if let pixels = frames[i] { released.append(pixels); frames[i] = nil }
         }
         account(released)
+        pump()
     }
 
     /// Stop decoding and release every frame (off the main thread).
@@ -191,6 +194,11 @@ public final class AnimationPlayer {
 
     private func opened(_ timing: AnimationTiming, generation: Int) {
         guard generation == self.generation else { return }
+        // Rewritten since it was probed: the pipeline sees the new version and the player is replaced.
+        guard timing.frameCount == frameCount else {
+            failed(DecodeError.unsupported("\(url.lastPathComponent) changed"), generation: generation)
+            return
+        }
         self.timing = timing
         if isPlaying, deadline == nil, let start = pendingStart { deadline = start + timing.delays[index] }
         pump()

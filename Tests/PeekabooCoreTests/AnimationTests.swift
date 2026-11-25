@@ -228,6 +228,23 @@ final class AnimationTests: XCTestCase {
         XCTAssertEqual(p.decodedFrames, 4, "later loops replay kept frames")
     }
 
+    /// Memory pressure: every frame but the shown one is released, and a small window is kept from then on.
+    func testTrimKeepsTheShownFrameAndSwitchesToAWindow() throws {
+        let p = try player("trim.gif", AnimationFixtures.gif(loopCount: 0))
+        p.start(at: 0)
+        spin { p.timing != nil && (0..<4).allSatisfy { p.frame($0) != nil } }
+        XCTAssertTrue(p.keepsAllFrames)
+        XCTAssertNotNil(p.advance(to: 0.1))
+        p.trimToCurrent()
+        XCTAssertFalse(p.keepsAllFrames)
+        XCTAssertEqual((0..<4).filter { p.frame($0) != nil }, [1])
+        for _ in 0..<6 {
+            spin { p.frame((p.index + 1) % 4) != nil }
+            XCTAssertNotNil(p.advance(to: p.deadline ?? 0))
+            XCTAssertLessThanOrEqual((0..<4).filter { p.frame($0) != nil }.count, 3)
+        }
+    }
+
     func testWindowBoundsMemoryWhenFramesDoNotFit() throws {
         // 8×8 frames are 256 bytes as estimated; a 600-byte budget keeps a window of 2 ahead plus the shown one.
         let p = try player("window.gif", AnimationFixtures.gif(loopCount: 0), budget: 600)
