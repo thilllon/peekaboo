@@ -78,6 +78,9 @@ final class DecodeTests: XCTestCase {
         case .rgba16f:
             func f(_ i: Int) -> Int { Int(Float(Float16(bitPattern: p.load(fromByteOffset: i * 2, as: UInt16.self))) * 255) }
             return (f(0), f(1), f(2), f(3))
+        case .bgr10a2:
+            let v = Int(p.load(as: UInt32.self))
+            return ((v >> 20 & 0x3ff) >> 2, (v >> 10 & 0x3ff) >> 2, (v & 0x3ff) >> 2, 255)
         }
     }
 
@@ -307,7 +310,7 @@ final class DecodeTests: XCTestCase {
         XCTAssertEqual(screen.pixels.height, 384)
         let preview = try decoder.decode(url, tier: .preview, targetLongSide: 64, pool: pool)
         XCTAssertGreaterThanOrEqual(preview.pixels.width, 64)
-        XCTAssertLessThanOrEqual(preview.pixels.width, 256, "HEIF subsample is capped at /4 (or a thumbnail item)")
+        XCTAssertLessThanOrEqual(preview.pixels.width, 256, "a reduced decode (or a thumbnail item)")
         let full = try decoder.decode(url, tier: .full, targetLongSide: 0, pool: pool)
         XCTAssertEqual(full.pixels.width, 1024)
         for image in [preview, screen, full] {

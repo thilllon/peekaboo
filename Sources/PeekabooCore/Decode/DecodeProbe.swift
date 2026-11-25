@@ -21,6 +21,8 @@ struct DecodeProbe {
         let kind: Kind
         let info: ImageInfo
         let hasThumbnailItem: Bool
+        let hdrTransfer: Bool
+        let bitDepth: Int
     }
 
     let source: CGImageSource
@@ -29,8 +31,16 @@ struct DecodeProbe {
     let info: ImageInfo
     /// HEIF thumbnail item(s) listed in the container (cheap embedded preview).
     let hasThumbnailItem: Bool
+    /// Pixels encoded with an HDR transfer function (BT.2100 PQ or HLG: 10-bit HEIF from cameras, HDR AVIF): shown
+    /// through ImageIO's tone-mapped SDR rendition, or decoded to HDR with `decodeHDR`.
+    let hdrTransfer: Bool
+    /// Bits per component as stored (`kCGImagePropertyDepth`; 8 when absent).
+    let bitDepth: Int
 
-    var facts: Facts { Facts(index: index, kind: kind, info: info, hasThumbnailItem: hasThumbnailItem) }
+    var facts: Facts {
+        Facts(index: index, kind: kind, info: info, hasThumbnailItem: hasThumbnailItem, hdrTransfer: hdrTransfer,
+              bitDepth: bitDepth)
+    }
 
     static let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
 
@@ -41,6 +51,8 @@ struct DecodeProbe {
         kind = facts.kind
         info = facts.info
         hasThumbnailItem = facts.hasThumbnailItem
+        hdrTransfer = facts.hdrTransfer
+        bitDepth = facts.bitDepth
     }
 
     init(url: URL) throws {
@@ -97,6 +109,15 @@ struct DecodeProbe {
         exif["format"] = Self.formatName(kind: kind, type: type, make: tiff[kCGImagePropertyTIFFMake] as? String)
 
         let alpha = props[kCGImagePropertyHasAlpha] as? Bool ?? false
+        // Only deep images can carry PQ / HLG; the colour space comes from the lazy, header-only CGImage (not for RAW:
+        // creating one there sets up the RAW pipeline).
+        bitDepth = props[kCGImagePropertyDepth] as? Int ?? 8
+        var hdrTransfer = false
+        if bitDepth > 8, kind == .heif || kind == .other,
+           let image = CGImageSourceCreateImageAtIndex(source, index, Self.sourceOptions), let space = image.colorSpace {
+            hdrTransfer = CGColorSpaceUsesITUR_2100TF(space)
+        }
+        self.hdrTransfer = hdrTransfer
         self.kind = kind
         self.hasThumbnailItem = hasThumbnailItem
         info = ImageInfo(pixelWidth: width, pixelHeight: height, orientation: orientation, typeIdentifier: type,

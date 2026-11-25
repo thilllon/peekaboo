@@ -9,6 +9,8 @@ LaunchClock.mainWall = LaunchClock.wallNow()
 RenderContext.prewarm()
 // The folder listing filters names by ImageIO's types: build that table off the main thread now, not in the first listing.
 DispatchQueue.global(qos: .userInitiated).async { _ = FolderScanner.supportedExtensions }
+// The first HEVC decode waits ~50 ms for the hardware decoder: let a 16 px HEIC take that wait now, behind AppKit's start.
+DispatchQueue.global(qos: .utility).async { HEVCWarmUp.run() }
 let app = NSApplication.shared
 let appDelegate = AppDelegate()
 app.delegate = appDelegate

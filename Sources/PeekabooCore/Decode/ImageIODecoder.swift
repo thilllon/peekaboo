@@ -11,7 +11,7 @@ import IOSurface
 /// |---|---|---|---|
 /// | baseline JPEG | MPF large thumbnail, else EXIF thumbnail, else IOSurface SPI /≤4 | IOSurface SPI, power-of-two subsample (≤ 4) covering the target | IOSurface SPI |
 /// | progressive JPEG | MPF large thumbnail, else EXIF thumbnail, else ImageIO /8 (DC-only) | libjpeg-turbo, DCT scale covering the target; on screen, the first-pass scans first (approximate, beside it) | libjpeg-turbo (same early rendition when zoomed) |
-/// | HEIC / HEIF / AVIF | thumbnail item, else IOSurface SPI /≤4 | IOSurface SPI /≤4 | IOSurface SPI |
+/// | HEIC / HEIF / AVIF | thumbnail item, else SPI native YCbCr → GPU /≤8 | SPI native YCbCr → GPU /≤8 | SPI native YCbCr → GPU |
 /// | camera RAW | embedded preview (CR3: own ISO-BMFF parse) | embedded preview at the target size if it covers it, else RAW decode /n | RAW decode (16-bit) |
 /// | PNG (RGB, RGBA, palette; not interlaced) | own decoder (`CPeekabooDecode`), box filter /n | own decoder, box filter /n covering the target | own decoder (16-bit stays 16-bit) |
 /// | other PNG, WebP, TIFF, … | thumbnail (`Always`) | IOSurface SPI /n | IOSurface SPI |
@@ -140,7 +140,8 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     private func decode(_ probe: DecodeProbe, url: URL, tier: Tier, target: Int, pool: PixelBufferPool,
                         early: EarlyRendition?) throws -> Output {
         let info = probe.info
-        if Self.decodeHDR, info.hasGainMap, tier != .preview, let hdr = hdrDecode(probe, target: target, pool: pool) {
+        if Self.decodeHDR, info.hasGainMap || probe.hdrTransfer, tier != .preview,
+           let hdr = hdrDecode(probe, target: target, pool: pool) {
             return hdr
         }
         switch probe.kind {
@@ -151,7 +152,9 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
             if tier == .preview, probe.hasThumbnailItem, let thumb = embeddedThumbnail(probe, maxPixel: target, pool: pool) {
                 return thumb
             }
-            // HEVC/AV1 decode the whole image whatever the factor, and /8 is slower than /4
+            // The native YCbCr, reduced on the GPU (ImageIO's own reductions are CPU work).
+            if let output = nativeYCbCr(probe, scale: subsample(probe, target), pool: pool) { return output }
+            // Fallback (alpha, no SPI): HEVC/AV1 decode the whole image whatever the factor, and /8 is slower than /4
             // (HEIC 12 MP 36 vs 29 ms, 44 MP 122 vs 60 ms; AVIF 24 MP 52 vs 40 ms): cap at /4.
             // Previews without a thumbnail item: /4 is also cheaper than a resampled ImageIO thumbnail
             // (`CreateThumbnailAtIndex`, `…Always`, 1024 px) and /8, and still ≥ 512 px for ≥ 2048 px images
@@ -341,7 +344,7 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
         if tier != .full {
             if cr3 {
                 // ImageIO exposes no CR3 preview (asking runs a RAW decode): use the container's JPEG / HEVC
-                // renditions (HDR PQ EOS R5 Mark II `.screen` from its HEVC tile grid: 88 ms vs 421 ms for the RAW).
+                // renditions (HDR PQ EOS R5 Mark II `.screen` from its HEVC tile grid: 48 ms vs 421 ms for the RAW).
                 if let output = cr3Preview(url: url, info: info, tier: tier, target: target, pool: pool) { return output }
             } else {
                 // Without `…Always` ImageIO returns the camera's embedded JPEG, scaled to the target when it is
@@ -355,7 +358,7 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
         }
         // RAW decode: the SPI declines full size (returns nil) but delivers 16-bit RGBA for /2…/8.
         let factor = Self.coveringSubsample(long: long, target: target)
-        if factor > 1, let output = surface(probe, subsample: factor) { return output }
+        if factor > 1, let output = surface(probe, subsample: factor, pool: pool) { return output }
         return try publicImage(probe, subsample: factor, pool: pool)
     }
 
@@ -375,9 +378,11 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
             decoded = try? decodeJPEG(probe, scan: scan, url: url, data: data, tier: tier == .preview ? .screen : tier,
                                       target: target, pool: pool)
         case .heif:
-            // 10-bit PQ previews (HDR PQ shooting mode): ask ImageIO for its tone-mapped SDR rendition.
-            decoded = try? publicImage(probe, subsample: subsample(probe, target), pool: pool,
-                                       extra: [kCGImageSourceDecodeRequest: kCGImageSourceDecodeToSDR])
+            // 10-bit PQ previews (HDR PQ shooting mode): ImageIO's tone-mapped SDR rendition, as native YCbCr converted
+            // on the GPU when the SPI is there.
+            decoded = nativeYCbCr(probe, scale: subsample(probe, target), pool: pool)
+                ?? (try? publicImage(probe, subsample: subsample(probe, target), pool: pool,
+                                     extra: [kCGImageSourceDecodeRequest: kCGImageSourceDecodeToSDR]))
         default:
             decoded = nil
         }
@@ -409,21 +414,53 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
             kCGImageSourceShouldCache: false,
         ]
         if always { options[kCGImageSourceCreateThumbnailFromImageAlways] = true }
+        if probe.hdrTransfer { options[kCGImageSourceDecodeRequest] = kCGImageSourceDecodeToSDR }
         guard let image = CGImageSourceCreateThumbnailAtIndex(probe.source, probe.index, options as CFDictionary),
               aspectMatches(image, probe.info),
               let pixels = try? NativeImage.pixels(image, pool: pool, opaque: !probe.info.hasAlpha) else { return nil }
         return Output(pixels: pixels, orientation: .up, path: "\(path) \(image.width)x\(image.height)")
     }
 
-    /// IOSurface SPI decode, nil when the symbol is missing or ImageIO declines.
-    private func surface(_ probe: DecodeProbe, subsample: Int) -> Output? {
-        guard let surface = IOSurfaceSPI.surface(probe.source, index: probe.index, subsample: subsample),
-              let layout = IOSurfaceSPI.layout(of: surface) else { return nil }
-        let (space, alpha) = traits(probe)
-        let pixels = PixelBuffer(width: IOSurfaceGetWidth(surface), height: IOSurfaceGetHeight(surface),
-                                 bytesPerRow: IOSurfaceGetBytesPerRow(surface), layout: layout, alpha: alpha,
-                                 colorSpace: space, storage: .surface(surface))
-        return Output(pixels: pixels, orientation: probe.info.orientation, path: "iosurface /\(subsample)")
+    /// IOSurface SPI decode, nil when the symbol is missing or ImageIO declines. PQ / HLG images are asked for their
+    /// tone-mapped SDR rendition (Display P3). Bi-planar YCbCr surfaces (10-bit sources, those SDR renditions) are
+    /// converted to RGB on the GPU: 24 MP 10-bit HEIC 8 ms + ~1 ms instead of the public path's 115–212 ms CPU draw.
+    private func surface(_ probe: DecodeProbe, subsample: Int, pool: PixelBufferPool) -> Output? {
+        let sdr = probe.hdrTransfer
+        guard let surface = IOSurfaceSPI.surface(probe.source, index: probe.index, subsample: subsample,
+                                                 request: sdr ? kCGImageSourceDecodeToSDR : nil) else { return nil }
+        if let layout = IOSurfaceSPI.layout(of: surface) {
+            let (space, alpha) = sdr ? (Self.displayP3, probe.info.hasAlpha ? AlphaMode.straight : .opaque) : traits(probe)
+            let pixels = PixelBuffer(width: IOSurfaceGetWidth(surface), height: IOSurfaceGetHeight(surface),
+                                     bytesPerRow: IOSurfaceGetBytesPerRow(surface), layout: layout, alpha: alpha,
+                                     colorSpace: space, storage: .surface(surface))
+            return Output(pixels: pixels, orientation: probe.info.orientation, path: "iosurface /\(subsample)")
+        }
+        // No alpha plane: an image with alpha takes the public path.
+        guard !probe.info.hasAlpha, YCbCrConverter.format(of: surface) != nil,
+              let pixels = YCbCrConverter.convert(surface, pool: pool, colorSpace: sdr ? Self.displayP3 : traits(probe).0)
+        else { return nil }
+        return Output(pixels: pixels, orientation: probe.info.orientation,
+                      path: "iosurface /\(subsample) ycbcr → gpu \(pixels.layout)\(sdr ? " (sdr)" : "")")
+    }
+
+    /// HEIF / AVIF decoded to their native bi-planar YCbCr at full size, converted to RGB and reduced by `scale` in one
+    /// GPU pass (`YCbCrConverter`). 8-bit images ask the SPI for `'420f'`; 10-bit ones and the SDR renditions of PQ / HLG
+    /// images come out bi-planar anyway (asking 10-bit ones for `'420f'` makes ImageIO convert them on the CPU: 39 ms).
+    /// Measured (M4 Pro, best of 5): 12 MP 8-bit HEIC 10 ms + pass instead of 32 ms (/1) or 30 ms (/4 for the
+    /// preview); 24 MP 10-bit 7.5 ms + pass instead of 36–75 ms at /2…/8. nil — the regular path follows — for images
+    /// with alpha (no alpha plane), beyond the texture limit, or when the SPI declines.
+    private func nativeYCbCr(_ probe: DecodeProbe, scale: Int, pool: PixelBufferPool) -> Output? {
+        let deep = probe.bitDepth > 8, sdr = probe.hdrTransfer
+        guard IOSurfaceSPI.isAvailable, !probe.info.hasAlpha, deep || sdr || IOSurfaceSPI.canRequestFormat,
+              max(probe.info.pixelWidth, probe.info.pixelHeight) <= YCbCrConverter.maxSide else { return nil }
+        guard let surface = IOSurfaceSPI.surface(probe.source, index: probe.index, subsample: 1,
+                                                 request: sdr ? kCGImageSourceDecodeToSDR : nil,
+                                                 format: deep || sdr ? nil : YCbCrConverter.fourCC("420f")),
+              YCbCrConverter.format(of: surface) != nil,
+              let pixels = YCbCrConverter.convert(surface, scale: scale, pool: pool,
+                                                  colorSpace: sdr ? Self.displayP3 : traits(probe).0) else { return nil }
+        return Output(pixels: pixels, orientation: probe.info.orientation,
+                      path: "iosurface ycbcr → gpu /\(scale) \(pixels.layout)\(sdr ? " (sdr)" : "")")
     }
 
     /// Colour space and alpha semantics of the source pixels, without decoding. The SPI keeps the
@@ -450,8 +487,9 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     }
 
     private func surfaceOrPublic(_ probe: DecodeProbe, subsample: Int, pool: PixelBufferPool) throws -> Output {
-        if let output = surface(probe, subsample: subsample) { return output }
-        return try publicImage(probe, subsample: subsample, pool: pool)
+        if let output = surface(probe, subsample: subsample, pool: pool) { return output }
+        return try publicImage(probe, subsample: subsample, pool: pool,
+                               extra: probe.hdrTransfer ? [kCGImageSourceDecodeRequest: kCGImageSourceDecodeToSDR] : [:])
     }
 
     /// Public fallback: a lazy CGImage (parallel-safe, unlike `ShouldCacheImmediately`) decoded by a

@@ -165,7 +165,7 @@ private func writePNG(_ p: PixelBuffer, to url: URL) {
     case .bgra8: info = (opaque ? CGImageAlphaInfo.noneSkipFirst : .premultipliedFirst).rawValue | CGBitmapInfo.byteOrder32Little.rawValue
     case .argb8: info = (opaque ? CGImageAlphaInfo.noneSkipFirst : .premultipliedFirst).rawValue
     case .rgba16: info = (opaque ? CGImageAlphaInfo.noneSkipLast : .premultipliedLast).rawValue | CGBitmapInfo.byteOrder16Little.rawValue
-    case .rgba16f: info = p.layout.cgBitmapInfo
+    case .rgba16f, .bgr10a2: info = p.layout.cgBitmapInfo
     }
     let data = Data(bytes: p.baseAddress, count: p.byteCount)
     guard let provider = CGDataProvider(data: data as CFData),
