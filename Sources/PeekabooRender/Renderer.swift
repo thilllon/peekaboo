@@ -110,9 +110,7 @@ public final class RenderContext: @unchecked Sendable {
         self.queue = queue
         let start = Trace.now()
         do {
-            let options = MTLCompileOptions()
-            options.mathMode = .fast
-            let library = try device.makeLibrary(source: Shaders.source, options: options)
+            let library = try device.makeLibrary(source: Shaders.source, options: Self.compileOptions())
             func compute(_ name: String) throws -> MTLComputePipelineState {
                 try device.makeComputePipelineState(function: library.makeFunction(name: name)!)
             }
@@ -144,6 +142,14 @@ public final class RenderContext: @unchecked Sendable {
         d.storageMode = .shared
         dummy = device.makeTexture(descriptor: d)!
         Trace.log("render context ready in \(String(format: "%.1f", Trace.ms(since: start))) ms")
+    }
+
+    /// Fast math, in the newest Metal language version the running system compiles (macOS 14: MSL 3.1).
+    /// `mathMode` replaced `fastMathEnabled` in macOS 15.
+    static func compileOptions() -> MTLCompileOptions {
+        let options = MTLCompileOptions()
+        if #available(macOS 15, *) { options.mathMode = .fast } else { options.fastMathEnabled = true }
+        return options
     }
 
     func presentPipeline(for format: MTLPixelFormat) -> MTLRenderPipelineState {
@@ -504,8 +510,9 @@ public final class Renderer {
     }
 
     /// EDR for HDR images (macOS 26 API: `preferredDynamicRange` + `contentsHeadroom` tag the drawables, so the
-    /// compositor neither tone-maps them to SDR nor spends EDR power on SDR images). Free when the range does not
-    /// change (every SDR → SDR swap).
+    /// compositor neither tone-maps them to SDR nor spends EDR power on SDR images; macOS 14–15:
+    /// `wantsExtendedDynamicRangeContent`, values above 1.0 clamped to the screen's current headroom). Free when the
+    /// range does not change (every SDR → SDR swap).
     private func configureDynamicRange(hdr: Bool) {
         guard hdr != hdrActive else { return }
         hdrActive = hdr
@@ -513,13 +520,15 @@ public final class Renderer {
         if hdr {
             layer.pixelFormat = .rgba16Float
             layer.colorspace = CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)
-            layer.contentsHeadroom = Self.hdrHeadroom
-            layer.preferredDynamicRange = .high
         } else {
             layer.pixelFormat = Self.drawableFormat
             layer.colorspace = CGColorSpace(name: CGColorSpace.displayP3)
-            layer.contentsHeadroom = 0
-            layer.preferredDynamicRange = .standard
+        }
+        if #available(macOS 26, *) {
+            layer.contentsHeadroom = hdr ? Self.hdrHeadroom : 0
+            layer.preferredDynamicRange = hdr ? .high : .standard
+        } else {
+            layer.wantsExtendedDynamicRangeContent = hdr
         }
     }
 

@@ -14,7 +14,7 @@ import Foundation
 /// `version` is the name shown to the user, `build` the `CFBundleVersion` that orders releases (see `AppVersion`).
 public struct UpdateManifest: Equatable, Sendable {
     public let version: AppVersion
-    /// `LSMinimumSystemVersion` of the release, e.g. `26.0`.
+    /// `LSMinimumSystemVersion` of the release, e.g. `14.0`.
     public let minimumSystemVersion: String
     /// The zipped app (the updater's payload).
     public let url: URL

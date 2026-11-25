@@ -8,8 +8,9 @@
 #include <stdio.h>
 #include <string.h>
 
-// Homebrew's libjpeg-turbo (the same build `CTurboJPEG` links statically; see Package.swift).
-#include "/opt/homebrew/opt/jpeg-turbo/include/jpeglib.h"
+// The libjpeg API of the libjpeg-turbo build PeekabooCore links statically (`mise run deps` installs its headers into
+// .deps/ next to turbojpeg.h; see Package.swift). A "file not found" here means it has not been built yet:
+#include "../../.deps/libjpeg-turbo/include/jpeglib.h"  // run `mise run deps`
 
 /// Progressive files with more scans than this are left to the exact decode (a legitimate scan script has < 100).
 enum { max_scans = 1000 };

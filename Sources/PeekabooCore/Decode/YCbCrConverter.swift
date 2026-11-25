@@ -143,6 +143,35 @@ enum YCbCrConverter {
         }
     }
 
+    /// The kernel, compiled at runtime in the running system's newest Metal language version: it must stay within MSL
+    /// 3.1, the newest macOS 14 compiles (`testShadersCompileAsMetal31ForMacOS14`).
+    static let shaderSource = """
+    #include <metal_stdlib>
+    using namespace metal;
+    struct P { float4 r, g, b, offset, scale; float2 chromaScale; int reduction, pad; };
+    kernel void ycbcrToRGB(texture2d<float, access::read> luma [[texture(0)]],
+                           texture2d<float, access::sample> chroma [[texture(1)]],
+                           texture2d<float, access::write> out [[texture(2)]],
+                           constant P& p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+        if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
+        constexpr sampler s(coord::pixel, address::clamp_to_edge, filter::linear);
+        // Box filter over the reduction's block of luma texels (clipped at the right and bottom edges).
+        uint2 size = uint2(luma.get_width(), luma.get_height());
+        uint n = uint(p.reduction);
+        uint2 origin = gid * n;
+        uint2 end = min(origin + n, size);
+        float y = 0.0f;
+        for (uint j = origin.y; j < end.y; j++)
+            for (uint i = origin.x; i < end.x; i++) y += luma.read(uint2(i, j)).r;
+        y = (y / float((end.x - origin.x) * (end.y - origin.y)) - p.offset.x) * p.scale.x;
+        // Chroma at the block's centre, in luma texels.
+        float2 centre = (float2(origin) + float2(end)) * 0.5f;
+        float2 c = (chroma.sample(s, centre * p.chromaScale).rg - p.offset.yz) * p.scale.yz;
+        float3 ycc = float3(y, c.x, c.y);
+        out.write(float4(saturate(float3(dot(p.r.xyz, ycc), dot(p.g.xyz, ycc), dot(p.b.xyz, ycc))), 1.0f), gid);
+    }
+    """
+
     /// Device, queue and pipeline, created on first use.
     private final class GPU: @unchecked Sendable {
         let device: MTLDevice
@@ -165,7 +194,7 @@ enum YCbCrConverter {
         private init?(device: MTLDevice) {
             let start = Trace.now()
             guard let queue = device.makeCommandQueue(),
-                  let library = try? device.makeLibrary(source: Self.source, options: nil),
+                  let library = try? device.makeLibrary(source: YCbCrConverter.shaderSource, options: nil),
                   let function = library.makeFunction(name: "ycbcrToRGB"),
                   let pipeline = try? device.makeComputePipelineState(function: function) else { return nil }
             self.device = device
@@ -173,32 +202,5 @@ enum YCbCrConverter {
             self.pipeline = pipeline
             Trace.log("YCbCr converter ready in \(String(format: "%.1f", Trace.ms(since: start))) ms")
         }
-
-        static let source = """
-        #include <metal_stdlib>
-        using namespace metal;
-        struct P { float4 r, g, b, offset, scale; float2 chromaScale; int reduction, pad; };
-        kernel void ycbcrToRGB(texture2d<float, access::read> luma [[texture(0)]],
-                               texture2d<float, access::sample> chroma [[texture(1)]],
-                               texture2d<float, access::write> out [[texture(2)]],
-                               constant P& p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
-            if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
-            constexpr sampler s(coord::pixel, address::clamp_to_edge, filter::linear);
-            // Box filter over the reduction's block of luma texels (clipped at the right and bottom edges).
-            uint2 size = uint2(luma.get_width(), luma.get_height());
-            uint n = uint(p.reduction);
-            uint2 origin = gid * n;
-            uint2 end = min(origin + n, size);
-            float y = 0.0f;
-            for (uint j = origin.y; j < end.y; j++)
-                for (uint i = origin.x; i < end.x; i++) y += luma.read(uint2(i, j)).r;
-            y = (y / float((end.x - origin.x) * (end.y - origin.y)) - p.offset.x) * p.scale.x;
-            // Chroma at the block's centre, in luma texels.
-            float2 centre = (float2(origin) + float2(end)) * 0.5f;
-            float2 c = (chroma.sample(s, centre * p.chromaScale).rg - p.offset.yz) * p.scale.yz;
-            float3 ycc = float3(y, c.x, c.y);
-            out.write(float4(saturate(float3(dot(p.r.xyz, ycc), dot(p.g.xyz, ycc), dot(p.b.xyz, ycc))), 1.0f), gid);
-        }
-        """
     }
 }

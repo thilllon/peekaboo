@@ -152,7 +152,9 @@ struct DecodeProbe {
     }
 
     private static func auxiliaryGainMap(_ source: CGImageSource, _ index: Int) -> Bool {
-        if CGImageSourceCopyAuxiliaryDataInfoAtIndex(source, index, kCGImageAuxiliaryDataTypeISOGainMap) != nil { return true }
+        // ISO 21496-1 gain maps: ImageIO reads them from macOS 15; older systems only know Apple's.
+        if #available(macOS 15, *),
+           CGImageSourceCopyAuxiliaryDataInfoAtIndex(source, index, kCGImageAuxiliaryDataTypeISOGainMap) != nil { return true }
         return CGImageSourceCopyAuxiliaryDataInfoAtIndex(source, index, kCGImageAuxiliaryDataTypeHDRGainMap) != nil
     }
 

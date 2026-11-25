@@ -153,7 +153,7 @@ func fakePeekabooApp(in root: URL, version: AppVersion) throws -> Bundle {
 /// Serve a `latest.json` in `root` announcing `version` (its zip at `zip`) through `PEEKABOO_UPDATE_URL`.
 func publishManifest(in root: URL, version: AppVersion, zip: String = "https://example.com/Peekaboo.zip") throws {
     let url = root.appendingPathComponent("latest.json")
-    let json: [String: Any] = ["version": version.name, "build": version.build, "minimumSystemVersion": "26.0", "url": zip,
+    let json: [String: Any] = ["version": version.name, "build": version.build, "minimumSystemVersion": "14.0", "url": zip,
                                "sha256": String(repeating: "0", count: 64), "size": 10]
     try JSONSerialization.data(withJSONObject: json).write(to: url)
     setenv("PEEKABOO_UPDATE_URL", url.absoluteString, 1)

@@ -14,6 +14,7 @@ measurements behind them (all measured on an M4 Pro, 48 GB, macOS 26.6, unless n
 | Upload | Zero-copy: decode into a shared `MTLBuffer` / IOSurface, wrap as texture | `makeTexture` over the buffer: 0.014 ms. `replace(region:)` 7.6 ms. |
 | Lifecycle | Stay resident after the last window closes | Re-open of a running app ≈ 65 ms (mostly `open`/LaunchServices) vs 230–250 ms cold. |
 | Shaders | MSL source embedded in Swift, compiled at runtime on a background thread started in `main()` | Offline compiler absent. 1.1 ms with a warm OS shader cache, 31–42 ms (≤ 97 ms) on first compile; hidden behind AppKit init. |
+| Oldest macOS | **14 (Sonoma)**, Apple Silicon. Newer APIs behind `#available` with the macOS 26 path unchanged (ISO gain-map probe 15+, `MTLCompileOptions.mathMode` 15+, EDR drawable tagging 26+); ImageIO's private surface SPI and its `kCGImageSurfaceFormatRequest` are `dlsym` lookups, and every route falls back to the public path without them; the runtime-compiled shaders (renderer, YCbCr converter) stay MSL 3.1; libjpeg-turbo built from its pinned release for 14.0 at `-O3` (`mise run deps`), whose own headers (TurboJPEG, and the libjpeg API of the early rendition) come from the same build; binaries record SDK 26.0 | Every strong import passes the SDK's macOS 14 availability annotations. On macOS 26 decode, pipeline, render and process-launch times are unchanged (same pixels), except libjpeg-turbo: Homebrew's bottle is `-Os`, upstream's Release `-O3` decodes progressive JPEGs 4–26 % faster (101 MP `.full` 795 → 587 ms; an `-Os` build of the same source measures as before). |
 
 ## 2. Decode paths (per format)
 
@@ -82,6 +83,11 @@ and hands it over as an approximate tier (`DecodedImage.isApproximate`) while th
 | 24 MP 4:4:4 | 36 ms | 76 ms | 35.5 dB | 300 ms |
 | 101 MP 4:4:4 (1/2) | 0.3 ms (160 px EXIF thumb) | 94 ms | 51.9 dB | 682 ms |
 | 22705 px panorama (1/4) | 0.2 ms (157 px EXIF thumb) | 146 ms | 49.8 dB | 933 ms |
+
+(Measured with Homebrew's `-Os` libjpeg-turbo. With the `-O3` build from `mise run deps` the exact tiers of these files
+decode 6–25 % faster (101 MP 717 → 539 ms) and the early renditions keep their PSNR to 0.01 dB; they land as early or
+up to 5 ms sooner, except the 101 MP one, 5 ms later beside its exact decode (92 → 98 ms; alone 94 → 96 ms: `-O3` code
+for its first-pass path, an `-Os` build of the same source takes 93 ms).)
 
 Rejected (measured, docs/research.md): libjpeg buffered-image mode in the same decode (same early time, exact +10 %),
 also skipping only the luma refinements (+1.4–4 dB for 2–4× the time), `TJPARAM_FASTUPSAMPLE`/`FASTDCT` for the
@@ -184,7 +190,8 @@ viewers score 21–26 dB and alias 10–25× more.
   Neighbours get pre-rendered fit canvases, so next/prev is a ~0.4 ms present.
 - **Colour**: working space linear Display P3; source → working conversion on the GPU (3×3 matrix + transfer function),
   never on the CPU. SDR: `bgra8Unorm` drawable tagged Display P3, sRGB-curve encode + TPDF ±1 LSB dither in the present
-  pass. HDR/EDR: `rgba16Float` + `extendedLinearDisplayP3`, macOS 26 `preferredDynamicRange`.
+  pass. HDR/EDR: `rgba16Float` + `extendedLinearDisplayP3`, macOS 26 `preferredDynamicRange` + `contentsHeadroom`
+  (macOS 14–15: `wantsExtendedDynamicRangeContent`).
 - **Tiling** above 16384 px (Apple9 limit, verified): level-0 tiles with an 8 px apron, visible tiles first.
 - **Pacing**: event-driven immediate render for discrete actions; a `CADisplayLink` only while animating;
   one drawable per refresh.

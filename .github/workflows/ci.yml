@@ -31,6 +31,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: sudo xcode-select -s /Applications/Xcode_27.2.app
-      - run: brew install jpeg-turbo
-      - run: swift build -c release
+      - uses: jdx/mise-action@v5
+      - uses: actions/cache@v6
+        with:
+          path: .deps
+          key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.mise/tasks/deps') }}
+      - run: mise run deps
+      # The app runs on macOS 14 (nothing built for a newer system may be linked in) and records SDK 26.0.
+      - name: swift build -c release
+        shell: bash
+        run: |
+          swift build -c release 2>&1 | tee "$RUNNER_TEMP/build.log"
+          if grep "built for newer" "$RUNNER_TEMP/build.log"; then exit 1; fi
+          vtool -show-build "$(swift build -c release --show-bin-path)/Peekaboo" | tr -s ' \n' ' ' | grep -q "minos 14.0 sdk 26.0"
       - run: swift test
