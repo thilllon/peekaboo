@@ -119,6 +119,13 @@
 	<string>public.app-category.photography</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
+	<!-- Shown in macOS's folder-access prompts, which Peekaboo asks for at first launch (FolderAccessRequest). -->
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Peekaboo lists the images in the folder you open, so you can browse them.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Peekaboo lists the images in the folder you open, so you can browse them.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Peekaboo lists the images in the folder you open, so you can browse them.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSPrincipalClass</key>

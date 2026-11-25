@@ -19,6 +19,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     var updateStatus: String? { updates?.updater.status }
     /// Built the first time `app.config` (⌘,) runs, never at launch.
     private(set) var settings: SettingsWindowController?
+    /// First launch: macOS asks for Desktop, Documents and Downloads then (built a second after launch; tests set it).
+    lazy var folderAccess = FolderAccessRequest()
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // The View menu carries its own full-screen items (instant and native); stop AppKit
@@ -72,10 +74,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             self.viewer?.showEmpty(nil)
         }
         // In-app updates start a second after launch, behind the first frame and its sharp tier; the first check
-        // waits 10 s more.
+        // waits 10 s more. The first launch's folder-access prompts start then too.
         if selfTest == nil {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.startUpdates() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                self?.startUpdates()
+                self?.requestFolderAccess()
+            }
         }
+    }
+
+    /// First launch only: macOS asks for Desktop, Documents and Downloads now, not in the middle of browsing.
+    private func requestFolderAccess() {
+        let started = Trace.now()
+        guard folderAccess.start(presentation: presentation, selfTest: selfTest != nil) else { return }
+        let ms = Trace.ms(since: started)
+        Trace.log(String(format: "folder access: first launch, listing %@ on a utility queue (main thread %.3f ms)",
+                         folderAccess.folders.map(\.lastPathComponent).joined(separator: ", "), ms))
     }
 
     private func startUpdates() {

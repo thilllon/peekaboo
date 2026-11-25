@@ -74,7 +74,11 @@ Everything below was measured on a MacBook Pro M4 Pro (see [docs/research.md](do
    (the volume is named after the version too, e.g. "Peekaboo 20261125-ab2342") and drag Peekaboo to Applications.
 2. Releases are signed with a Developer ID and notarized by Apple, so Peekaboo opens like any other app, and they update
    themselves.
-3. Optional: make it the default viewer with Finder → Get Info → Open with → Peekaboo → Change All.
+3. At first launch macOS asks, once for each, whether Peekaboo may access your Desktop, Documents and Downloads folders:
+   Peekaboo lists the folder of the image you open so you can browse it, and asks then rather than in the middle of your
+   work. macOS keeps the answers, across updates too; change them in **System Settings → Privacy & Security → Files and
+   Folders**. In a folder Peekaboo may not read, the image you open shows on its own and a toast says how to allow it.
+4. Optional: make it the default viewer with Finder → Get Info → Open with → Peekaboo → Change All.
 
 Requires macOS 14 (Sonoma) or later on Apple Silicon.
 

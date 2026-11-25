@@ -79,11 +79,13 @@ public enum FolderScanner {
     // MARK: Listing
 
     /// Every visible regular file (or symlink to one) in `directory`, unsorted; nil when the file system does not
-    /// support `getattrlistbulk`.
+    /// support `getattrlistbulk`. Throws a `POSIXError` with the system's reason (`posixCode`).
     public static func listBulk(_ directory: URL) throws -> [ImageFile]? {
         let path = directory.path
         let fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-        guard fd >= 0 else { throw CocoaError(.fileReadNoSuchFile, userInfo: [NSFilePathErrorKey: path]) }
+        guard fd >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO, userInfo: [NSFilePathErrorKey: path])
+        }
         defer { close(fd) }
         var request = attrlist()
         request.bitmapcount = u_short(ATTR_BIT_MAP_COUNT)
@@ -190,4 +192,16 @@ public enum FolderScanner {
 
     /// `ImageFile.modified` of a `stat` time (the listing and `FileStamp` must agree to the bit).
     static func seconds(_ time: timespec) -> Double { Double(time.tv_sec) + Double(time.tv_nsec) / 1e9 }
+
+    /// The POSIX reason of an error `scan` or `browse` threw (the bulk listing's own, or the one under a FileManager
+    /// error): `EPERM` when macOS privacy protection refuses the folder (System Settings › Privacy & Security ›
+    /// Files and Folders), `EACCES` when its permissions do. nil when there is none.
+    public static func posixCode(_ error: Error) -> Int32? {
+        var next: NSError? = error as NSError
+        while let current = next {
+            if current.domain == NSPOSIXErrorDomain { return Int32(current.code) }
+            next = current.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        return nil
+    }
 }

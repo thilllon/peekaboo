@@ -344,13 +344,13 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         } else if synchronous {
             // Launched with a folder: list it in this turn (getattrlistbulk, ≈ 0.2 ms per 100 files) instead of
             // in a main-queue turn that AppKit's launch delays by ~70 ms.
-            applyListing(try? FolderScanner.browse(urls), urls: urls, singleFile: false, opened: opened)
+            applyListing(Result { try FolderScanner.browse(urls) }, urls: urls, singleFile: false, opened: opened)
             presentFirstFrameNow()
             return
         }
         updateHUD()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let listing = try? FolderScanner.browse(urls)
+            let listing = Result { try FolderScanner.browse(urls) }
             DispatchQueue.main.async {
                 guard let self, generation == self.openGeneration else { return }
                 self.applyListing(listing, urls: urls, singleFile: singleFile, opened: opened)
@@ -358,14 +358,23 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         }
     }
 
-    private func applyListing(_ listing: (files: [ImageFile], index: Int)?, urls: [URL], singleFile: Bool, opened: UInt64) {
+    private func applyListing(_ result: Result<(files: [ImageFile], index: Int), Error>, urls: [URL], singleFile: Bool,
+                              opened: UInt64) {
         listingPending = false
-        guard let listing, !listing.files.isEmpty else {
+        guard case .success(let listing) = result, !listing.files.isEmpty else {
+            // A folder that macOS or its permissions do not let Peekaboo read: one toast says so, and how to allow it.
+            var denied = false
+            if case .failure(let error) = result, let folder = currentFolder,
+               let toast = Self.accessDeniedToast(error, folder: folder) {
+                denied = true
+                Trace.log("folder not readable: \(folder.lastPathComponent) (\(error))")
+                hud.showToast(toast, seconds: Self.accessDeniedToastSeconds)
+            }
             // An unreadable parent folder still shows the opened file on its own.
             if singleFile {
                 updateHUD()
             } else {
-                showEmpty(urls.count == 1 ? urls.first : nil)
+                showEmpty(urls.count == 1 ? urls.first : nil, unreadable: denied)
             }
             watchFolder()
             return
@@ -401,6 +410,23 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// The opened file before its folder is listed (size, date and inode not known yet).
     private static func placeholder(for url: URL) -> ImageFile {
         ImageFile(url: url, name: url.lastPathComponent, byteSize: 0, modified: 0, fileID: 0)
+    }
+
+    /// Long enough to read the way to allow it (a confirmation toast lasts 1.2 s).
+    static let accessDeniedToastSeconds: TimeInterval = 6
+
+    /// The toast for `folder` when listing it failed with `error` because access was refused, with the way to allow
+    /// it: macOS privacy protection (EPERM: Desktop, Documents or Downloads not allowed, a removable or network volume)
+    /// or the folder's permissions (EACCES). nil for any other error. A toast has no button, so it names the System
+    /// Settings pane instead of opening it.
+    static func accessDeniedToast(_ error: Error, folder: URL) -> String? {
+        guard let code = FolderScanner.posixCode(error) else { return nil }
+        let cannot = "Peekaboo cannot read “\(folder.lastPathComponent)”\n"
+        switch code {
+        case EPERM: return cannot + "Allow it in System Settings › Privacy & Security › Files and Folders"
+        case EACCES: return cannot + "Its permissions do not let you read it (Finder › Get Info)"
+        default: return nil
+        }
     }
 
     /// Index of `url` in the browsing set when it is a listed file of the folder being browsed.
@@ -458,8 +484,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
                          ready ? "presented" : "not ready", Trace.ms(since: start)))
     }
 
-    /// Nothing to show: an empty folder, or no file opened yet.
-    func showEmpty(_ folder: URL?) {
+    /// Nothing to show: an empty folder (`unreadable`: one Peekaboo may not read), or no file opened yet.
+    func showEmpty(_ folder: URL?, unreadable: Bool = false) {
         stopAnimation()
         replaceFiles([], index: 0)
         shownFile = nil
@@ -470,7 +496,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         setLoading(false)
         renderFrame()
         if let folder {
-            hud.setMessage("No images in “\(folder.lastPathComponent)”\nDrop images here or press ⌘O")
+            hud.setMessage("\(unreadable ? "Cannot read" : "No images in") “\(folder.lastPathComponent)”\n"
+                           + "Drop images here or press ⌘O")
         } else {
             hud.setMessage("Drop images or a folder here\nor press ⌘O to open")
         }

@@ -231,6 +231,14 @@ viewers score 21–26 dB and alias 10–25× more.
   Nothing of it runs before the first frame; launch → first frame is unchanged. The banner (an AppKit text field and
   buttons: 5–20 ms of main-thread work to build) waits for 1.5 s without input unless the user asked for it, so it
   never lands between two images or in a gesture.
+- Folder access: macOS asks once for each of Desktop, Documents and Downloads, the first time the app reads it (a
+  prompt that blocks the reading thread until it is answered). At first launch (`PeekabooFolderAccessRequested` in
+  the app's defaults) `FolderAccessRequest` lists the three one after another on a utility queue, a second after
+  launch next to the updater, so the prompts come right after installation instead of in the middle of browsing:
+  nothing runs before the first frame, and the main thread spends one `UserDefaults` read on it (plus a queue hop at
+  first launch). Never headless, in the self-test, with `PEEKABOO_ACTIONS` or outside an app bundle. A listing that
+  is refused (EPERM: privacy protection; EACCES: the folder's permissions) shows the opened image on its own and one
+  6 s toast with the way to allow it (System Settings › Privacy & Security › Files and Folders).
 
 ### Animation
 
