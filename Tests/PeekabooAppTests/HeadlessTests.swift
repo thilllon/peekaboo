@@ -42,6 +42,28 @@ final class HeadlessTests: ViewerTestCase {
         assertWindowServerShowsNothing()
     }
 
+    /// Instant full screen changes the app's presentation options (menu bar and Dock hidden, then shown): another
+    /// headless window that is ordered in meanwhile stays where it is, off every screen.
+    func testFullScreenLeavesOtherHeadlessWindowsOffScreen() throws {
+        let store = ConfigStore(url: root.appendingPathComponent("other.toml"))
+        let other = ViewerWindowController(configStore: store, presentation: .headless)
+        defer {
+            other.window?.close()
+            spin(0.05)
+        }
+        other.showEmpty(nil)
+        let frame = try XCTUnwrap(other.window?.frame)
+        let viewer = try makeViewer()
+        openAndWait(viewer, [writeImage(folder.appendingPathComponent("a.jpg"), width: 900, height: 600, gray: 0.4)])
+        viewer.perform(.fullscreen)
+        spin(0.3)
+        assertNothingOnScreen()
+        viewer.perform(.fullscreen)
+        spin(0.3)
+        XCTAssertEqual(other.window?.frame, frame)
+        assertNothingOnScreen()
+    }
+
     /// The app delegate activates the app when it launches, while it presents the first frame and when it shows the
     /// Settings window: never headless.
     func testTheAppDelegateNeverActivatesTheApp() throws {

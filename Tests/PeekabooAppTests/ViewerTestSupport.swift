@@ -43,6 +43,9 @@ class ViewerTestCase: XCTestCase {
             spin(0.05)
         }
         viewer = nil
+        // Subclasses close their own windows before this runs: one still ordered in would stay for the rest of the run.
+        let open = NSApp.windows.filter { $0.isVisible && ($0 is ViewerWindow || $0 is SettingsWindow) }
+        XCTAssertEqual(open.map(Self.describe), [], "the test left windows open")
         if let root { try? FileManager.default.removeItem(at: root) }
         for observer in focusObservers { NotificationCenter.default.removeObserver(observer) }
         focusObservers = []
@@ -137,10 +140,10 @@ class ViewerTestCase: XCTestCase {
             })
         }
         record(NSApplication.didBecomeActiveNotification) { _ in "the test process became the active app" }
-        record(NSWindow.didBecomeKeyNotification) { "\($0.object.map { "\($0)" } ?? "a window") became key" }
+        record(NSWindow.didBecomeKeyNotification) { note in "\((note.object as? NSWindow).map(Self.describe) ?? "a window") became key" }
         record(NSWindow.didChangeOcclusionStateNotification) { note in
             guard let window = note.object as? NSWindow, window.occlusionState.contains(.visible) else { return nil }
-            return "\(window) came on screen at \(window.frame)"
+            return "\(Self.describe(window)) came on screen"
         }
         addTeardownBlock { [weak self] in self?.assertNothingOnScreen() }
     }
@@ -152,11 +155,18 @@ class ViewerTestCase: XCTestCase {
         XCTAssertFalse(NSApp.isActive, "the test process is the active app", file: file, line: line)
         let screens = NSScreen.screens.map(\.frame)
         for window in NSApp.windows where window.isVisible {
-            XCTAssertEqual(window.alphaValue, 0, "\(window) is not transparent", file: file, line: line)
-            XCTAssertFalse(screens.contains { $0.intersects(window.frame) }, "\(window) is on a screen at \(window.frame)",
+            XCTAssertEqual(window.alphaValue, 0, "\(Self.describe(window)) is not transparent", file: file, line: line)
+            XCTAssertFalse(screens.contains { $0.intersects(window.frame) }, "\(Self.describe(window)) is on a screen \(screens)",
                            file: file, line: line)
-            XCTAssertFalse(window.isKeyWindow, "\(window) is key", file: file, line: line)
+            XCTAssertFalse(window.isKeyWindow, "\(Self.describe(window)) is key", file: file, line: line)
         }
+    }
+
+    /// A window, for failure messages: class, number, title, frame, alpha, and whether a controller still owns it.
+    static func describe(_ window: NSWindow) -> String {
+        let offScreen = (window as? ViewerWindow)?.staysOffScreen ?? (window as? SettingsWindow)?.staysOffScreen
+        return "\(type(of: window)) #\(window.windowNumber) “\(window.title)” at \(window.frame) alpha \(window.alphaValue)"
+            + " staysOffScreen \(offScreen.map { "\($0)" } ?? "-") controller \(window.windowController.map { "\(type(of: $0))" } ?? "none")"
     }
 
     // MARK: Introspection

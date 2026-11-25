@@ -66,6 +66,7 @@ final class SettingsWindowTests: ViewerTestCase {
         delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
         let viewer: ViewerWindowController = try XCTUnwrap(property(delegate, "viewer"))
         defer {
+            spin(0.05)  // the drop hint the launch queued, which would show the viewer again after it is closed
             delegate.settings?.window?.close()
             viewer.window?.close()
             spin(0.05)
