@@ -21,7 +21,10 @@ let package = Package(
         // libjpeg-turbo (static): parallel CPU JPEG decoding with DCT scaling and ROI crops.
         .systemLibrary(name: "CTurboJPEG", path: "Sources/CTurboJPEG"),
         // Own C decoders where ImageIO is slow: PNG (system zlib) and the early rendition of progressive JPEGs.
-        .target(name: "CPeekabooDecode", linkerSettings: [.linkedLibrary("z")]),
+        // SwiftPM builds release C at -Os, which leaves the unfilter's per-byte loops rolled (the left neighbours go
+        // through memory): 24 MP PNG 158–165 vs 138–143 ms at -O3 with two threads, 272 vs 202 ms with one.
+        .target(name: "CPeekabooDecode", cSettings: [.unsafeFlags(["-O3"], .when(configuration: .release))],
+                linkerSettings: [.linkedLibrary("z")]),
         // Decode tiers, tiered cache, prefetch scheduler, folder model, config/keymap. No AppKit.
         .target(
             name: "PeekabooCore",
