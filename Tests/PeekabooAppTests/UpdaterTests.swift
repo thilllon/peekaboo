@@ -3,6 +3,9 @@ import XCTest
 @testable import PeekabooApp
 @testable import PeekabooCore
 
+/// Release `n` of these tests: `202611nn-0000nn` with build number `n` (25 < 26).
+func releaseVersion(_ n: Int) -> AppVersion { AppVersion(name: String(format: "202611%02d-0000%02d", n, n), build: n)! }
+
 /// The updater as the Settings window sees it (`PeekabooCheckForUpdatesNow` in, `PeekabooUpdateStatusChanged` out),
 /// against a manifest file instead of the network, and a cache folder of its own. Nothing is installed, and the one
 /// download tried is of a file that does not exist.
@@ -21,12 +24,12 @@ final class UpdaterTests: XCTestCase {
         super.tearDown()
     }
 
-    private func fakeApp(_ version: String) throws -> Bundle { try fakePeekabooApp(in: root, version: version) }
+    private func fakeApp(_ version: AppVersion) throws -> Bundle { try fakePeekabooApp(in: root, version: version) }
 
     /// The updater's folder for these tests (never the user's).
     private var cache: URL { root.appendingPathComponent("cache") }
 
-    private func publish(_ version: String) throws { try publishManifest(in: root, version: version) }
+    private func publish(_ version: AppVersion) throws { try publishManifest(in: root, version: version) }
 
     /// Statuses posted until one starts with `final`.
     private func statuses(until final: String, after trigger: () -> Void) -> [String] {
@@ -48,38 +51,38 @@ final class UpdaterTests: XCTestCase {
     }
 
     func testCheckNowFromSettingsPostsTheStatus() throws {
-        try publish("20261125")
-        let updater = try XCTUnwrap(Updater(settings: AppConfig.Updates(check: false), bundle: try fakeApp("20261125"), cache: cache))
+        try publish(releaseVersion(25))
+        let updater = try XCTUnwrap(Updater(settings: AppConfig.Updates(check: false), bundle: try fakeApp(releaseVersion(25)), cache: cache))
         let controller = UpdateController(updater: updater) { nil }
         let seen = statuses(until: "Up to date") {
             NotificationCenter.default.post(name: Notification.Name("PeekabooCheckForUpdatesNow"), object: nil)
         }
-        XCTAssertEqual(seen, ["Checking for updates…", "Up to date (20261125)"])
+        XCTAssertEqual(seen, ["Checking for updates…", "Up to date (20261125-000025)"])
         XCTAssertEqual(updater.phase, .upToDate)
         XCTAssertFalse(controller.canPerformUpdate)
     }
 
     func testANewerReleaseWaitsForTheUserWithoutAutoInstall() throws {
-        try publish("20261126")
+        try publish(releaseVersion(26))
         let updater = try XCTUnwrap(Updater(settings: AppConfig.Updates(check: false, autoInstall: false),
-                                            bundle: try fakeApp("20261125"), cache: cache))
+                                            bundle: try fakeApp(releaseVersion(25)), cache: cache))
         let controller = UpdateController(updater: updater) { nil }
-        let seen = statuses(until: "Peekaboo 20261126 is available") { updater.checkNow(show: false) }
-        XCTAssertEqual(seen.last, "Peekaboo 20261126 is available")
+        let seen = statuses(until: "Peekaboo 20261126-000026 is available") { updater.checkNow(show: false) }
+        XCTAssertEqual(seen.last, "Peekaboo 20261126-000026 is available")
         guard case .available(let manifest, nil) = updater.phase else { return XCTFail("\(updater.phase)") }
-        XCTAssertEqual(manifest.version, AppVersion("20261126"))
+        XCTAssertEqual(manifest.version, releaseVersion(26))
         XCTAssertTrue(controller.canPerformUpdate)
     }
 
     func testStatusTexts() {
-        let current = AppVersion("20261125")!
+        let current = releaseVersion(25)
         func text(_ phase: Updater.Phase, _ settings: AppConfig.Updates = AppConfig.Updates(), installs: Bool = true) -> String {
             Updater.statusText(phase, current: current, settings: settings, installsOnQuit: installs)
         }
-        XCTAssertEqual(text(.idle), "Peekaboo 20261125 · checks for updates automatically")
-        XCTAssertEqual(text(.idle, AppConfig.Updates(check: false)), "Peekaboo 20261125 · automatic update checks are off")
+        XCTAssertEqual(text(.idle), "Peekaboo 20261125-000025 · checks for updates automatically")
+        XCTAssertEqual(text(.idle, AppConfig.Updates(check: false)), "Peekaboo 20261125-000025 · automatic update checks are off")
         XCTAssertEqual(text(.checking), "Checking for updates…")
-        XCTAssertEqual(text(.upToDate), "Up to date (20261125)")
+        XCTAssertEqual(text(.upToDate), "Up to date (20261125-000025)")
         XCTAssertEqual(text(.failed("Could not check for updates: offline")), "Could not check for updates: offline")
     }
 
@@ -99,13 +102,13 @@ final class UpdaterTests: XCTestCase {
         return seen
     }
 
-    /// The helper could not install 20261126 behind the last quit: the next run says so once, and automatic checks
+    /// The helper could not install release 26 behind the last quit: the next run says so once, and automatic checks
     /// offer the download instead of fetching it to fail again on every quit; "Check for Updates…" tries again.
     func testAFailedInstallIsToldOnceAndNotFetchedAgain() throws {
         // The zip does not exist: a retry fails at once, without the network.
-        try publishManifest(in: root, version: "20261126", zip: root.appendingPathComponent("missing.zip").absoluteString)
-        let app = try fakeApp("20261125")
-        UpdateInstaller.Failure(version: AppVersion("20261126")!, target: app.bundleURL, reason: "Operation not supported")
+        try publishManifest(in: root, version: releaseVersion(26), zip: root.appendingPathComponent("missing.zip").absoluteString)
+        let app = try fakeApp(releaseVersion(25))
+        UpdateInstaller.Failure(version: releaseVersion(26), target: app.bundleURL, reason: "Operation not supported")
             .write(in: cache)
         var policy = UpdatePolicy()
         policy.firstCheckDelay = 0
@@ -114,7 +117,7 @@ final class UpdaterTests: XCTestCase {
 
         let first = try XCTUnwrap(Updater(settings: AppConfig.Updates(), bundle: app, cache: cache, policy: policy))
         let seen = phases(of: first, until: available) { first.start() }
-        XCTAssertEqual(seen.filter(\.shown).map(\.phase), [.failed("Peekaboo 20261126 could not be installed: Operation not supported")])
+        XCTAssertEqual(seen.filter(\.shown).map(\.phase), [.failed("Peekaboo 20261126-000026 could not be installed: Operation not supported")])
         XCTAssertFalse(seen.contains { downloading($0.phase) }, "fetched again")
         guard case .available(_, let blocked) = first.phase else { return XCTFail("\(first.phase)") }
         XCTAssertEqual(blocked, "installing it failed (Operation not supported)")
@@ -135,11 +138,12 @@ final class UpdaterTests: XCTestCase {
 }
 
 /// A bundle in `root` that passes for Peekaboo.app `version` (unsigned: nothing may be installed from or over it).
-func fakePeekabooApp(in root: URL, version: String) throws -> Bundle {
+func fakePeekabooApp(in root: URL, version: AppVersion) throws -> Bundle {
     let contents = root.appendingPathComponent("Peekaboo.app/Contents")
     try FileManager.default.createDirectory(at: contents.appendingPathComponent("MacOS"), withIntermediateDirectories: true)
-    let info: [String: Any] = ["CFBundleIdentifier": "com.thilllon.Peekaboo", "CFBundleShortVersionString": version,
-                               "CFBundleExecutable": "Peekaboo", "CFBundlePackageType": "APPL"]
+    let info: [String: Any] = ["CFBundleIdentifier": "com.thilllon.Peekaboo", "CFBundleShortVersionString": version.name,
+                               "CFBundleVersion": String(version.build), "CFBundleExecutable": "Peekaboo",
+                               "CFBundlePackageType": "APPL"]
     try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
         .write(to: contents.appendingPathComponent("Info.plist"))
     FileManager.default.createFile(atPath: contents.appendingPathComponent("MacOS/Peekaboo").path, contents: Data())
@@ -147,9 +151,9 @@ func fakePeekabooApp(in root: URL, version: String) throws -> Bundle {
 }
 
 /// Serve a `latest.json` in `root` announcing `version` (its zip at `zip`) through `PEEKABOO_UPDATE_URL`.
-func publishManifest(in root: URL, version: String, zip: String = "https://example.com/Peekaboo.zip") throws {
+func publishManifest(in root: URL, version: AppVersion, zip: String = "https://example.com/Peekaboo.zip") throws {
     let url = root.appendingPathComponent("latest.json")
-    let json: [String: Any] = ["version": version, "minimumSystemVersion": "26.0", "url": zip,
+    let json: [String: Any] = ["version": version.name, "build": version.build, "minimumSystemVersion": "26.0", "url": zip,
                                "sha256": String(repeating: "0", count: 64), "size": 10]
     try JSONSerialization.data(withJSONObject: json).write(to: url)
     setenv("PEEKABOO_UPDATE_URL", url.absoluteString, 1)
@@ -169,8 +173,8 @@ final class UpdateBannerTests: ViewerTestCase {
 
     func testAnAutomaticBannerWaitsForAPauseInTheInput() throws {
         let viewer = try makeViewer()
-        try publishManifest(in: root, version: "20261126")
-        let app = try fakePeekabooApp(in: root, version: "20261125")
+        try publishManifest(in: root, version: releaseVersion(26))
+        let app = try fakePeekabooApp(in: root, version: releaseVersion(25))
         let updater = try XCTUnwrap(Updater(settings: AppConfig.Updates(check: false, autoInstall: false), bundle: app,
                                             cache: root.appendingPathComponent("cache")))
         let controller = UpdateController(updater: updater) { viewer }

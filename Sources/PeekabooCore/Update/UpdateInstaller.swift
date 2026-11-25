@@ -68,7 +68,7 @@ public enum UpdateInstaller {
         return stat(url.path, &info) == 0 ? info.st_dev : nil
     }
 
-    /// Delete every staged version under `root` except `keeping`.
+    /// Delete every staged version under `root` (folders named `AppVersion.token`) except `keeping`.
     public static func removeStaged(in root: URL, keeping: AppVersion? = nil) {
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { return }
@@ -113,8 +113,10 @@ public enum UpdateInstaller {
         guard info.identifier == CodeSignature.bundleIdentifier else {
             throw UpdateError.verification("unexpected bundle identifier \(info.identifier ?? "none")")
         }
+        // The build too: an older signed release under a manifest that names a newer build must not install.
         guard info.version == version else {
-            throw UpdateError.verification("it is version \(info.version?.description ?? "?"), not \(version)")
+            let found = info.version.map { "\($0) (build \($0.build))" } ?? "?"
+            throw UpdateError.verification("it is version \(found), not \(version) (build \(version.build))")
         }
         try CodeSignature.check(app, requirement: requirement)
     }
@@ -129,7 +131,7 @@ public enum UpdateInstaller {
         }
         let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
         return (plist?["CFBundleIdentifier"] as? String,
-                (plist?["CFBundleShortVersionString"] as? String).flatMap(AppVersion.init))
+                AppVersion(shortVersion: plist?["CFBundleShortVersionString"], bundleVersion: plist?["CFBundleVersion"]))
     }
 
     // MARK: Install
@@ -165,7 +167,7 @@ public enum UpdateInstaller {
     /// checks then offer that version as a download instead of fetching it again and failing on every quit; a
     /// manual check or a newer release tries again.
     public struct Failure: Codable, Equatable, Sendable {
-        /// The version that did not install.
+        /// The version that did not install (`AppVersion.token`).
         public var version: String
         /// Path of the bundle it was meant to replace (another copy of the app is not concerned).
         public var target: String
@@ -175,7 +177,7 @@ public enum UpdateInstaller {
         public var reported = false
 
         public init(version: AppVersion, target: URL, reason: String) {
-            self.version = version.description
+            self.version = version.token
             self.target = target.path
             self.reason = reason
         }
@@ -232,9 +234,9 @@ public enum UpdateInstaller {
             self.reopen = reopen
         }
 
-        /// `--install-update <pid> <staged app> <target app> <version> [--relaunch] [--open <file>]`
+        /// `--install-update <pid> <staged app> <target app> <version token> [--relaunch] [--open <file>]`
         public var arguments: [String] {
-            var arguments = [UpdateInstaller.helperFlag, String(pid), staged.path, target.path, version.description]
+            var arguments = [UpdateInstaller.helperFlag, String(pid), staged.path, target.path, version.token]
             if relaunch { arguments.append("--relaunch") }
             if let reopen { arguments += ["--open", reopen.path] }
             return arguments
@@ -306,7 +308,7 @@ public enum UpdateInstaller {
             // Before the relaunch, so that the relaunched app can say so.
             if let cache { Failure(version: job.version, target: job.target, reason: failureReason(error)).write(in: cache) }
         }
-        // The staged app sat in a folder named after its version (`<staging root>/<version>/Peekaboo.app`); after
+        // The staged app sat in a folder named after its version (`<staging root>/<token>/Peekaboo.app`); after
         // the attempt it holds the old app or a download that failed its checks.
         let folder = job.staged.deletingLastPathComponent()
         if AppVersion(folder.lastPathComponent) == job.version { try? FileManager.default.removeItem(at: folder) }

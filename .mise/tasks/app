@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-#MISE description="Build build/Peekaboo.app (release; CONFIG=debug for debug), version VERSION (default: today, YYYYMMDD), signed with the keychain's Developer ID (hardened runtime), else ad-hoc"
+#MISE description="Build build/Peekaboo.app (release; CONFIG=debug for debug), version YYYYMMDD-<sha6> and build number (commit count) of HEAD (VERSION= and BUILD= override them), signed with the Developer ID (hardened runtime), else ad-hoc"
 # mise runs file tasks from the project root.
 set -euo pipefail
 source .mise/lib/signing.sh
+source .mise/lib/version.sh
+load_release_env
 CONFIG="${CONFIG:-release}"
-# Versions are dates: YYYYMMDD, and YYYYMMDD.N for a further release the same day (`mise run release` picks it).
-VERSION="${VERSION:-$(date +%Y%m%d)}"
-[[ "$VERSION" =~ ^[0-9]{8}(\.[1-9][0-9]*)?$ ]] || { echo "VERSION must be YYYYMMDD or YYYYMMDD.N, not $VERSION" >&2; exit 1; }
-COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-[[ -z "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]] || COMMIT="$COMMIT-dirty"
+# The version of HEAD (YYYYMMDD-<sha6>) and its build number (commits up to HEAD); tests pass VERSION= and BUILD=.
+VERSION="${VERSION:-$(head_version || true)}"
+BUILD="${BUILD:-$(head_build || true)}"
+[[ "$VERSION" =~ ^[0-9]{8}-[0-9a-f]{6}$ ]] || { echo "VERSION must be YYYYMMDD-<sha6>, not \"$VERSION\" (outside a git checkout, set VERSION and BUILD)" >&2; exit 1; }
+[[ "$BUILD" =~ ^[1-9][0-9]{0,8}$ ]] || { echo "BUILD must be a positive integer, not \"$BUILD\"" >&2; exit 1; }
 IDENTITY="$(sign_identity)"
 
 swift build -c "$CONFIG" --product Peekaboo
@@ -32,9 +34,7 @@ fi
 PLIST="$APP/Contents/Info.plist"
 cp Resources/Info.plist "$PLIST"
 plutil -replace CFBundleShortVersionString -string "$VERSION" "$PLIST"
-# The build number is the version too: dates and same-day suffixes only grow (20261125 < 20261125.1 < 20261126).
-plutil -replace CFBundleVersion -string "$VERSION" "$PLIST"
-plutil -replace PeekabooCommit -string "$COMMIT" "$PLIST"
+plutil -replace CFBundleVersion -string "$BUILD" "$PLIST"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 # CLI launcher ships inside the bundle; `mise run install` links it onto PATH.
 cp Resources/peekaboo "$APP/Contents/Resources/peekaboo"
@@ -58,5 +58,6 @@ else
   codesign --force --sign "$IDENTITY" --options runtime --timestamp "$APP"
 fi
 codesign --verify --strict "$APP"
-echo "Peekaboo $VERSION ($COMMIT), $(is_developer_id "$APP" && echo "Developer ID signed" || echo "ad-hoc signed")"
+echo "Peekaboo $VERSION (build $BUILD), $(is_developer_id "$APP" && echo "Developer ID signed" || echo "ad-hoc signed")"
+[[ -z "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]] || echo "note: built from a modified working tree" >&2
 echo "$APP"

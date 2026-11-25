@@ -200,11 +200,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         }
     }
 
-    /// The About panel names the version and the commit it was built from: "Version 20261125 (1a2b3c4)".
+    /// The standard About panel: "Version 20261125-ab2342 (35)", from `CFBundleShortVersionString` and the build
+    /// number `CFBundleVersion`.
     @objc func showAbout(_ sender: Any?) {
-        var options: [NSApplication.AboutPanelOptionKey: Any] = [.version: BuildInfo.commit ?? ""]
-        if let version = BuildInfo.version { options[.applicationVersion] = version }
-        NSApp.orderFrontStandardAboutPanel(options: options)
+        NSApp.orderFrontStandardAboutPanel(options: [:])
     }
 
     @objc func checkForUpdates(_ sender: Any?) { updates?.checkForUpdates() }

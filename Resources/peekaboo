@@ -6,8 +6,8 @@ set -euo pipefail
 if [[ "${1:-}" == --version || "${1:-}" == -V ]]; then
   plist="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/../Info.plist"
   version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")"
-  commit="$(/usr/libexec/PlistBuddy -c 'Print :PeekabooCommit' "$plist" 2>/dev/null || true)"
-  echo "Peekaboo $version${commit:+ ($commit)}"
+  build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist" 2>/dev/null || true)"
+  echo "Peekaboo $version${build:+ ($build)}"
   exit 0
 fi
 if [[ $# -eq 0 ]]; then exec open -a Peekaboo; fi

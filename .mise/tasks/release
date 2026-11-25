@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-#MISE description="Release: date version (today YYYYMMDD, a further release the same day YYYYMMDD.1, …), Developer ID signed + notarized app and DMG, tag and GitHub Release with Peekaboo-<v>.dmg, Peekaboo.dmg, Peekaboo-<v>.zip and latest.json. DRY_RUN=1 prints the notarization and publishing commands; ALLOW_ADHOC=1 publishes without a Developer ID"
+#MISE description="Release HEAD of main as YYYYMMDD-<sha6> (build number = commit count): Developer ID signed + notarized app and DMG, tag v<version> and GitHub Release \"Peekaboo <version>\" with Peekaboo-<version>.dmg, Peekaboo.dmg, Peekaboo-<version>.zip and latest.json. DRY_RUN=1 prints the notarization and publishing commands; ALLOW_ADHOC=1 publishes without a Developer ID"
 # mise runs file tasks from the project root.
 set -euo pipefail
 source .mise/lib/signing.sh
+source .mise/lib/version.sh
+load_release_env
 REPO=thilllon/peekaboo
 # A failed precondition stops a release; a dry run reports it and goes on, to show the rest.
 fail() {
@@ -14,29 +16,25 @@ fail() {
 git diff --quiet && git diff --cached --quiet || fail "the working tree is not clean"
 git fetch -q --tags origin main
 [[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || fail "main is not in sync with origin/main"
+# The build number counts commits: a shallow clone would count too few.
+[[ "$(git rev-parse --is-shallow-repository)" == false ]] || fail "a shallow clone: git fetch --unshallow first"
 dry || gh auth status >/dev/null 2>&1 || fail "gh is not logged in (gh auth login)"
 
-# 2. The version: today, or the next free YYYYMMDD.N; never older than the latest date tag.
-TAGS="$({ git tag -l; git ls-remote --tags --refs origin | sed 's|.*refs/tags/||'; } | sort -u)"
-if [[ -n "${1:-}" ]]; then
-  VERSION="$1"
-  [[ "$VERSION" =~ ^[0-9]{8}(\.[1-9][0-9]*)?$ ]] || { echo "the version is YYYYMMDD or YYYYMMDD.N, not $VERSION" >&2; exit 1; }
-else
-  DAY="$(date +%Y%m%d)"
-  VERSION="$DAY"
-  N=0
-  while grep -qxF "$VERSION" <<<"$TAGS"; do
-    N=$((N + 1))
-    VERSION="$DAY.$N"
-  done
-fi
-if grep -qxF "$VERSION" <<<"$TAGS"; then echo "tag $VERSION exists" >&2; exit 1; fi
-LATEST="$(grep -E '^[0-9]{8}(\.[0-9]+)?$' <<<"$TAGS" | sort -t. -k1,1n -k2,2n | tail -n 1 || true)"
-if [[ -n "$LATEST" && "$(printf '%s\n%s\n' "$LATEST" "$VERSION" | sort -t. -k1,1n -k2,2n | tail -n 1)" != "$VERSION" ]]; then
-  echo "$VERSION is not newer than the latest release $LATEST" >&2
+# 2. The version of HEAD: YYYYMMDD-<sha6> (the same commit always gets the same one) and its build number, which
+#    must be above the latest release's (the updater installs only higher builds).
+[[ $# -eq 0 ]] || { echo "usage: mise run release (the version comes from HEAD: YYYYMMDD-<sha6>)" >&2; exit 1; }
+VERSION="$(head_version)"
+BUILD="$(head_build)"
+TAG="v$VERSION"
+if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+  echo "$TAG exists: HEAD is released already" >&2
   exit 1
 fi
-echo "releasing Peekaboo $VERSION"
+# The latest release's manifest (none before the first release with an updater, v0.1.0).
+LATEST_BUILD="$(curl -fsSL "https://github.com/$REPO/releases/latest/download/latest.json" 2>/dev/null \
+  | plutil -extract build raw -o - - 2>/dev/null || echo 0)"
+(( BUILD > LATEST_BUILD )) || fail "build $BUILD is not above the latest release's build $LATEST_BUILD"
+echo "releasing Peekaboo $VERSION (build $BUILD) as $TAG"
 
 # 3. A Developer ID, or an explicit ad-hoc release (it will not open on other Macs without "Open Anyway").
 if [[ "$(sign_identity)" == - && "${ALLOW_ADHOC:-0}" != 1 ]]; then
@@ -44,7 +42,7 @@ if [[ "$(sign_identity)" == - && "${ALLOW_ADHOC:-0}" != 1 ]]; then
 fi
 
 # 4. Build, sign, notarize, staple: build/Peekaboo.app, build/Peekaboo-$VERSION.zip and .dmg.
-RELEASE=1 VERSION="$VERSION" ./.mise/tasks/app
+RELEASE=1 VERSION="$VERSION" BUILD="$BUILD" ./.mise/tasks/app
 NOTARIZE=1 ./.mise/tasks/dmg
 APP=build/Peekaboo.app
 ZIP="build/Peekaboo-$VERSION.zip"
@@ -54,20 +52,25 @@ if is_developer_id "$APP"; then
 elif [[ "${ALLOW_ADHOC:-0}" != 1 ]]; then
   fail "the app is not Developer ID signed"
 fi
+# The updater accepts only updates signed by the running app's team: a release from another team would strand users.
+if [[ -n "${TEAM_ID:-}" ]] && is_developer_id "$APP" && [[ "$(team_id "$APP")" != "$TEAM_ID" ]]; then
+  fail "the app is signed by team $(team_id "$APP"), not $TEAM_ID (APPLE_TEAM_ID of .env.production)"
+fi
 # Same bytes under a stable name: https://github.com/$REPO/releases/latest/download/Peekaboo.dmg
 cp "$DMG" build/Peekaboo.dmg
 
 # 5. latest.json: what the in-app updater reads (Sources/PeekabooCore/Update/UpdateManifest.swift).
-BASE="https://github.com/$REPO/releases/download/$VERSION"
+BASE="https://github.com/$REPO/releases/download/$TAG"
 cat > build/latest.json <<JSON
 {
   "version": "$VERSION",
+  "build": $BUILD,
   "minimumSystemVersion": "$(plutil -extract LSMinimumSystemVersion raw -o - "$APP/Contents/Info.plist")",
   "url": "$BASE/Peekaboo-$VERSION.zip",
   "sha256": "$(shasum -a 256 "$ZIP" | awk '{ print $1 }')",
   "size": $(stat -f %z "$ZIP"),
   "dmg": "$BASE/Peekaboo-$VERSION.dmg",
-  "notes": "https://github.com/$REPO/releases/tag/$VERSION",
+  "notes": "https://github.com/$REPO/releases/tag/$TAG",
   "published": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 JSON
@@ -75,8 +78,8 @@ plutil -convert xml1 -o /dev/null build/latest.json
 cat build/latest.json
 
 # 6. Tag, push the tag, publish.
-run git tag -a "$VERSION" -m "Peekaboo $VERSION"
-run git push -q origin "refs/tags/$VERSION"
-run gh release create "$VERSION" "$DMG" build/Peekaboo.dmg "$ZIP" build/latest.json --repo "$REPO" \
+run git tag -a "$TAG" -m "Peekaboo $VERSION"
+run git push -q origin "refs/tags/$TAG"
+run gh release create "$TAG" "$DMG" build/Peekaboo.dmg "$ZIP" build/latest.json --repo "$REPO" \
   --title "Peekaboo $VERSION" --generate-notes --latest --verify-tag
-if dry; then echo "DRY_RUN: nothing was tagged or published"; else echo "released $VERSION"; fi
+if dry; then echo "DRY_RUN: nothing was tagged or published"; else echo "released $TAG"; fi

@@ -137,9 +137,10 @@ Updates, which shows the outcome in its status line (`Up to date (20261125)`). T
 in one atomic rename. When Peekaboo cannot replace itself (it runs from the disk image or from a quarantined
 copy, or its folder is not writable), it offers the release page instead. If an install fails when Peekaboo
 quits, the next launch says why once, and that release is then offered as a download from the release page
-instead of being fetched again; **Check for Updates…** (or a newer release) tries the install again. Each release is named after its
-day: `20261125`, and `20261125.1` for a second release that day. The About panel, Settings (General and
-Updates) and `peekaboo --version` show the version and the commit it was built from.
+instead of being fetched again; **Check for Updates…** (or a newer release) tries the install again. A release is named
+after its commit, e.g. `20261125-ab2342` (the day and the start of the commit hash); its build number (e.g. `35`)
+decides which release is newer. The About panel, Settings (General and
+Updates) and `peekaboo --version` show both.
 
 ## Key bindings
 

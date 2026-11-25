@@ -71,7 +71,7 @@ Everything below was measured on a MacBook Pro M4 Pro (see [docs/research.md](do
 ## Install
 
 1. Download [Peekaboo.dmg](https://github.com/thilllon/peekaboo/releases/latest/download/Peekaboo.dmg) (the volume is named
-   after the version, e.g. "Peekaboo 20261125") and drag Peekaboo to Applications.
+   after the version, e.g. "Peekaboo 20261125-ab2342") and drag Peekaboo to Applications.
 2. Releases are signed with a Developer ID and notarized by Apple, so Peekaboo opens like any other app. (The first release,
    0.1.0, was not: if macOS refuses to open it, use **System Settings → Privacy & Security → Open Anyway**, or install the
    current release.)
@@ -79,8 +79,8 @@ Everything below was measured on a MacBook Pro M4 Pro (see [docs/research.md](do
 
 Requires macOS 26 (Tahoe) on Apple Silicon.
 
-**Versions are dates**: `20261125`, and `20261125.1` for a second release that day. Peekaboo › About Peekaboo, Settings
-and `peekaboo --version` show the version and the commit it was built from.
+**Versions** are the release commit's day and the start of its hash, e.g. `20261125-ab2342`. Peekaboo › About Peekaboo,
+Settings and `peekaboo --version` show it with the build number, e.g. `20261125-ab2342 (35)`.
 
 **Updates**: when it is online, Peekaboo looks for a newer release (10 s after launch at the earliest, then every 6 hours and
 when the network comes back; never while it launches or on the main thread). A new release is downloaded in the background,
