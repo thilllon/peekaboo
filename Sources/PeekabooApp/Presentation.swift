@@ -7,9 +7,10 @@ import AppKit
 /// `.headless` is for tests, which drive real windows (renderer, pipeline, folder watcher): a window is ordered in, so
 /// it renders and `isVisible` holds, but it stays transparent, click-through, behind other windows and off every
 /// screen; it never becomes key and the app never activates. A test run therefore never shows a window or takes the
-/// keyboard focus (tests also set the `.prohibited` activation policy). Like any hidden window it gets no
-/// display-link ticks: an animation steps, but does not advance on its own. Instant full screen keeps the window off
-/// screen at the screen's size; native full screen, which takes a Space on a screen, is skipped.
+/// keyboard focus (tests also set the `.prohibited` activation policy). The window is never visible
+/// (`occlusionState`), so it behaves as a hidden one: an animation does not start playing on its own. Instant full
+/// screen keeps the window off screen at the screen's size; native full screen, which takes a Space on a screen, is
+/// skipped.
 ///
 /// A stored value, not an environment lookup: the launch path pays one comparison per order-in.
 enum Presentation {
