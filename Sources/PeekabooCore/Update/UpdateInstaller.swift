@@ -21,6 +21,9 @@ public enum UpdateInstaller {
         if app.path.contains("/AppTranslocation/") {
             return "Peekaboo runs from a quarantined copy: move it to the Applications folder first"
         }
+        if (try? app.resourceValues(forKeys: [.volumeIsReadOnlyKey]))?.volumeIsReadOnly == true {
+            return "Peekaboo runs from the disk image: drag it to the Applications folder first"
+        }
         let folder = app.deletingLastPathComponent()
         if access(folder.path, W_OK) != 0 || access(app.path, W_OK) != 0 {
             return "“\(folder.lastPathComponent)” is not writable"

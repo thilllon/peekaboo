@@ -14,7 +14,7 @@ is_developer_id "$APP" && SIGNED=1
 NOTARY=0
 [[ "${NOTARIZE:-1}" == 1 ]] && { [[ $SIGNED == 1 ]] || dry; } && NOTARY=1
 IDENTITY="$(sign_identity)"
-[[ "$IDENTITY" == - ]] && IDENTITY="Developer ID Application: …"
+[[ "$IDENTITY" == - ]] && IDENTITY=DEVELOPER_ID_APPLICATION  # a dry run without a certificate
 
 rm -f build/Peekaboo-*.zip build/Peekaboo-*.dmg
 # The app: sign (app task) → zip → notarize → staple → zip again, so the zip carries the ticket.

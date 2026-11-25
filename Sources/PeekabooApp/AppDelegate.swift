@@ -64,15 +64,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             guard let self, !self.openedSomething else { return }
             self.viewer?.showEmpty(nil)
         }
-        // The first frame is on screen: updates wait 10 s more before touching the network.
+        // In-app updates start a second after launch, behind the first frame and its sharp tier; the first check
+        // waits 10 s more.
         if selfTest == nil {
-            let started = Trace.now()
-            updates = UpdateController(settings: configStore.config.updates) { [weak self] in self?.viewer }
-            updates?.updater.start()
-            if updates != nil {
-                Trace.log(String(format: "update: set up in %.3f ms, first check in %.0f s", Trace.ms(since: started),
-                                 UpdatePolicy().firstCheckDelay))
-            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.startUpdates() }
+        }
+    }
+
+    private func startUpdates() {
+        let started = Trace.now()
+        updates = Updater(settings: configStore.config.updates).map { updater in
+            UpdateController(updater: updater) { [weak self] in self?.viewer }
+        }
+        updates?.updater.start()
+        if updates != nil {
+            Trace.log(String(format: "update: set up in %.3f ms, first check in %.0f s", Trace.ms(since: started),
+                             UpdatePolicy().firstCheckDelay))
         }
     }
 

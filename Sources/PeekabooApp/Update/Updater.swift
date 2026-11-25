@@ -31,6 +31,9 @@ final class Updater {
 
     /// Main thread.
     private(set) var phase = Phase.idle
+    /// The verified update waiting to be installed (main thread). Unlike `phase` it survives a re-check that is in
+    /// flight or fails, so quitting at that moment still installs it.
+    private(set) var ready: (manifest: UpdateManifest, app: URL)?
     /// One line for the Settings window and the toasts, e.g. `Up to date (20261125)`.
     private(set) var status = ""
     /// Main thread, after every phase change; `show` is true when the user asked for this outcome.
@@ -65,7 +68,7 @@ final class Updater {
     private var monitor: NWPathMonitor?
     private var connectivity = ConnectivityEdge()
     private var stagingRoot: URL?
-    private var staged: (version: AppVersion, app: URL)?
+    private var staged: (manifest: UpdateManifest, app: URL)?
 
     /// nil unless this is Peekaboo running from its app bundle with a version (not `swift run`, not tests).
     init?(settings: AppConfig.Updates, bundle: Bundle = .main) {
@@ -136,14 +139,14 @@ final class Updater {
     /// "Restart to Update": start the installer, which relaunches the app (reopening `file`) once it has quit.
     /// False when the installer cannot start (the phase then says why): the app keeps running.
     func restartToUpdate(reopening file: URL?) -> Bool {
-        guard case .ready(let manifest, let app) = phase else { return false }
-        return startInstaller(manifest, staged: app, relaunch: true, reopen: file)
+        guard let ready else { return false }
+        return startInstaller(ready.manifest, staged: ready.app, relaunch: true, reopen: file)
     }
 
     /// The app is quitting: install a ready update behind it (auto-install on, or asked for).
     func installOnQuit() {
-        guard case .ready(let manifest, let app) = phase, settings.autoInstall || requested else { return }
-        _ = startInstaller(manifest, staged: app, relaunch: false, reopen: nil)
+        guard let ready, settings.autoInstall || requested else { return }
+        _ = startInstaller(ready.manifest, staged: ready.app, relaunch: false, reopen: nil)
     }
 
     private func startInstaller(_ manifest: UpdateManifest, staged: URL, relaunch: Bool, reopen: URL?) -> Bool {
@@ -201,7 +204,8 @@ final class Updater {
         busy = true
         showOutcome = show
         Trace.log("update: \(trigger.rawValue) check of \(manifestURL.absoluteString)")
-        publish(.checking)
+        // A background re-check leaves a ready update on show until it has an outcome.
+        if staged == nil || trigger == .manual { publish(.checking) }
         var request = URLRequest(url: manifestURL)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         // Automatic checks wait for a connection; a manual one reports at once that there is none.
@@ -231,7 +235,8 @@ final class Updater {
 
     private func evaluate(_ manifest: UpdateManifest) {
         guard manifest.version > current else {
-            // An update staged but installed another way (the DMG) is stale now.
+            // An update staged but installed another way (the DMG), or a withdrawn release, is stale now.
+            staged = nil
             if let cached = UpdateInstaller.cachedUpdates { UpdateInstaller.removeStaged(in: cached) }
             return finish(.upToDate)
         }
@@ -239,26 +244,29 @@ final class Updater {
             return finish(.available(manifest, blocked: "it needs macOS \(manifest.minimumSystemVersion)"))
         }
         if let reason = UpdateInstaller.cannotReplaceReason(app) { return finish(.available(manifest, blocked: reason)) }
+        if let staged, staged.manifest.version == manifest.version, FileManager.default.fileExists(atPath: staged.app.path) {
+            return finish(.ready(manifest, app: staged.app))
+        }
+        // Without auto-install nothing touches the disk until the user asks for the update.
+        guard queueSettings.autoInstall || requestedOnQueue else { return finish(.available(manifest, blocked: nil)) }
         if stagingRoot == nil { stagingRoot = try? UpdateInstaller.stagingRoot(for: app) }
         guard let root = stagingRoot, let requirement = CodeSignature.updateRequirementForRunningApp() else {
             return finish(.available(manifest, blocked: "it cannot be staged"))
-        }
-        if let staged, staged.version == manifest.version, FileManager.default.fileExists(atPath: staged.app.path) {
-            return finish(.ready(manifest, app: staged.app))
         }
         // Downloaded by an earlier run that quit before installing it: check it again (the cache is the user's).
         let folder = root.appendingPathComponent(manifest.version.description, isDirectory: true)
         let previous = folder.appendingPathComponent("Peekaboo.app", isDirectory: true)
         if (try? UpdateInstaller.verify(previous, version: manifest.version, requirement: requirement)) != nil {
-            staged = (manifest.version, previous)
+            staged = (manifest, previous)
             return finish(.ready(manifest, app: previous))
         }
-        guard queueSettings.autoInstall || requestedOnQueue else { return finish(.available(manifest, blocked: nil)) }
         download(manifest, into: folder, root: root, requirement: requirement)
     }
 
     private func download(_ manifest: UpdateManifest, into folder: URL, root: URL, requirement: String) {
         let fm = FileManager.default
+        // A newer release replaces whatever was staged before.
+        staged = nil
         UpdateInstaller.removeStaged(in: root)
         do {
             try fm.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -301,7 +309,7 @@ final class Updater {
             try? FileManager.default.removeItem(at: zip)
             try UpdateInstaller.verify(app, version: manifest.version, requirement: requirement)
             Trace.log(String(format: "update: %@ downloaded in %.0f ms and verified", manifest.version.description, ms))
-            staged = (manifest.version, app)
+            staged = (manifest, app)
             finish(.ready(manifest, app: app))
         } catch {
             try? FileManager.default.removeItem(at: folder)
@@ -312,6 +320,12 @@ final class Updater {
     /// The check (and download) in flight is over.
     private func finish(_ phase: Phase) {
         busy = false
+        var phase = phase
+        // A background re-check that failed (offline) changes nothing about the update that is ready.
+        if case .failed(let message) = phase, let staged, !showOutcome {
+            Trace.log("update: \(message)")
+            phase = .ready(staged.manifest, app: staged.app)
+        }
         publish(phase, show: showOutcome)
         showOutcome = false
     }
@@ -337,10 +351,16 @@ final class Updater {
         }
         if case .failed(let message) = phase { Trace.log("update: \(message)") }
         self.phase = phase
-        if case .ready = phase, !suddenTerminationDisabled {
-            // Logging out must quit the app properly, so that the ready update installs.
-            ProcessInfo.processInfo.disableSuddenTermination()
-            suddenTerminationDisabled = true
+        switch phase {
+        case .ready(let manifest, let app):
+            ready = (manifest, app)
+            if !suddenTerminationDisabled {
+                // Logging out must quit the app properly, so that the ready update installs.
+                ProcessInfo.processInfo.disableSuddenTermination()
+                suddenTerminationDisabled = true
+            }
+        case .upToDate, .available, .downloading: ready = nil
+        case .idle, .checking, .failed: break
         }
         let text = Self.statusText(phase, current: current, settings: settings, installsOnQuit: settings.autoInstall || requested)
         if text != status {

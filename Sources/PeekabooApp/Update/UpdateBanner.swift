@@ -24,6 +24,8 @@ final class UpdateBanner: NSView {
             control.controlSize = .small
             control.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
             control.refusesFirstResponder = true
+            // The first button is the action; accent-coloured like a default button, without taking Return.
+            if index == 0 { control.bezelColor = .controlAccentColor }
             control.sizeToFit()
             views.append(control)
             actions.append(button.action)
