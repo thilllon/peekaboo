@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+#MISE description="Download and derive the benchmark corpus into $PEEKABOO_CORPUS (default ~/Library/Caches/peekaboo-corpus)"
+# Real photographs (Wikimedia Commons, raw.pixls.us CC0, libjxl/libultrahdr test data) plus formats derived locally
+# with sips / jpeg-turbo / webp tools. Idempotent: existing files are kept. Needs `brew install jpeg-turbo webp`.
+set -euo pipefail
+C="${PEEKABOO_CORPUS:-$HOME/Library/Caches/peekaboo-corpus}"
+mkdir -p "$C"/{jpeg,formats,hdr,navsrc,raw,anim,nav}
+UA="peekaboo-corpus-fetch/1.0"
+
+fetch() { # fetch <dest> <url>
+  local dest="$C/$1" url="$2" try
+  [[ -s "$dest" ]] && return 0
+  for try in 1 2 3 4 5; do
+    if curl -fsSL --retry 2 -A "$UA" -o "$dest.part" "$url"; then mv "$dest.part" "$dest"; echo "got $1"; sleep 1; return 0; fi
+    echo "retry $try: $1" >&2; sleep $((try * 5))
+  done
+  rm -f "$dest.part"; echo "FAILED $1 <- $url" >&2; return 1
+}
+derive() { # derive <dest> <command...>: run the command (writing $OUT) unless dest exists
+  local dest="$C/$1"; shift
+  [[ -s "$dest" ]] && return 0
+  OUT="$dest.part.${dest##*.}" "$@" && mv "$dest.part.${dest##*.}" "$dest" && echo "made ${dest#"$C"/}"
+}
+
+W=https://upload.wikimedia.org/wikipedia/commons
+fetch jpeg/jpeg_12mp_4000x3000.jpg "$W/4/44/2.Mussaenda_philippica_2.jpg"
+fetch jpeg/jpeg_24mp_5947x3964.jpg "$W/8/85/Les_ruines_du_Ch%C3%A2teau_de_Logne_et_la_vall%C3%A9e_de_l%27Ourthe.jpg"
+fetch jpeg/jpeg_50mp_8688x5792.jpg "$W/6/68/Moscow_2026-07-22_07.jpg"
+fetch jpeg/jpeg_60mp_9504x6336.jpg "$W/5/55/Vineyards_and_hillside_houses_near_Merano_-_2026-09-14_-_DSC09806.jpg"
+fetch jpeg/jpeg_101mp_11800x8600.jpg "$W/d/d4/Cypraea_tigris_02.jpg"
+fetch jpeg/jpeg_pano_22705x3184.jpg "$W/1/13/Hamburg_-_Binnnenalster_01.jpg"
+fetch navsrc/nav_src_elephants_50mp.jpg "$W/a/a1/079_Herd_of_African_bush_elephants_drinking_in_Etosha_National_Park_Photo_by_Giles_Laurent.jpg"
+fetch navsrc/nav_src_giraffes_44mp.jpg "$W/d/d2/077_Angolan_giraffes_cuddling_at_sunset_in_Etosha_National_Park_Photo_by_Giles_Laurent.jpg"
+fetch navsrc/nav_src_grandcanyon_11mp.jpg "$W/f/fb/Sunrise_from_Grand_Canyon_Village_-_8349_%2855121088440%29.jpg"
+fetch navsrc/nav_src_jaguar_13mp.jpg "$W/f/f3/129_Jaguar_crossing_the_river_in_Encontro_das_%C3%81guas_State_Park_Photo_by_Giles_Laurent.jpg"
+fetch anim/gif_rotating_earth.gif "https://commons.wikimedia.org/wiki/Special:FilePath/Rotating_earth_(large).gif"
+fetch formats/jxl_bike_conformance.jxl https://raw.githubusercontent.com/libjxl/conformance/master/testcases/bike/input.jxl
+fetch formats/jxl_cafe_conformance.jxl https://raw.githubusercontent.com/libjxl/conformance/master/testcases/cafe/input.jxl
+fetch hdr/jpeg_apple_gainmap_new_small.jpg https://raw.githubusercontent.com/google/libultrahdr/main/tests/data/apple_gainmap_new.jpg
+R=https://raw.pixls.us/data
+fetch raw/raw_apple_iphone12pro_proraw.DNG "$R/Apple/iPhone%2012%20Pro/IMG_1361.DNG"
+fetch raw/raw_canon_eosr5m2_45mp.CR3 "$R/Canon/Canon%20EOS%20R5m2/RAW.CR3"
+fetch raw/raw_fuji_xt4_26mp_compressed.RAF "$R/Fujifilm/X-T4/DSCF0267.RAF"
+fetch raw/raw_nikon_z7_46mp_lossless.NEF "$R/Nikon/Z%207/3-Nikon-Z7-RAW-14bit-lossless-compressed-L.NEF"
+fetch raw/raw_sony_ilce7rm4_61mp_compressed.ARW "$R/Sony/ILCE-7RM4/DSC00396.ARW"
+
+J24="$C/jpeg/jpeg_24mp_5947x3964.jpg"
+derive jpeg/jpeg_24mp_5947x3964_progressive.jpg sh -c 'jpegtran -progressive -copy all -outfile "$OUT" "$0"' "$J24"
+derive jpeg/jpeg_24mp_5947x3964_q90_420.jpg sh -c 'djpeg -bmp "$0" | cjpeg -quality 90 -sample 2x2 -outfile "$OUT"' "$J24"
+derive jpeg/jpeg_24mp_5947x3964_q90_444.jpg sh -c 'djpeg -bmp "$0" | cjpeg -quality 90 -sample 1x1 -outfile "$OUT"' "$J24"
+derive jpeg/jpeg_24mp_5947x3964_mozprog.jpg sh -c 'djpeg -bmp "$0" | cjpeg -quality 90 -progressive -optimize -outfile "$OUT"' "$J24"
+derive formats/png_24mp_5947x3964.png sh -c 'sips -s format png "$0" --out "$OUT" >/dev/null' "$J24"
+derive formats/tiff_24mp_5947x3964_8bit.tiff sh -c 'sips -s format tiff "$0" --out "$OUT" >/dev/null' "$J24"
+derive formats/avif_24mp_5947x3964.avif sh -c 'sips -s format avif "$0" --out "$OUT" >/dev/null' "$J24"
+derive formats/webp_24mp_5947x3964_q90.webp sh -c 'cwebp -quiet -q 90 "$1" -o "$OUT"' "$J24" "$C/formats/png_24mp_5947x3964.png"
+derive formats/webp_24mp_5947x3964_lossless.webp sh -c 'cwebp -quiet -lossless -z 3 "$1" -o "$OUT"' "$J24" "$C/formats/png_24mp_5947x3964.png"
+derive formats/png_12mp_screenshot_like.png sh -c 'sips -s format png -Z 4000 "$0" --out "$OUT" >/dev/null' "$C/jpeg/jpeg_12mp_4000x3000.jpg"
+derive formats/heic_12mp_4000x3000.heic sh -c 'sips -s format heic "$0" --out "$OUT" >/dev/null' "$C/jpeg/jpeg_12mp_4000x3000.jpg"
+derive formats/heic_50mp_8688x5792.heic sh -c 'sips -s format heic "$0" --out "$OUT" >/dev/null' "$C/jpeg/jpeg_50mp_8688x5792.jpg"
+derive navsrc/nav_src_giraffes_44mp.heic sh -c 'sips -s format heic "$0" --out "$OUT" >/dev/null' "$C/navsrc/nav_src_giraffes_44mp.jpg"
+ORIENT="$(mktemp -t orient).swift"
+cat > "$ORIENT" <<'SWIFT'
+import Foundation
+import ImageIO
+// Lossless copy with EXIF orientation 6 (rotate 90° CW to display).
+let a = CommandLine.arguments
+let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: a[1]) as CFURL, nil)!
+let dst = CGImageDestinationCreateWithURL(URL(fileURLWithPath: a[2]) as CFURL, CGImageSourceGetType(src)!, 1, nil)!
+let opts = [kCGImageDestinationOrientation: 6, kCGImageDestinationMergeMetadata: true] as CFDictionary
+var error: Unmanaged<CFError>?
+guard CGImageDestinationCopyImageSource(dst, src, opts, &error) else { exit(1) }
+SWIFT
+derive jpeg/jpeg_12mp_4000x3000_exif_orientation6.jpg sh -c 'swift "$1" "$0" "$OUT"' "$C/jpeg/jpeg_12mp_4000x3000.jpg" "$ORIENT"
+rm -f "$ORIENT"
+derive anim/webp_rotating_earth.webp sh -c 'gif2webp -quiet -lossy -q 80 "$0" -o "$OUT"' "$C/anim/gif_rotating_earth.gif"
+
+# nav/: 120 APFS clones (no extra disk) cycling through 12 photos; every 4th file is HEIC.
+SRCS=(jpeg/jpeg_12mp_4000x3000.jpg navsrc/nav_src_elephants_50mp.jpg formats/heic_12mp_4000x3000.heic
+  jpeg/jpeg_24mp_5947x3964.jpg navsrc/nav_src_grandcanyon_11mp.jpg jpeg/jpeg_60mp_9504x6336.jpg
+  navsrc/nav_src_giraffes_44mp.heic navsrc/nav_src_jaguar_13mp.jpg jpeg/jpeg_50mp_8688x5792.jpg
+  navsrc/nav_src_giraffes_44mp.jpg formats/heic_50mp_8688x5792.heic jpeg/jpeg_24mp_5947x3964_progressive.jpg)
+for i in $(seq 1 120); do
+  src="${SRCS[$(((i - 1) % 12))]}"
+  name="$(printf %04d "$i").${src##*.}"
+  [[ -e "$C/nav/$name" ]] || cp -c "$C/$src" "$C/nav/$name"
+done
+
+cat > "$C/LICENSES.md" <<'EOF'
+# Peekaboo benchmark corpus — sources and licenses
+
+Not redistributed with the repository; `mise run corpus` downloads and derives it.
+
+- jpeg_12mp_4000x3000.jpg — Wikimedia Commons "2.Mussaenda philippica 2.jpg", CC BY-SA 4.0 (heic_12mp, png_12mp, orientation-6 copies derive from it)
+- jpeg_24mp_5947x3964.jpg — Wikimedia Commons "Les ruines du Château de Logne et la vallée de l'Ourthe.jpg", CC BY-SA 4.0 (progressive, q90, PNG, TIFF, AVIF, WebP derive from it)
+- jpeg_50mp_8688x5792.jpg — Wikimedia Commons "Moscow 2026-07-22 07.jpg", CC0 (heic_50mp derives from it)
+- jpeg_60mp_9504x6336.jpg — Wikimedia Commons "Vineyards and hillside houses near Merano - 2026-09-14 - DSC09806.jpg", CC BY-SA 4.0
+- jpeg_101mp_11800x8600.jpg — Wikimedia Commons "Cypraea tigris 02.jpg", CC BY-SA 3.0
+- jpeg_pano_22705x3184.jpg — Wikimedia Commons "Hamburg - Binnnenalster 01.jpg", CC BY-SA 3.0
+- nav_src_elephants / giraffes / jaguar — Wikimedia Commons photos by Giles Laurent, CC BY-SA 4.0
+- nav_src_grandcanyon_11mp.jpg — Wikimedia Commons "Sunrise from Grand Canyon Village - 8349", public domain (NPS)
+- gif_rotating_earth.gif — Wikimedia Commons "Rotating earth (large).gif", see its Commons page (webp_rotating_earth derives from it)
+- jxl_*_conformance.jxl — libjxl/conformance test data, BSD-3-Clause
+- jpeg_apple_gainmap_new_small.jpg — google/libultrahdr test data, Apache-2.0
+- raw/* — raw.pixls.us, CC0
+EOF
+echo "corpus ready: $C"

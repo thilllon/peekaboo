@@ -1,8 +1,19 @@
 # Peekaboo — instructions for coding agents
 
 Peekaboo is an ultra-fast image viewer for macOS on Apple Silicon. **Speed is the product.**
-Judge every change first by launch-to-first-pixel, next/previous latency and zoom/pan
-smoothness (120 Hz ProMotion, 144 Hz external), then by features.
+
+## Rule #1 — performance is the first principle, always
+
+**Performance comes first, no matter what, in every decision.** When anything conflicts with speed —
+a feature, a setting, a dependency, UI polish, code style, a deadline — speed wins. Judge every change
+first by launch-to-first-pixel, next/previous latency, time to sharp and zoom/pan smoothness
+(120 Hz ProMotion, 144 Hz external), and only then by features.
+
+- New features must cost ~0 on the hot paths: nothing on the launch path before the first frame,
+  nothing on the main thread during navigation; initialise lazily, after the first frame, off the main thread.
+- Measure before and after on the target Mac (`PEEKABOO_TRACE=1`, `peekaboo-bench`, `--selftest`) and put
+  the numbers in the PR. A change without numbers that touches a hot path is not done.
+- If a request would slow a hot path, find a design that doesn't, or say so plainly. Never ship a silent regression.
 
 ## Non-negotiable rules
 
@@ -10,7 +21,9 @@ smoothness (120 Hz ProMotion, 144 Hz external), then by features.
   personal e-mail addresses, absolute home paths (`/Users/<name>/…`), agent scratch paths.
   `gitleaks` (config: `.gitleaks.toml`) runs on every commit and push via lefthook and in CI.
   Never bypass it (`--no-verify`, `LEFTHOOK=0`); remove the offending content instead.
-- Commit messages: imperative subject line. Do not add `Co-Authored-By` trailers.
+- Commit messages: imperative subject line.
+- **No AI attribution anywhere**: no `Co-Authored-By` trailers, no "Generated with …" lines, no agent session
+  URLs or IDs in commits, PR titles/descriptions, issues, comments or release notes.
 - One GitHub issue per workstream; PR descriptions say `Closes #N`. Merge only when
   `swift build` and `swift test` pass (CI runs both plus the secret scan).
 - Keep `main` lean: delete unused code, functions, files, scripts and prototypes instead of
@@ -36,6 +49,7 @@ brew install jpeg-turbo   # static libturbojpeg linked into PeekabooCore
 | Release | `mise run release <version>`: tag on `main`, build the DMG, publish a GitHub Release |
 | Secret scan (history + tree) | `mise run secrets` |
 | Latency trace | `PEEKABOO_TRACE=1 build/Peekaboo.app/Contents/MacOS/Peekaboo <image>` |
+| Benchmark corpus | `mise run corpus` → `~/Library/Caches/peekaboo-corpus` (override with `PEEKABOO_CORPUS`) |
 | Benchmarks | `swift run -c release peekaboo-bench <suite>` |
 
 ## Debug switches
@@ -48,7 +62,7 @@ brew install jpeg-turbo   # static libturbojpeg linked into PeekabooCore
 | `PEEKABOO_NO_IOSURFACE_SPI=1` | force the public ImageIO path instead of the private IOSurface fast path |
 | `PEEKABOO_HDR=1` | decode gain-map photos to HDR (off by default: 13× the SDR cost) |
 | `PEEKABOO_CONFIG=<file>` | use another config file |
-| `peekaboo-bench decode / pipeline [--cold] / render [--png DIR]` | regression benches (corpus from `PEEKABOO_CORPUS`) |
+| `peekaboo-bench decode / pipeline [--cold] / render [--png DIR]` | regression benches (corpus from `PEEKABOO_CORPUS`, built by `mise run corpus`) |
 
 ## Layout
 
