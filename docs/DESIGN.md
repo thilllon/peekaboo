@@ -106,9 +106,10 @@ palette indices past the palette.
 HDR (gain-map HEIC/JPEG, PQ / HLG HEIF): `kCGImageSourceDecodeRequest = DecodeToHDR` (10-bit PQ / half-float) when the screen
 reports EDR headroom > 1, displayed through the EDR path of the renderer. SDR otherwise (PQ / HLG: ImageIO's SDR rendition).
 
-`main()` decodes a 16 px HEIC (`HEVCWarmUp`) on a utility thread while AppKit starts, so a HEIC opened at launch decodes
-warm: process start → first committed frame of a 36 MP HEIC without a thumbnail item 226 → 140 ms (median of 8
-interleaved runs, its first decode 112 → 55 ms); a JPEG launch is unchanged (137 vs 134 ms).
+`main()` decodes a 16 px HEIC (`HEVCWarmUp`) while AppKit starts, on the userInitiated thread that builds
+`FolderScanner.supportedExtensions` and right after it (ImageIO is initialised by then, so no decode waits for a slower
+thread to finish that). A HEIC opened at launch decodes warm: process start → first committed frame of a 36 MP HEIC
+without a thumbnail item 189 → 141 ms, a JPEG launch unchanged (128 vs 126 ms), medians of 16 interleaved runs.
 
 ## 3. Pipeline — predictive prefetch & tiered cache ("P4")
 
