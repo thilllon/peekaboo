@@ -617,12 +617,16 @@ public final class ImagePipeline {
     }
 
     /// An early rendition from a decode still running: shown while it is the current image's best, never cached (the
-    /// job delivers the exact tier, which replaces it). Pixels from a file that has changed since the job was planned
-    /// are dropped.
+    /// job delivers the exact tier, which replaces it). Pixels of another version of the file than the listed one are
+    /// dropped. The file the app opens is decoded before its folder is listed (a placeholder without size or date, and
+    /// the listing lands during the decode): what the worker's `stat` saw before decoding is compared instead.
     private func handlePartial(_ outcome: DecodeOutcome) {
         let key = outcome.job.key
         guard case .success(let image) = outcome.result, let i = position(of: key.url, name: outcome.job.file.name),
-              i == index, !isCached(i, key.tier), FileStamp(files[i]) == FileStamp(outcome.job.file) else { return }
+              i == index, !isCached(i, key.tier) else { return }
+        if let listed = FileStamp(files[i]), let decoded = outcome.stamp ?? FileStamp(outcome.job.file), decoded != listed {
+            return
+        }
         stats.partials += 1
         onDecoded?(files[i], image)
     }

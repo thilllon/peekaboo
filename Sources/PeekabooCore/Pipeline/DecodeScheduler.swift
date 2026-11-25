@@ -31,7 +31,7 @@ struct DecodeOutcome: Sendable {
     /// Metadata of the file: the job's, or probed by the worker before the decode (nil only when that probe failed).
     let info: ImageInfo?
     /// The file as `stat` saw it before and after the decode, when both agreed: what was decoded. Nil when the file
-    /// could not be stat'ed, or changed while it was decoded (see `changedDuringDecode`).
+    /// could not be stat'ed, or changed while it was decoded (see `changedDuringDecode`). For a `partial`: before.
     let stamp: FileStamp?
     /// Size or modification time changed while the file was decoded (it is being written): the pixels match no version.
     let changedDuringDecode: Bool
@@ -291,10 +291,11 @@ final class DecodeScheduler: @unchecked Sendable {
         } else {
             // Screen and full tiers may hand over an early rendition (progressive JPEG) while the image is on screen.
             let key = job.key, snapshot = job
+            // Its stamp is the file as `stat` saw it before the decode (the job's may be a placeholder without one).
             let partial = tier == .preview ? nil : PartialSink(
                 wanted: { [weak self] in self?.wantsPartial(key) ?? false },
                 deliver: { [weak self] image in
-                    self?.deliver(DecodeOutcome(job: snapshot, result: .success(image), info: snapshot.info, stamp: nil,
+                    self?.deliver(DecodeOutcome(job: snapshot, result: .success(image), info: snapshot.info, stamp: before,
                                                 changedDuringDecode: false, stampedAt: Trace.now(), wallMs: 0,
                                                 concurrency: 0, partial: true))
                 })

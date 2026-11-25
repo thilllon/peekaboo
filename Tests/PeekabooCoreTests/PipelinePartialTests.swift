@@ -81,6 +81,25 @@ final class PipelinePartialTests: PipelineTestCase {
         XCTAssertEqual(pipeline.best(for: files[0])?.isApproximate, false)
     }
 
+    /// The app decodes the file it opens before its folder is listed (a placeholder without size or date); the listing
+    /// lands during that decode (~80 ms, the rendition takes 40–150 ms). The rendition is still shown.
+    func testEarlyRenditionOfTheOpenedFileSurvivesTheListing() {
+        let decoder = PartialDecoder()
+        let pipeline = makePipeline(decoder)
+        let files = makeFiles(6)
+        let opened = ImageFile(url: files[2].url, name: files[2].name, byteSize: 0, modified: 0, fileID: 0)
+        var approximate: [ImageFile] = []
+        pipeline.onDecoded = { file, image in if image.isApproximate { approximate.append(file) } }
+        pipeline.setFiles([opened], index: 0)
+        // The worker hands over the rendition of the placeholder's decode; the main thread lists the folder before its
+        // run loop turns (deliveries wait for it).
+        let deadline = Date().addingTimeInterval(3)
+        while !decoder.asked.contains(where: { $0.0 == opened.url && $0.1 == .screen }) && Date() < deadline { usleep(1000) }
+        pipeline.setFiles(files, index: 2)
+        XCTAssertTrue(spin { self.has(pipeline, files[2], .screen) })
+        XCTAssertEqual(approximate, [files[2]], "the early rendition of the opened file was dropped")
+    }
+
     /// A rendition that arrives after the user moved on is dropped (deliveries reach the main thread only when its run
     /// loop turns, after the jump here).
     func testEarlyRenditionOfAnImageLeftBehindIsDropped() {
