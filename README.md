@@ -33,10 +33,10 @@ Everything below was measured on a MacBook Pro M4 Pro (see [docs/research.md](do
 
 - **Hardware decoding, zero copies.** Baseline JPEGs go through the Apple Silicon JPEG engines (24 MP in 50 ms vs 109 ms for
   libjpeg-turbo), HEIC through the hardware HEVC decoder, and the decoded pixels are handed to the GPU without a single copy.
-- **No slow format left behind.** PNGs go through Peekaboo's own decoder (inflate on one core, unfilter on another) at
-  twice ImageIO's speed with identical pixels: 24 MP in ~150 ms instead of ~300. Progressive JPEGs, which no hardware
-  decodes, show their first-pass scans while the exact decode finishes on another core: a 101 MP photo is sharp (52 dB)
-  after 108 ms instead of 670 ms.
+- **No slow format left behind.** PNGs go through Peekaboo's own decoder (inflate on one core, unfilter on another),
+  nearly twice as fast as ImageIO with identical pixels: 24 MP in ~155 ms instead of ~280. Progressive JPEGs, which no
+  hardware decodes, show their first-pass scans while the exact decode finishes on another core: a 101 MP photo looks
+  sharp (52 dB) after 94 ms instead of 680 ms.
 - **The next image is already there.** A predictive prefetcher schedules every decode by *when you will reach that image*,
   scales its look-ahead with how fast you browse, and switches to embedded previews while you hold an arrow key.
   On a 120-photo folder it hits 100 % of steps when browsing steadily and 96 % while holding an arrow key

@@ -251,6 +251,33 @@ final class PNGDecodeTests: XCTestCase {
         try assertMatchesImageIO(url, wide: false, alpha: true)
     }
 
+    /// The samples are interpreted in ImageIO's colour space for the file: sRGB when untagged or for an sRGB chunk,
+    /// linear sRGB for gAMA 1.0, the embedded profile for iCCP.
+    func testColourSpaceIsImageIOs() throws {
+        let (w, h) = (16, 8)
+        let rgb = samples(w, h, channels: 3, max: 255)
+        let p3 = try XCTUnwrap(CGColorSpace(name: CGColorSpace.displayP3)?.copyICCData()) as Data
+        var compressed = [UInt8](repeating: 0, count: Int(compressBound(uLong(p3.count))))
+        var length = uLongf(compressed.count)
+        XCTAssertEqual(compress2(&compressed, &length, [UInt8](p3), uLong(p3.count), 9), Z_OK)
+        let iccp = Array("Display P3".utf8) + [0, 0] + compressed[0..<Int(length)]
+        let cases: [(String, [(String, [UInt8])])] = [
+            ("untagged", []), ("srgb", [("sRGB", [0])]), ("linear", [("gAMA", be32(100000))]), ("iccp", [("iCCP", iccp)]),
+        ]
+        for (name, chunks) in cases {
+            let url = try write(png(width: w, height: h, depth: 8, colorType: 2, samples: rgb, before: chunks), "\(name).png")
+            let ours = try decoder.decode(url, tier: .full, targetLongSide: 0, pool: pool).pixels
+            XCTAssertEqual(ours.layout, .rgba8, name)
+            let source = try XCTUnwrap(CGImageSourceCreateWithURL(url as CFURL, nil))
+            let theirs = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil)?.colorSpace)
+            if let theirName = theirs.name {
+                XCTAssertEqual(ours.colorSpace.name, theirName, name)
+            } else {
+                XCTAssertEqual(ours.colorSpace.copyICCData() as Data?, theirs.copyICCData() as Data?, name)
+            }
+        }
+    }
+
     // MARK: Reduced tiers
 
     func testBoxFilteredTiers() throws {

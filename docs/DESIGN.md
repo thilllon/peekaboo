@@ -57,10 +57,10 @@ and hands it over as an approximate tier (`DecodedImage.isApproximate`) while th
 
 | file (screen tier at 3456 px) | first pixel (DC preview) | early rendition | PSNR vs exact | exact |
 |---|---|---|---|---|
-| 24 MP 4:2:0 (mozjpeg) | 40 ms | 41 ms | 32.1 dB | 165 ms |
-| 24 MP 4:4:4 | 35 ms | 76 ms | 35.5 dB | 299 ms |
-| 101 MP 4:4:4 (1/2) | 0.4 ms (160 px EXIF thumb) | 108 ms | 51.9 dB | 670 ms |
-| 22705 px panorama (1/4) | 0.3 ms (157 px EXIF thumb) | 148 ms | 49.8 dB | 935 ms |
+| 24 MP 4:2:0 (mozjpeg) | 40 ms | 42 ms | 32.1 dB | 164 ms |
+| 24 MP 4:4:4 | 36 ms | 76 ms | 35.5 dB | 300 ms |
+| 101 MP 4:4:4 (1/2) | 0.3 ms (160 px EXIF thumb) | 94 ms | 51.9 dB | 682 ms |
+| 22705 px panorama (1/4) | 0.2 ms (157 px EXIF thumb) | 146 ms | 49.8 dB | 933 ms |
 
 Rejected (measured, docs/research.md): libjpeg buffered-image mode in the same decode (same early time, exact +10 %),
 also skipping only the luma refinements (+1.4–4 dB for 2–4× the time), `TJPARAM_FASTUPSAMPLE`/`FASTDCT` for the
@@ -71,18 +71,18 @@ parallel (the luma chain is ≥ 55 % of the work: ≤ 1.4×, needs libjpeg inter
 interlaced. The system zlib (as fast as libdeflate here: 127 vs 115 ms for 24 MP, Wuffs 152 ms) inflates on a second
 thread into a ring of rows while the calling thread unfilters (branchless scalar Paeth: 62 ms for 24 MP; libpng-style
 NEON 89 ms, branchy 151 ms) and writes RGBA, box-filtered /2–/8 for reduced tiers (premultiplied when there is alpha).
-24 MP: 137–156 ms at every tier vs ImageIO 282–312 ms, with ImageIO's sample values (tests compare every colour type,
-depth, filter type and tRNS form) and ImageIO's colour space. Grayscale (ImageIO's gray colour space and converting
-draw), Adam7, APNG and malformed files go to ImageIO.
+24 MP: 153–164 ms at every tier vs ImageIO 277–317 ms (12 MP: 60–66 vs 117–133 ms), with ImageIO's sample values
+(tests compare every colour type, depth, filter type and tRNS form; the corpus files are identical) and ImageIO's colour
+space. Grayscale (ImageIO's gray colour space and converting draw), Adam7, APNG and malformed files go to ImageIO.
 
 | Source | `.preview` (≤ 512 px) | `.screen` | `.full` |
 |---|---|---|---|
 | JPEG baseline ≤ HW limit | embedded EXIF/MPF thumb if present (0.2–1 ms); else `Subsample 4` (24 MP 40 ms) — never 8 | `Subsample 2` when W/2 ≥ screen (24 MP 44.6 ms), else full | HW: IOSurface path or lazy decode drawn into own buffer (49.8 ms @ 24 MP) |
-| JPEG progressive | `Subsample 8` (DC-only, 32 ms @ 24 MP, 88 ms @ 101 MP) | libjpeg-turbo, DCT scale covering the screen (24 MP: full size, 299 ms); on screen the first-pass rendition first (76 ms) | libjpeg-turbo (290 ms @ 24 MP); when zoomed, the same early rendition |
+| JPEG progressive | `Subsample 8` (DC-only, 32 ms @ 24 MP, 88 ms @ 101 MP) | libjpeg-turbo, DCT scale covering the screen (24 MP: full size, 300 ms); on screen the first-pass rendition first (76 ms) | libjpeg-turbo (290 ms @ 24 MP); when zoomed, the same early rendition |
 | JPEG baseline > 102 MP | embedded thumb, else `Subsample 4` | libjpeg-turbo, DCT scale covering the screen | libjpeg-turbo (tiles above 16384 px) |
 | HEIC / HEIF / AVIF | embedded thumbnail item (~2 ms); else thumbnail 1024 (70–76 ms @ 50 MP) | thumbnail at the screen long side (62–73 ms @ 50 MP) | ImageIO full via IOSurface (94–110 ms; 195–227 ms if copied out) |
 | Camera RAW | embedded preview, thumbnail without `Always` (ARW 15, RAF 19, NEF 43 ms); CR3 via own BMFF parse | embedded preview at screen size if it covers the screen (RAF 70, NEF 93 ms), else RAW decode in the background | RAW decode (ProRAW 133 … ARW 61 MP 886 ms), only on zoom |
-| PNG (RGB, RGBA, palette; not interlaced) | own decoder, box filter /8 (24 MP 140 ms) | own decoder, box filter covering the screen (24 MP 156 ms) | own decoder (16-bit stays 16-bit) |
+| PNG (RGB, RGBA, palette; not interlaced) | own decoder, box filter /8 (24 MP 164 ms) | own decoder, box filter covering the screen (24 MP 154 ms) | own decoder (16-bit stays 16-bit; 24 MP 153 ms) |
 | WebP / TIFF / GIF / JXL / PSD / EXR, other PNG | thumbnail ≤ 512 (TIFF 23, AVIF 48, WebP 350 ms) | IOSurface SPI /n (lazy draw as fallback) | IOSurface SPI (lazy draw as fallback) |
 
 HDR (gain-map HEIC/JPEG): `kCGImageSourceDecodeRequest = DecodeToHDR` (10-bit PQ / half-float) when the screen

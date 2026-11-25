@@ -175,9 +175,10 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
 
     /// PNG through `CPeekabooDecode`: streaming zlib inflate on a second thread, branchless unfiltering on this one,
     /// the samples as stored (RGBA 8-bit, or 16-bit at full size), box-filtered by the power of two (≤ 8) covering
-    /// `target`. 24 MP RGB: 140 ms vs 300–312 ms through ImageIO (whose subsample factor saves nothing), the same pixel
-    /// values. Nil hands the file to ImageIO: grayscale (ImageIO's gray colour space and converting draw), Adam7,
-    /// APNG, anything malformed.
+    /// `target`. 24 MP RGB: 153 ms vs 281 ms through ImageIO (whose subsample factor saves nothing), the same sample
+    /// values. Prefetch takes the second thread too: one-thread decodes (~200 ms) left fewer previews ready while
+    /// skimming a PNG folder (first pixel p90 108–123 vs 24–32 ms). Nil hands the file to ImageIO: grayscale (ImageIO's
+    /// gray colour space and converting draw), Adam7, APNG, anything malformed.
     private func png(_ probe: DecodeProbe, url: URL, target: Int, pool: PixelBufferPool) throws -> Output? {
         guard let bytes = try? Data(contentsOf: url, options: [.alwaysMapped]) else { return nil }
         return try bytes.withUnsafeBytes { raw -> Output? in
@@ -254,12 +255,12 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
             // sub-covering screen tier saves ≤ 7 % yet looks softer, and the renderer then asks for `.full`
             // at fit (it wants a tier ≥ 1.01× the displayed size), which costs the whole decode again.
             // What does pay off is skipping the refinement scans: the image on screen gets the first-pass rendition
-            // (`EarlyRendition`) from another core in 40–140 ms while this decode runs, unslowed.
+            // (`EarlyRendition`) from another core in 42–146 ms while this decode runs, unslowed.
             do {
                 let coverage = tier == .screen && scan.coding == .progressive ? Self.progressiveScreenCoverage : 1
                 let covering = Int((Double(target) * coverage).rounded(.up))
                 let bytes = try data ?? Data(contentsOf: url, options: [.alwaysMapped])
-                if let early, scan.coding == .progressive, Self.earlyRenditionFits(scan) {
+                if let early, scan.coding == .progressive, Self.earlyRenditionFits(scan, target: covering) {
                     early.start(bytes, target: covering, info: probe.info, pool: pool)
                 }
                 let pixels = try bytes.withUnsafeBytes { try TurboJPEG.decode($0, targetLongSide: covering, pool: pool) }
@@ -318,11 +319,14 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
         return n == length ? bytes : nil
     }
 
-    /// The early rendition holds a second whole-image coefficient buffer while it decodes (2 bytes per sample, e.g.
-    /// 0.6 GB for a 101 MP 4:4:4 file): only when that is small against physical memory.
-    static func earlyRenditionFits(_ scan: JPEGScan) -> Bool {
-        Double(scan.width) * Double(scan.height) * Double(max(1, scan.components)) * 2
-            <= Double(ProcessInfo.processInfo.physicalMemory) / 32
+    /// The early rendition holds a second whole-image coefficient buffer while it decodes (2 bytes per sample: 0.6 GB
+    /// for a 101 MP 4:4:4 file) and its own output until the exact tier replaces it (0.4 GB for that file's `.full`):
+    /// only when both together are small against physical memory (48 GB: 1.5 GB; 16 GB: 0.5 GB).
+    static func earlyRenditionFits(_ scan: JPEGScan, target: Int) -> Bool {
+        let factor = TurboJPEG.coveringScale(width: scan.width, height: scan.height, target: target)
+        let output = Double(TurboJPEG.scaled(scan.width, factor)) * Double(TurboJPEG.scaled(scan.height, factor)) * 4
+        let coefficients = Double(scan.width) * Double(scan.height) * Double(max(1, scan.components)) * 2
+        return coefficients + output <= Double(ProcessInfo.processInfo.physicalMemory) / 32
     }
 
     // MARK: RAW
@@ -481,9 +485,9 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
 }
 
 /// The first-pass rendition of one progressive JPEG decode, made on another core while the exact decode runs and
-/// handed to the sink as an approximate tier. The exact decode is not slowed (24 MP 4:4:4: 302 vs 320 ms alone,
-/// 4:2:0 174 vs 165 ms; 101 MP 723 vs 735 ms) and the rendition lands after 40 ms (24 MP 4:2:0) to 140 ms (22705 px
-/// panorama) instead of 165–990 ms.
+/// handed to the sink as an approximate tier. The exact decode is not slowed (screen tier with / without it, medians
+/// of 5 runs: 24 MP 4:4:4 298 / 300 ms, 4:2:0 166 / 164 ms, 101 MP 673 / 682 ms, panorama 932 / 933 ms) and the
+/// rendition lands after 42 ms (24 MP 4:2:0) to 146 ms (22705 px panorama) instead of 164–933 ms.
 final class EarlyRendition: @unchecked Sendable {
     private let sink: PartialSink
     private let url: URL

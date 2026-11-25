@@ -193,6 +193,15 @@ final class EarlyRenditionTests: XCTestCase {
         XCTAssertTrue(none.received.isEmpty, "baseline JPEGs and previews have no early rendition")
     }
 
+    /// The rendition's extra memory (a second coefficient buffer and its output) must stay small against RAM.
+    func testEarlyRenditionMemoryGuard() {
+        let photo = JPEGScan(coding: .progressive, width: 5947, height: 3964, components: 3)
+        XCTAssertTrue(ImageIODecoder.earlyRenditionFits(photo, target: 3456), "24 MP: 0.24 GB, fine with 8 GB")
+        let huge = JPEGScan(coding: .progressive, width: 60000, height: 60000, components: 3)
+        XCTAssertFalse(ImageIODecoder.earlyRenditionFits(huge, target: 0), "3.6 GP: 36 GB")
+        XCTAssertFalse(ImageIODecoder.earlyRenditionFits(huge, target: 3456), "the coefficients alone are 21.6 GB")
+    }
+
     // MARK: Robustness
 
     /// Corrupted and truncated variants of a progressive file: the scan walk and the truncated decode always return.

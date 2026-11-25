@@ -509,11 +509,13 @@ static pb_png_status run_pipelined(consumer *c, inflater *in, int *started) {
     }
     *started = 1;
     pthread_attr_destroy(&attr);
-    uint32_t available = 0;
+    uint32_t available = 0, released = 0;
     for (uint32_t y = 0; y < p.height; y++) {
-        if (y == available) {
+        // Hand slots back every batch (not only when caught up), so a consumer slower than the inflate (16-bit, alpha
+        // box filter) never leaves the inflate thread waiting for a whole ring.
+        if (y == available || y - released >= p.batch) {
             pthread_mutex_lock(&p.lock);
-            p.released = y;
+            p.released = released = y;
             pthread_cond_broadcast(&p.changed);
             while (!p.failed && p.produced <= y) pthread_cond_wait(&p.changed, &p.lock);
             available = p.produced;
