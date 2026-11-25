@@ -7,20 +7,30 @@ if CommandLine.arguments.count > 1, CommandLine.arguments[1] == UpdateInstaller.
     exit(UpdateInstaller.runHelper(Array(CommandLine.arguments.dropFirst())))
 }
 LaunchClock.mainWall = LaunchClock.wallNow()
-// Programmatic entry point: no storyboard, no nib, no SwiftUI — nothing to
-// unarchive before the first window can appear. GPU setup (device + shader
-// compile) starts first, on a background thread, hidden behind AppKit init.
-RenderContext.prewarm()
-// The folder listing filters names by ImageIO's types: build that table off the main thread now, not in the first listing.
-// Then let a 16 px HEIC take the first HEVC decode's ~50 ms wait for the hardware decoder, behind AppKit's start, at
-// utility QoS: queued once the table is built, so ImageIO's one-time setup has run at userInitiated and no decode waits
-// for it on the slower thread. A HEIC opened at launch shows ~50 ms sooner, a JPEG launch is unchanged (docs/DESIGN.md §2).
-DispatchQueue.global(qos: .userInitiated).async {
-    _ = FolderScanner.supportedExtensions
-    DispatchQueue.global(qos: .utility).async { HEVCWarmUp.run() }
+// A copy on a disk image or a translocated path installs itself into Applications and hands its files over instead of
+// opening a window (`Installation`, docs/DESIGN.md §5). Decided first, so that it skips the warm-ups it would throw away;
+// a normal launch pays two C string comparisons on argv[0] for it.
+let installation = CommandLine.unsafeArgv[0].flatMap {
+    AppInstall.needsInstalling(executable: $0) ? Installation.forLaunch(arguments: Array(CommandLine.arguments.dropFirst())) : nil
+}
+if installation == nil {
+    // Programmatic entry point: no storyboard, no nib, no SwiftUI — nothing to
+    // unarchive before the first window can appear. GPU setup (device + shader
+    // compile) starts first, on a background thread, hidden behind AppKit init.
+    RenderContext.prewarm()
+    // The folder listing filters names by ImageIO's types: build that table off the main thread now, not in the first
+    // listing. Then let a 16 px HEIC take the first HEVC decode's ~50 ms wait for the hardware decoder, behind AppKit's
+    // start, at utility QoS: queued once the table is built, so ImageIO's one-time setup has run at userInitiated and no
+    // decode waits for it on the slower thread. A HEIC opened at launch shows ~50 ms sooner, a JPEG launch is unchanged
+    // (docs/DESIGN.md §2).
+    DispatchQueue.global(qos: .userInitiated).async {
+        _ = FolderScanner.supportedExtensions
+        DispatchQueue.global(qos: .utility).async { HEVCWarmUp.run() }
+    }
 }
 let app = NSApplication.shared
 let appDelegate = AppDelegate()
+appDelegate.installation = installation
 app.delegate = appDelegate
 app.setActivationPolicy(.regular)
 app.run()

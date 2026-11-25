@@ -63,7 +63,7 @@ public enum UpdateInstaller {
         return root
     }
 
-    private static func device(_ url: URL) -> dev_t? {
+    static func device(_ url: URL) -> dev_t? {
         var info = stat()
         return stat(url.path, &info) == 0 ? info.st_dev : nil
     }
@@ -141,6 +141,12 @@ public enum UpdateInstaller {
     /// meanwhile) is simply replaced.
     public static func install(_ staged: URL, over target: URL, version: AppVersion, requirement: String) throws {
         try verify(staged, version: version, requirement: requirement)
+        try swap(staged, over: target, version: version)
+    }
+
+    /// The swap of `install`, for a `staged` bundle already verified. `displaced` checks the bundle the swap moved out
+    /// of `target` (it is at `staged` then) before it is deleted: when it throws, the swap is undone.
+    static func swap(_ staged: URL, over target: URL, version: AppVersion, displaced: (URL) throws -> Void = { _ in }) throws {
         let fm = FileManager.default
         guard fm.fileExists(atPath: target.path) else {
             do {
@@ -153,9 +159,14 @@ public enum UpdateInstaller {
         guard renamex_np(staged.path, target.path, UInt32(RENAME_SWAP)) == 0 else {
             throw UpdateError.install(String(cString: strerror(errno)))
         }
-        guard (try? bundleInfo(target))?.version == version else {
+        do {
+            guard (try? bundleInfo(target))?.version == version else {
+                throw UpdateError.install("the new bundle did not read back as \(version)")
+            }
+            try displaced(staged)
+        } catch {
             _ = renamex_np(staged.path, target.path, UInt32(RENAME_SWAP))
-            throw UpdateError.install("the new bundle did not read back as \(version)")
+            throw error
         }
         try? fm.removeItem(at: staged)
     }
@@ -317,7 +328,7 @@ public enum UpdateInstaller {
     }
 
     /// Wait until process `pid` has exited (true) or `timeout` passed (false).
-    static func waitForExit(_ pid: pid_t, timeout: TimeInterval) -> Bool {
+    public static func waitForExit(_ pid: pid_t, timeout: TimeInterval) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while kill(pid, 0) == 0 || errno != ESRCH {
             if Date() >= deadline { return false }

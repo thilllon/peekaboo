@@ -5,6 +5,51 @@ import XCTest
 /// Release `n` of the updater tests: `202611nn-0000nn` with build number `n` (24 < 25 < 26 < 27).
 func releaseVersion(_ n: Int) -> AppVersion { AppVersion(name: String(format: "202611%02d-0000%02d", n, n), build: n)! }
 
+/// A minimal app bundle: Info.plist, an executable (a copy of `/usr/bin/true`) and a resource, ad-hoc signed with
+/// `identifier`; `shortVersion` replaces the version's name (an old `0.1.0`).
+@discardableResult
+func makeApp(_ url: URL, version: AppVersion, identifier: String = "com.thilllon.Peekaboo", shortVersion: String? = nil,
+             sign: Bool = true) throws -> URL {
+    let fm = FileManager.default
+    try fm.createDirectory(at: url.appendingPathComponent("Contents/MacOS"), withIntermediateDirectories: true)
+    try fm.createDirectory(at: url.appendingPathComponent("Contents/Resources"), withIntermediateDirectories: true)
+    let info: [String: Any] = ["CFBundleIdentifier": identifier, "CFBundleShortVersionString": shortVersion ?? version.name,
+                               "CFBundleVersion": String(version.build), "CFBundleExecutable": "Peekaboo",
+                               "CFBundlePackageType": "APPL"]
+    try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+        .write(to: url.appendingPathComponent("Contents/Info.plist"))
+    try fm.copyItem(at: URL(fileURLWithPath: "/usr/bin/true"), to: url.appendingPathComponent("Contents/MacOS/Peekaboo"))
+    try Data("resource of \(version)".utf8).write(to: url.appendingPathComponent("Contents/Resources/data.txt"))
+    if sign {
+        let codesign = Process()
+        codesign.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        codesign.arguments = ["--force", "--sign", "-", "--identifier", identifier, url.path]
+        codesign.standardOutput = FileHandle.nullDevice
+        codesign.standardError = FileHandle.nullDevice
+        do { try codesign.run() } catch { throw XCTSkip("codesign is not available") }
+        codesign.waitUntilExit()
+        guard codesign.terminationStatus == 0 else { throw XCTSkip("codesign failed (\(codesign.terminationStatus))") }
+    }
+    return url
+}
+
+/// Run hdiutil for at most 60 s; true when it succeeded.
+func hdiutil(_ arguments: [String]) -> Bool {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+    process.arguments = arguments
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    guard (try? process.run()) != nil else { return false }
+    let deadline = Date().addingTimeInterval(60)
+    while process.isRunning, Date() < deadline { usleep(20_000) }
+    guard !process.isRunning else {
+        process.terminate()
+        return false
+    }
+    return process.terminationStatus == 0
+}
+
 /// Versions, `latest.json`, the check schedule, signature requirements and the bundle swap of the updater.
 final class UpdateTests: XCTestCase {
     private var directory: URL!
@@ -166,34 +211,6 @@ final class UpdateTests: XCTestCase {
         for team in ["", "abcde12345", "ABCDE1234", "ABCDE123456", "ABCDE1234\"", "ABCDE 1234", "ÄBCDE12345"] {
             XCTAssertNil(CodeSignature.updateRequirement(teamIdentifier: team), team)
         }
-    }
-
-    /// A minimal app bundle: Info.plist, an executable (a copy of `/usr/bin/true`) and a resource, ad-hoc signed
-    /// with `identifier`.
-    @discardableResult
-    private func makeApp(_ url: URL, version: AppVersion, identifier: String = "com.thilllon.Peekaboo",
-                         sign: Bool = true) throws -> URL {
-        let fm = FileManager.default
-        try fm.createDirectory(at: url.appendingPathComponent("Contents/MacOS"), withIntermediateDirectories: true)
-        try fm.createDirectory(at: url.appendingPathComponent("Contents/Resources"), withIntermediateDirectories: true)
-        let info: [String: Any] = ["CFBundleIdentifier": identifier, "CFBundleShortVersionString": version.name,
-                                   "CFBundleVersion": String(version.build), "CFBundleExecutable": "Peekaboo",
-                                   "CFBundlePackageType": "APPL"]
-        try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
-            .write(to: url.appendingPathComponent("Contents/Info.plist"))
-        try fm.copyItem(at: URL(fileURLWithPath: "/usr/bin/true"), to: url.appendingPathComponent("Contents/MacOS/Peekaboo"))
-        try Data("resource of \(version)".utf8).write(to: url.appendingPathComponent("Contents/Resources/data.txt"))
-        if sign {
-            let codesign = Process()
-            codesign.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-            codesign.arguments = ["--force", "--sign", "-", "--identifier", identifier, url.path]
-            codesign.standardOutput = FileHandle.nullDevice
-            codesign.standardError = FileHandle.nullDevice
-            do { try codesign.run() } catch { throw XCTSkip("codesign is not available") }
-            codesign.waitUntilExit()
-            guard codesign.terminationStatus == 0 else { throw XCTSkip("codesign failed (\(codesign.terminationStatus))") }
-        }
-        return url
     }
 
     private func version(of app: URL) throws -> AppVersion? {
@@ -368,25 +385,8 @@ final class UpdateTests: XCTestCase {
         guard hdiutil(["create", "-quiet", "-size", "16m", "-fs", "APFS", "-volname", "PeekabooTest", image.path]),
               hdiutil(["attach", "-quiet", "-nobrowse", "-noverify", "-noautoopen", "-mountpoint", mountPoint.path, image.path])
         else { throw XCTSkip("cannot attach a disk image here") }
-        addTeardownBlock { [self] in _ = hdiutil(["detach", "-force", "-quiet", mountPoint.path]) }
+        addTeardownBlock { _ = hdiutil(["detach", "-force", "-quiet", mountPoint.path]) }
         return mountPoint
-    }
-
-    /// Run hdiutil for at most 60 s; true when it succeeded.
-    private func hdiutil(_ arguments: [String]) -> Bool {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
-        process.arguments = arguments
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        guard (try? process.run()) != nil else { return false }
-        let deadline = Date().addingTimeInterval(60)
-        while process.isRunning, Date() < deadline { usleep(20_000) }
-        guard !process.isRunning else {
-            process.terminate()
-            return false
-        }
-        return process.terminationStatus == 0
     }
 
     func testHelperArgumentsRoundTrip() throws {

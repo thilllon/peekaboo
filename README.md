@@ -71,7 +71,11 @@ Everything below was measured on a MacBook Pro M4 Pro (see [docs/research.md](do
 ## Install
 
 1. Download `Peekaboo-<version>.dmg` from the [latest release](https://github.com/thilllon/peekaboo/releases/latest)
-   (the volume is named after the version too, e.g. "Peekaboo 20261125-ab2342") and drag Peekaboo to Applications.
+   (the volume is named after the version too, e.g. "Peekaboo 20261125-ab2342") and drag Peekaboo to Applications, or
+   just open it from the disk image: it then installs itself into Applications (`~/Applications` when you may not
+   write to `/Applications`), replacing an older copy (an older Peekaboo that is still open is quit first) but never
+   a newer one, opens your files from there and ejects the Peekaboo disk images. There is always one Peekaboo; only
+   its version changes.
 2. Releases are signed with a Developer ID and notarized by Apple, so Peekaboo opens like any other app, and they update
    themselves.
 3. At first launch macOS asks, once for each, whether Peekaboo may access your Desktop, Documents and Downloads folders:
@@ -129,7 +133,7 @@ and action.
 mise install              # pinned gitleaks, lefthook, cmake
 mise run setup            # git hooks
 mise run deps             # static libjpeg-turbo and libwebp (pinned, checksum-verified) for macOS 14 → .deps/
-mise run install          # build the release app into ~/Applications
+mise run install          # build the release app into /Applications (replacing the copy there)
 ```
 
 `swift build`, `swift test`, `mise run app`, `mise run dmg`, `peekaboo-bench <anim|decode|pipeline|render>`. Releases:
