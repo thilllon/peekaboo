@@ -368,6 +368,33 @@ final class PNGDecodeTests: XCTestCase {
         }
     }
 
+    /// Values the format leaves undefined, where ImageIO has its own answer: a colour key above the bit depth (ImageIO
+    /// matches its low byte) and palette indices past the palette (the last entry, or black with tRNS).
+    func testOutOfRangeValuesGoToImageIO() throws {
+        let (w, h) = (40, 12)
+        let rgb = samples(w, h, channels: 3, max: 255)
+        let highKey = [UInt8](png(width: w, height: h, depth: 8, colorType: 2, samples: rgb, before: [("tRNS", [1, 10, 0, 20, 0, 30])]))
+        let status = highKey.withUnsafeBufferPointer { raw -> pb_png_status in
+            var info = pb_png_info()
+            return pb_png_read_info(raw.baseAddress!, raw.count, &info)
+        }
+        XCTAssertEqual(status, PB_PNG_INVALID, "8-bit key above 255")
+
+        let palette: [UInt8] = [10, 20, 30, 40, 50, 60, 70, 80, 90]  // 3 entries
+        for depth in [4, 8] {
+            let inside = samples(w, h, channels: 1, max: 2, seed: UInt64(depth))
+            var outside = inside
+            outside[outside.count - 3] = depth == 4 ? 15 : 200  // in the last row
+            for (name, indices, expected) in [("inside", inside, PB_PNG_OK), ("outside", outside, PB_PNG_INVALID)] {
+                let bytes = [UInt8](png(width: w, height: h, depth: depth, colorType: 3, samples: indices,
+                                        before: [("PLTE", palette)]))
+                for factor: UInt32 in [1, 2] {
+                    XCTAssertEqual(decodeDirectly(bytes, factor: factor), expected, "\(depth)-bit \(name) /\(factor)")
+                }
+            }
+        }
+    }
+
     /// The two-thread path stops cleanly whichever side fails: a bad filter type halfway (the unfiltering side) or the
     /// data running out (the inflating side). Every call joins its inflate thread, so repeating them leaves none behind.
     func testPipelinedFailuresStopBothThreads() {

@@ -133,6 +133,8 @@ static pb_png_status parse(const uint8_t *data, size_t size, png_t *png) {
                 png->has_key = 1;
                 png->info.has_alpha = 1;
                 for (int i = 0; i < 3; i++) png->key[i] = be16(body + 2 * i);
+                // A key above the bit depth's range is malformed; ImageIO then matches its low byte.
+                if (png->info.bit_depth == 8 && (png->key[0] | png->key[1] | png->key[2]) > 255) return PB_PNG_INVALID;
             }
             // Gray keys are left to ImageIO with the rest of grayscale; tRNS beside an alpha channel is ignored.
         } else if (is_type(type, "acTL")) {
@@ -289,8 +291,9 @@ static int unfilter(int type, const uint8_t *in, uint8_t *out, const uint8_t *pr
 
 // MARK: - Convert
 
-/// One unfiltered row as RGBA, 8-bit (`out` 4 bytes per pixel).
-static void row_rgba8(const png_t *png, const uint8_t *row, uint8_t *out) {
+/// One unfiltered row as RGBA, 8-bit (`out` 4 bytes per pixel). -1 for a palette index past the palette: ImageIO has
+/// its own colours for those (the last entry, or black with tRNS), so such a file is left to it.
+static int row_rgba8(const png_t *png, const uint8_t *row, uint8_t *out) {
     const uint32_t w = png->info.width;
     const uint8_t depth = png->info.bit_depth;
     switch (png->info.color_type) {
@@ -332,18 +335,26 @@ static void row_rgba8(const png_t *png, const uint8_t *row, uint8_t *out) {
         break;
     case 3: {
         uint32_t *o = (uint32_t *)out;
+        unsigned top = 0;
         if (depth == 8) {
-            for (uint32_t x = 0; x < w; x++) o[x] = png->palette[row[x]];
+            for (uint32_t x = 0; x < w; x++) {
+                const unsigned index = row[x];
+                o[x] = png->palette[index];
+                top = index > top ? index : top;
+            }
         } else {
             const unsigned per_byte = 8 / depth, mask = (1u << depth) - 1;
             for (uint32_t x = 0; x < w; x++) {
                 unsigned shift = 8 - depth * (x % per_byte + 1);
-                o[x] = png->palette[(row[x / per_byte] >> shift) & mask];
+                const unsigned index = (row[x / per_byte] >> shift) & mask;
+                o[x] = png->palette[index];
+                top = index > top ? index : top;
             }
         }
-        break;
+        return top < (unsigned)png->palette_size ? 0 : -1;
     }
     }
+    return 0;
 }
 
 /// One unfiltered row of a 16-bit image as RGBA, 16-bit little-endian (`out` 8 bytes per pixel).
@@ -415,9 +426,9 @@ static int consume(consumer *c, const uint8_t *filtered) {
     if (c->factor == 1) {
         uint8_t *o = c->out + (size_t)c->y * c->stride;
         if (png->info.bit_depth == 16) row_rgba16(png, c->cur, (uint16_t *)o);
-        else row_rgba8(png, c->cur, o);
+        else if (row_rgba8(png, c->cur, o) != 0) return -1;
     } else {
-        row_rgba8(png, c->cur, c->rgba);
+        if (row_rgba8(png, c->cur, c->rgba) != 0) return -1;
         const size_t n = (size_t)png->info.width * 4;
         const uint8_t *p = c->rgba;
         uint32_t *col = c->columns;
