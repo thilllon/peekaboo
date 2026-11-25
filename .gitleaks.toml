@@ -28,9 +28,11 @@ keywords = ["/tmp/claude-"]
 [[rules]]
 id = "credential-file-name"
 description = "Credential-looking file committed"
-path = '''(?i)(?:^|/)(?:client_secret[^/]*\.json|credentials?[^/]*\.json|service[-_]?account[^/]*\.json|[^/]*\.(?:p12|pfx|pem|key|keystore|jks|mobileprovision|provisionprofile)|\.env(?:\.[^/]*)?|\.netrc|id_(?:rsa|ed25519|ecdsa)(?:\.pub)?)$'''
+path = '''(?i)(?:^|/)(?:client_secret[^/]*\.json|credentials?[^/]*\.json|service[-_]?account[^/]*\.json|[^/]*\.(?:p12|pfx|pem|key|p8|cer|der|csr|certSigningRequest|keychain|keychain-db|keystore|jks|mobileprovision|provisionprofile)|\.env(?:\.[^/]*)?|\.netrc|id_(?:rsa|ed25519|ecdsa)(?:\.pub)?)$'''
 
-# Local build outputs are gitignored and full of absolute toolchain paths; never scan them.
+# Local build outputs (and the vendored .deps sources) are gitignored and full of absolute toolchain paths and
+# third-party author addresses; never scan them.
 [[allowlists]]
 description = "Gitignored build outputs"
-paths = ['''(?:^|/)\.build/''', '''(?:^|/)build/''', '''(?:^|/)\.swiftpm/''', '''(?:^|/)dist/''']
+paths = ['''(?:^|/)\.build/''', '''(?:^|/)build/''', '''(?:^|/)\.swiftpm/''', '''(?:^|/)dist/''', '''(?:^|/)\.deps/''',
+         '''(?:^|/)\.claude/worktrees/''']  # agent worktrees: their commits are scanned on their own branches

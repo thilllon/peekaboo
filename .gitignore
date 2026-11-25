@@ -22,6 +22,14 @@ target/
 *.jks
 *.mobileprovision
 *.provisionprofile
+# Apple signing: App Store Connect API keys (AuthKey_*.p8), certificates, signing requests, keychains
+*.p8
+*.cer
+*.der
+*.csr
+*.certSigningRequest
+*.keychain
+*.keychain-db
 client_secret*.json
 credentials*.json
 service-account*.json
