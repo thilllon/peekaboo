@@ -123,6 +123,10 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// The opened file when its folder's listing does not include it (a type the scan skips, a hidden file): it stays
     /// in the set while it is on screen.
     private var unlistedFile: ImageFile?
+    /// The browsed folder may not be listed (macOS privacy protection, its permissions): the text that says so and how
+    /// to allow it. The set is the opened image alone: its ends show this instead of "First image" / "Last image", and
+    /// the folder is listed again whenever the window becomes key (back from System Settings). nil once it lists.
+    private var refusedListing: String?
     /// Files without pixels whose decode failed (the pipeline never retries them), for the version that failed.
     private var failures: [URL: Failure] = [:]
     private struct Failure {
@@ -316,6 +320,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         let generation = openGeneration
         failures.removeAll()
         unlistedFile = nil
+        refusedListing = nil
         listingPending = true
         // First pixel first: decode the opened file before listing its folder, and submit that decode before the
         // window is ordered in and flushed (window-server work it can overlap). Decide "file or folder" from the URL
@@ -329,6 +334,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         } else {
             browseSource = urls.count == 1 ? .folder(first) : .files
         }
+        let folder = currentFolder
         showWindow(nil)
         makeKeyAndOrderFront()
         hud.setMessage(nil)
@@ -344,13 +350,13 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         } else if synchronous {
             // Launched with a folder: list it in this turn (getattrlistbulk, ≈ 0.2 ms per 100 files) instead of
             // in a main-queue turn that AppKit's launch delays by ~70 ms.
-            applyListing(try? FolderScanner.browse(urls), urls: urls, singleFile: false, opened: opened)
+            applyListing(Self.list(urls, folder: folder), urls: urls, singleFile: false, opened: opened)
             presentFirstFrameNow()
             return
         }
         updateHUD()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let listing = try? FolderScanner.browse(urls)
+            let listing = Self.list(urls, folder: folder)
             DispatchQueue.main.async {
                 guard let self, generation == self.openGeneration else { return }
                 self.applyListing(listing, urls: urls, singleFile: singleFile, opened: opened)
@@ -358,11 +364,31 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         }
     }
 
-    private func applyListing(_ listing: (files: [ImageFile], index: Int)?, urls: [URL], singleFile: Bool, opened: UInt64) {
+    /// What `open` lists: the browsing set or the error, and when access to the folder was refused, the text that says
+    /// so and how to allow it.
+    private typealias Listing = (result: Result<(files: [ImageFile], index: Int), Error>, refusal: String?)
+
+    /// `FolderScanner.browse(urls)`, and the refusal text when it failed for lack of access to `folder`: built here,
+    /// with the listing (off the main thread but at launch) and only on failure, because naming a volume's switch
+    /// asks the volume for its type.
+    private static func list(_ urls: [URL], folder: URL?) -> Listing {
+        let result = Result { try FolderScanner.browse(urls) }
+        guard case .failure(let error) = result, let folder else { return (result, nil) }
+        return (result, accessDeniedToast(error, folder: folder))
+    }
+
+    private func applyListing(_ listing: Listing, urls: [URL], singleFile: Bool, opened: UInt64) {
         listingPending = false
-        guard let listing, !listing.files.isEmpty else {
-            // An unreadable parent folder still shows the opened file on its own.
+        refusedListing = listing.refusal
+        guard case .success(let browsed) = listing.result, !browsed.files.isEmpty else {
+            if case .failure(let error) = listing.result, listing.refusal != nil {
+                Trace.log("folder not readable: \(currentFolder?.lastPathComponent ?? "?") (\(error))")
+            }
+            // An unreadable parent folder still shows the opened file on its own; a refused one also says why and how
+            // to allow it, in a toast over the image (again at the ends of the set), or as the message of an opened
+            // folder (`showEmpty`).
             if singleFile {
+                if let refusal = refusedListing { hud.showToast(refusal, seconds: Self.accessDeniedToastSeconds) }
                 updateHUD()
             } else {
                 showEmpty(urls.count == 1 ? urls.first : nil)
@@ -370,8 +396,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             watchFolder()
             return
         }
-        var files = listing.files
-        var index = listing.index
+        var files = browsed.files
+        var index = browsed.index
         if singleFile, let url = urls.first,
            !(files.indices.contains(index) && files[index].url.standardizedFileURL == url.standardizedFileURL) {
             // The opened file is not in its folder's listing (a type the scan skips, a hidden file, a path typed in
@@ -395,12 +421,58 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         presentCurrent()
         updateHUD()
         watchFolder()
-        Trace.log("folder listed: \(listing.files.count) files, \(String(format: "%.1f", Trace.ms(since: opened))) ms after open")
+        Trace.log("folder listed: \(browsed.files.count) files, \(String(format: "%.1f", Trace.ms(since: opened))) ms after open")
     }
 
     /// The opened file before its folder is listed (size, date and inode not known yet).
     private static func placeholder(for url: URL) -> ImageFile {
         ImageFile(url: url, name: url.lastPathComponent, byteSize: 0, modified: 0, fileID: 0)
+    }
+
+    /// Long enough to read the way to allow it (a confirmation toast lasts 1.2 s).
+    static let accessDeniedToastSeconds: TimeInterval = 6
+
+    /// The text for `folder` when listing it failed with `error` because access was refused, with the way to allow it:
+    /// macOS privacy protection refuses with EPERM (`privacySetting`), the folder's permissions with EACCES. nil for
+    /// any other error. A toast has no button, so it names the System Settings pane instead of opening it.
+    static func accessDeniedToast(_ error: Error, folder: URL) -> String? {
+        guard let code = FolderScanner.posixCode(error) else { return nil }
+        let cannot = "Peekaboo cannot read “\(folder.lastPathComponent)”\n"
+        switch code {
+        case EPERM: return cannot + privacySetting(for: folder)
+        case EACCES: return cannot + "Its permissions do not let you read it: Finder › Get Info › Sharing & Permissions"
+        default: return nil
+        }
+    }
+
+    /// Where System Settings lets Peekaboo read `folder`, which macOS privacy protection refuses: the Files & Folders
+    /// switch of the protected place it is in (Desktop, Documents or Downloads Folder, Removable or Network Volumes),
+    /// else Full Disk Access, the only setting for the rest (Mail, Messages, Time Machine backups, other apps' data).
+    /// Asks the volume of a folder in /Volumes for its type: never on the main thread.
+    static func privacySetting(for folder: URL) -> String {
+        let path = folder.standardizedFileURL.path
+        let filesAndFolders = " for Peekaboo in System Settings › Privacy & Security › Files & Folders"
+        if let place = FolderAccessRequest.folders.first(where: { isInside(path, $0.standardizedFileURL.path) }) {
+            return "Turn on \(place.lastPathComponent) Folder" + filesAndFolders
+        }
+        let components = folder.standardizedFileURL.pathComponents
+        if isInside(path, "/Volumes"), components.count > 2,
+           !components.contains(".timemachine"), !components.contains("Backups.backupdb") {
+            return "Turn on \(isOnNetworkVolume(path) ? "Network" : "Removable") Volumes" + filesAndFolders
+        }
+        return "Allow Peekaboo in System Settings › Privacy & Security › Full Disk Access"
+    }
+
+    /// `path` is `folder` or inside it, in any letter case (as the file system compares names).
+    private static func isInside(_ path: String, _ folder: String) -> Bool {
+        path.caseInsensitiveCompare(folder) == .orderedSame
+            || path.range(of: folder + "/", options: [.anchored, .caseInsensitive]) != nil
+    }
+
+    /// The file system of `path` is not local (`MNT_LOCAL`): a network volume. False when `statfs` fails.
+    static func isOnNetworkVolume(_ path: String) -> Bool {
+        var volume = statfs()
+        return statfs(path, &volume) == 0 && volume.f_flags & UInt32(MNT_LOCAL) == 0
     }
 
     /// Index of `url` in the browsing set when it is a listed file of the folder being browsed.
@@ -458,7 +530,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
                          ready ? "presented" : "not ready", Trace.ms(since: start)))
     }
 
-    /// Nothing to show: an empty folder, or no file opened yet.
+    /// Nothing to show: an empty folder (or one Peekaboo may not read: `refusedListing`), or no file opened yet.
     func showEmpty(_ folder: URL?) {
         stopAnimation()
         replaceFiles([], index: 0)
@@ -470,7 +542,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         setLoading(false)
         renderFrame()
         if let folder {
-            hud.setMessage("No images in “\(folder.lastPathComponent)”\nDrop images here or press ⌘O")
+            hud.setMessage(refusedListing ?? "No images in “\(folder.lastPathComponent)”\nDrop images here or press ⌘O")
         } else {
             hud.setMessage("Drop images or a folder here\nor press ⌘O to open")
         }
@@ -703,7 +775,12 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         guard !pipeline.files.isEmpty else { return }
         let target = min(max(index, 0), pipeline.files.count - 1)
         if target != index, target == pipeline.index {
-            hud.showToast(index < 0 ? "First image" : "Last image")
+            // A folder Peekaboo may not list browses the opened image alone: say why, not that it is the last one.
+            if let refusal = refusedListing {
+                if !isRepeat { hud.showToast(refusal, seconds: Self.accessDeniedToastSeconds) }
+            } else {
+                hud.showToast(index < 0 ? "First image" : "Last image")
+            }
             return
         }
         guard target != pipeline.index || shownFile == nil else { return }
@@ -746,7 +823,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             return
         }
         let index = listingPending ? "…" : "\(pipeline.index + 1)"
-        let count = listingPending ? "…" : "\(pipeline.files.count)"
+        // A folder that may not be listed has images nobody counted.
+        let count = listingPending ? "…" : refusedListing == nil ? "\(pipeline.files.count)" : "?"
         var parts = [file.name, "\(index)/\(count)"]
         let info = pipeline.info(for: file)
         let onScreen = isShowing(file) ? renderer.image : nil
@@ -1502,6 +1580,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     func windowDidBecomeKey(_ notification: Notification) {
         lastPointerMove = Trace.now()
         scheduleIdleCheck()
+        // Back from System Settings, where the folder may have been allowed: list it again (off the main thread).
+        if refusedListing != nil { rescanFolder() }
     }
 
     func windowDidChangeScreen(_ notification: Notification) {
@@ -1560,6 +1640,14 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     }
 
     private func applyRescan(_ listed: [ImageFile], of folder: URL) {
+        // A folder that was refused lists now (allowed in System Settings, its permissions changed): browse it, and
+        // watch it, which needed the same access.
+        let allowed = refusedListing != nil
+        if allowed {
+            refusedListing = nil
+            watchFolder()
+            Trace.log("folder readable now: \(folder.lastPathComponent)")
+        }
         var files = listed
         if let unlisted = unlistedFile {
             if files.contains(unlisted) || unlisted != pipeline.currentFile {
@@ -1569,7 +1657,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             }
         }
         let fingerprint = { (list: [ImageFile]) in list.map { $0.url.path + "|" + $0.version } }
-        guard fingerprint(files) != fingerprint(pipeline.files) else { return }
+        guard allowed || fingerprint(files) != fingerprint(pipeline.files) else { return }
         if files.isEmpty {
             showEmpty(folder)
             return

@@ -154,6 +154,41 @@ final class FolderTests: XCTestCase {
         XCTAssertEqual(browse.files[2].byteSize, 3)
     }
 
+    /// A folder that may not be listed (here: no read permission, EACCES; macOS privacy protection refuses with
+    /// EPERM) throws the system's reason, not "no such file", so the viewer can say how to allow it.
+    func testAFolderThatCannotBeListedThrowsTheSystemsReason() throws {
+        try touch("a.jpg")
+        XCTAssertEqual(chmod(directory.path, 0o311), 0)  // -wx--x--x: files open by name, the folder does not list
+        defer { chmod(directory.path, 0o755) }
+        let fd = open(directory.path, O_RDONLY | O_DIRECTORY)
+        if fd >= 0 { close(fd) }
+        guard fd < 0 else { throw XCTSkip("permissions are not enforced for this user") }
+
+        XCTAssertThrowsError(try FolderScanner.scan(directory)) {
+            XCTAssertEqual(FolderScanner.posixCode($0), EACCES, "\($0)")
+        }
+        XCTAssertThrowsError(try FolderScanner.browse([directory.appendingPathComponent("a.jpg")])) {
+            XCTAssertEqual(FolderScanner.posixCode($0), EACCES, "\($0)")
+        }
+        // The FileManager fallback's error carries the POSIX reason underneath.
+        XCTAssertThrowsError(try FolderScanner.listWithFileManager(directory)) {
+            XCTAssertEqual(($0 as NSError).code, CocoaError.fileReadNoPermission.rawValue, "\($0)")
+            XCTAssertEqual(FolderScanner.posixCode($0), EACCES, "\($0)")
+        }
+        XCTAssertThrowsError(try FolderScanner.scan(directory.appendingPathComponent("missing"))) {
+            XCTAssertEqual(FolderScanner.posixCode($0), ENOENT, "\($0)")
+        }
+    }
+
+    func testPOSIXCodeOfAPrivacyRefusal() {
+        // What FileManager reports for a folder macOS privacy protection refuses: 257 over "Operation not permitted".
+        let refused = NSError(domain: NSCocoaErrorDomain, code: CocoaError.fileReadNoPermission.rawValue,
+                              userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(EPERM))])
+        XCTAssertEqual(FolderScanner.posixCode(refused), EPERM)
+        XCTAssertEqual(FolderScanner.posixCode(POSIXError(.EPERM)), EPERM)
+        XCTAssertNil(FolderScanner.posixCode(CocoaError(.fileReadUnknown)))
+    }
+
     func testScanOfLargeFolderIsFast() throws {
         for i in 0..<2000 { try touch("photo \(i).jpg", bytes: 1) }
         let start = Trace.now()

@@ -209,8 +209,8 @@ final class HUD {
 
     // MARK: Toast
 
-    /// Show `text` for 1.2 s at the same spot (replaces the previous toast).
-    func showToast(_ text: String) {
+    /// Show `text` for `seconds` (1.2 confirms an action) at the same spot (replaces the previous toast).
+    func showToast(_ text: String, seconds: TimeInterval = 1.2) {
         Trace.log("toast: \(text)")
         toastGeneration += 1
         let generation = toastGeneration
@@ -223,7 +223,7 @@ final class HUD {
             ]), maxWidth: size.width - 40)
             layoutToast()
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
             guard let self, self.toastGeneration == generation else { return }
             let fade = CABasicAnimation(keyPath: "opacity")
             fade.fromValue = 1
