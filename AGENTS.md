@@ -110,7 +110,10 @@ Without a Developer ID it refuses to publish unless `ALLOW_ADHOC=1` (other Macs 
 `DRY_RUN=1 mise run release` builds and packages everything (ad-hoc without a certificate) and prints the
 notarization, tag and publish commands instead of running them. `mise run app` and `mise run dmg` sign with the
 Developer ID when the keychain has one and fall back to ad-hoc for local builds (`SIGN_IDENTITY=-` forces ad-hoc);
-a local ad-hoc build carries `get-task-allow` (lldb, Instruments), a release never does.
+a local ad-hoc build carries `get-task-allow` (lldb, Instruments), a release never does. A release-config bundle's
+executable is stripped of the linker's debug map (`strip -S`), which names every object file and source folder by
+absolute path, the home folder included; the app task refuses to sign one that still contains `/Users/` or `$HOME`
+(`.build/release/Peekaboo` keeps the map for lldb).
 
 Installed apps read `https://github.com/thilllon/peekaboo/releases/latest/download/latest.json`
 (`Sources/PeekabooApp/Update`, `Sources/PeekabooCore/Update`): keep its fields and the zip layout stable, since every

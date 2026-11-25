@@ -18,6 +18,17 @@ APP="$PWD/build/Peekaboo.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_DIR/Peekaboo" "$APP/Contents/MacOS/Peekaboo"
+if [[ "$CONFIG" == release ]]; then
+  # The linker's debug map (STABS) names every object file and source folder by absolute path, the home folder
+  # included: strip it from the bundle (function names stay for crash reports; `$BIN_DIR/Peekaboo` keeps it for
+  # lldb), and refuse to ship a binary that still names a home folder.
+  strip -S "$APP/Contents/MacOS/Peekaboo"
+  if LC_ALL=C grep -aqF -e /Users/ -e "$HOME/" "$APP/Contents/MacOS/Peekaboo"; then
+    echo "Contents/MacOS/Peekaboo still contains an absolute home path:" >&2
+    { LC_ALL=C grep -ao '/Users/[[:print:]]*' "$APP/Contents/MacOS/Peekaboo" | sort -u | head -n 5 >&2; } || true
+    exit 1
+  fi
+fi
 PLIST="$APP/Contents/Info.plist"
 cp Resources/Info.plist "$PLIST"
 plutil -replace CFBundleShortVersionString -string "$VERSION" "$PLIST"
