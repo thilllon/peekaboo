@@ -369,7 +369,7 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
         guard let pick = candidates.first(where: { max($0.width, $0.height) >= need }) ?? (tier == .preview ? candidates.last : nil),
               let data = CR3Preview.bytes(url: url, pick),
               let source = CGImageSourceCreateWithData(data as CFData, DecodeProbe.sourceOptions) else { return nil }
-        guard let probe = try? data.withUnsafeBytes({ try DecodeProbe(source: source, url: url, jpegBytes: $0) }) else {
+        guard let probe = try? data.withUnsafeBytes({ try DecodeProbe(source: source, url: url, bytes: $0) }) else {
             return nil
         }
         let decoded: Output?
@@ -436,8 +436,9 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
             return Output(pixels: pixels, orientation: probe.info.orientation, path: "iosurface /\(subsample)")
         }
         // No alpha plane: an image with alpha takes the public path.
-        guard !probe.info.hasAlpha, YCbCrConverter.format(of: surface) != nil,
-              let pixels = YCbCrConverter.convert(surface, pool: pool, colorSpace: sdr ? Self.displayP3 : traits(probe).0)
+        guard !probe.info.hasAlpha, YCbCrConverter.format(of: surface) != nil, let matrix = ycbcrMatrix(probe),
+              let pixels = YCbCrConverter.convert(surface, matrix: matrix, pool: pool,
+                                                  colorSpace: sdr ? Self.displayP3 : traits(probe).0)
         else { return nil }
         return Output(pixels: pixels, orientation: probe.info.orientation,
                       path: "iosurface /\(subsample) ycbcr → gpu \(pixels.layout)\(sdr ? " (sdr)" : "")")
@@ -452,15 +453,22 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     private func nativeYCbCr(_ probe: DecodeProbe, scale: Int, pool: PixelBufferPool) -> Output? {
         let deep = probe.bitDepth > 8, sdr = probe.hdrTransfer
         guard IOSurfaceSPI.isAvailable, !probe.info.hasAlpha, deep || sdr || IOSurfaceSPI.canRequestFormat,
-              max(probe.info.pixelWidth, probe.info.pixelHeight) <= YCbCrConverter.maxSide else { return nil }
+              max(probe.info.pixelWidth, probe.info.pixelHeight) <= YCbCrConverter.maxSide,
+              let matrix = ycbcrMatrix(probe) else { return nil }
         guard let surface = IOSurfaceSPI.surface(probe.source, index: probe.index, subsample: 1,
                                                  request: sdr ? kCGImageSourceDecodeToSDR : nil,
                                                  format: deep || sdr ? nil : YCbCrConverter.fourCC("420f")),
               YCbCrConverter.format(of: surface) != nil,
-              let pixels = YCbCrConverter.convert(surface, scale: scale, pool: pool,
+              let pixels = YCbCrConverter.convert(surface, matrix: matrix, scale: scale, pool: pool,
                                                   colorSpace: sdr ? Self.displayP3 : traits(probe).0) else { return nil }
         return Output(pixels: pixels, orientation: probe.info.orientation,
                       path: "iosurface ycbcr → gpu /\(scale) \(pixels.layout)\(sdr ? " (sdr)" : "")")
+    }
+
+    /// The YCbCr matrix of `probe`'s bi-planar surfaces: the file's (`nclx`), or BT.2020 for the SDR rendition of a PQ /
+    /// HLG image. nil: a matrix the converter does not implement (ImageIO's BGRA path follows).
+    private func ycbcrMatrix(_ probe: DecodeProbe) -> YCbCrConverter.Matrix? {
+        probe.hdrTransfer ? YCbCrConverter.sdrRendition : YCbCrConverter.matrix(coefficients: probe.nclxMatrix)
     }
 
     /// Colour space and alpha semantics of the source pixels, without decoding. The SPI keeps the

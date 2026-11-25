@@ -187,9 +187,93 @@ final class DecodeHEIFTests: XCTestCase {
                 XCTAssertFalse(image.isHDR)
                 XCTAssertEqual(mean(image.pixels), mean(reference), accuracy: mean(reference) * 0.05, "\(name) \(tier)")
             }
+            // The rendition's YCbCr is BT.2020 (tagged BT.601 like every surface): its colours, not only its brightness.
+            let full = try decoder.decode(url, tier: .full, targetLongSide: 0, pool: pool)
+            assertMatchesImageIO(full.pixels, try imageIORendition(url, space: full.pixels.colorSpace, request: kCGImageSourceDecodeToSDR),
+                                 "\(name) SDR rendition")
         }
         // 8-bit images are never probed for an HDR transfer function.
         XCTAssertFalse(try DecodeProbe(url: try write([try quadrants(64, 48)], "sdr.heic")).hdrTransfer)
+    }
+
+    // MARK: YCbCr matrix
+
+    /// (r, g, b) at (x, y) of ImageIO's own rendering of `url` (`request`: `kCGImageSourceDecodeRequest`) drawn into
+    /// `space`.
+    private func imageIORendition(_ url: URL, space: CGColorSpace, request: CFString? = nil) throws -> (Int, Int) -> (Int, Int, Int) {
+        let source = try XCTUnwrap(CGImageSourceCreateWithURL(url as CFURL, nil))
+        let options = request.map { [kCGImageSourceDecodeRequest: $0] as CFDictionary }
+        let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, options))
+        let (w, h) = (image.width, image.height)
+        let context = try XCTUnwrap(CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4, space: space,
+                                              bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+        context.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        let data = try XCTUnwrap(context.data).assumingMemoryBound(to: UInt8.self)
+        let pixels = Array(UnsafeBufferPointer(start: data, count: w * h * 4))
+        return { x, y in let o = (y * w + x) * 4; return (Int(pixels[o]), Int(pixels[o + 1]), Int(pixels[o + 2])) }
+    }
+
+    private func assertMatchesImageIO(_ pb: PixelBuffer, _ reference: (Int, Int) -> (Int, Int, Int), tolerance: Int = 3,
+                                      _ label: String, file: StaticString = #filePath, line: UInt = #line) {
+        for (fx, fy) in [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)] {
+            let x = Int(Double(pb.width) * fx), y = Int(Double(pb.height) * fy)
+            let got = rgb(pb, x, y), want = reference(x, y)
+            XCTAssert(abs(got.0 - want.0) <= tolerance && abs(got.1 - want.1) <= tolerance && abs(got.2 - want.2) <= tolerance,
+                      "\(label) (\(fx), \(fy)) = \(got), ImageIO \(want)", file: file, line: line)
+        }
+    }
+
+    /// Rewrite `matrix_coefficients` of the file's first `colr` `nclx` box; false when it has none.
+    private func relabelMatrix(_ url: URL, to matrix: Int) throws -> Bool {
+        var bytes = [UInt8](try Data(contentsOf: url))
+        guard let colr = Self.box(bytes, "colr"), colr + 11 <= bytes.count, Array(bytes[colr..<(colr + 4)]) == Array("nclx".utf8) else {
+            return false
+        }
+        bytes[colr + 8] = UInt8(matrix >> 8)
+        bytes[colr + 9] = UInt8(matrix & 0xff)
+        try Data(bytes).write(to: url)
+        return true
+    }
+
+    /// ImageIO's surfaces keep the file's YCbCr matrix but are all tagged BT.601, so the converter reads the matrix
+    /// from the file's `nclx` (ImageIO follows that label too): files relabelled BT.709 / BT.2020 decode to ImageIO's
+    /// own colours. Saturated quadrants: converted as BT.601 a BT.709 red reads (255, 0, 0) where ImageIO shows
+    /// (255, 25, 0). A matrix the converter lacks (YCgCo) is left to ImageIO's BGRA conversion.
+    func testYCbCrMatrixComesFromTheFile() throws {
+        guard IOSurfaceSPI.canRequestFormat else { throw XCTSkip("no surface format request") }
+        XCTAssertEqual(try DecodeProbe(url: try write([try quadrants(64, 48)], "plain.heic")).nclxMatrix, 6, "ImageIO writes BT.601")
+        for (matrix, name) in [(1, "bt709"), (9, "bt2020"), (8, "ycgco")] {
+            let url = try write([try quadrants(512, 384)], "\(name).heic")
+            guard try relabelMatrix(url, to: matrix) else { throw XCTSkip("ImageIO wrote no nclx colour box") }
+            XCTAssertEqual(try DecodeProbe(url: url).nclxMatrix, matrix)
+            let image = try decoder.decode(url, tier: .full, targetLongSide: 0, pool: pool)
+            if YCbCrConverter.matrix(coefficients: matrix) == nil {
+                if case .surface = image.pixels.storage {} else { XCTFail("\(name): ImageIO's BGRA surface") }
+            } else {
+                if case .metal = image.pixels.storage {} else { XCTFail("\(name): converted on the GPU") }
+            }
+            assertMatchesImageIO(image.pixels, try imageIORendition(url, space: image.pixels.colorSpace), name)
+        }
+    }
+
+    /// The matrix is read from the `meta` box without trusting its sizes: truncated and corrupted headers give nil.
+    func testNCLXParserSurvivesMalformedHeaders() throws {
+        let url = try write([try quadrants(64, 48)], "parse.heic")
+        let bytes = [UInt8](try Data(contentsOf: url))
+        XCTAssertEqual(bytes.withUnsafeBytes { HEIFColour.matrixCoefficients(file: $0) }, 6)
+        XCTAssertEqual(HEIFColour.matrixCoefficients(url: url), 6)
+        let head = Array(bytes.prefix(1024))
+        var generator = SystemRandomNumberGenerator()
+        for length in stride(from: 0, through: head.count, by: 3) {
+            _ = Array(head.prefix(length)).withUnsafeBytes { HEIFColour.matrixCoefficients(file: $0) }
+            var flipped = head
+            for _ in 0..<4 { flipped[Int.random(in: 0..<flipped.count, using: &generator)] = .random(in: 0...255, using: &generator) }
+            _ = flipped.withUnsafeBytes { HEIFColour.matrixCoefficients(file: $0) }
+        }
+        let truncated = dir.appendingPathComponent("truncated.heic")
+        try Data(head.prefix(200)).write(to: truncated)
+        XCTAssertNil(HEIFColour.matrixCoefficients(url: truncated))
+        XCTAssertNil(HEIFColour.matrixCoefficients(url: dir.appendingPathComponent("missing.heic")))
     }
 
     // MARK: Containers

@@ -6,8 +6,8 @@ import Metal
 /// Converts the bi-planar YCbCr IOSurfaces ImageIO's surface SPI decodes HEIF / AVIF into (`'420f'` for 8 bits when
 /// asked, `'xf20'` for 10 bits, `'420f'` for the SDR rendition of a PQ / HLG image) into an RGB `PixelBuffer` with one
 /// Metal compute pass, optionally reduced by a power of two: luma box-filtered over the reduction, chroma sampled
-/// bilinearly at the output pixel's centre, the attachment's YCbCr matrix and range applied. 8-bit sources become
-/// `.bgra8`, deeper ones `.bgr10a2` (4 bytes per pixel either way, opaque).
+/// bilinearly at the output pixel's centre, the file's YCbCr matrix and the surface's range applied. 8-bit sources
+/// become `.bgra8`, deeper ones `.bgr10a2` (4 bytes per pixel either way, opaque).
 ///
 /// Measured on M4 Pro, macOS 26.6 (best of 5): ImageIO's own BGRA surface of a 12 MP / 50 MP HEIC costs 32 / 83 ms, its
 /// raw YCbCr 10 / 22 ms, the pass ~1–2 ms. Reduced SPI decodes are converted and downsampled on the CPU by ImageIO
@@ -40,9 +40,41 @@ enum YCbCrConverter {
     /// Largest surface side converted (the Metal texture limit).
     static let maxSide = 16384
 
-    /// `surface` as RGB in `colorSpace`, reduced by `scale` ∈ {1, 2, 4, 8} (output size rounded up), or nil (not a
-    /// supported layout, larger than a texture, no Metal, out of memory).
-    static func convert(_ surface: IOSurfaceRef, scale: Int = 1, pool: PixelBufferPool, colorSpace: CGColorSpace) -> PixelBuffer? {
+    /// Kr, Kb of a YCbCr matrix.
+    struct Matrix: Equatable {
+        let kr: Float
+        let kb: Float
+    }
+
+    static let bt601 = Matrix(kr: 0.299, kb: 0.114)
+    static let bt709 = Matrix(kr: 0.2126, kb: 0.0722)
+    static let bt2020 = Matrix(kr: 0.2627, kb: 0.0593)
+
+    /// The matrix of an ISO/IEC 23091-2 `matrix_coefficients` code point (`HEIFColour`). ImageIO's surfaces keep the
+    /// file's matrix but are all tagged `ITU_R_601_4`, so the tag is never read: absent and unspecified (2) mean
+    /// BT.601, as for that tag. nil for matrices the kernel does not implement (identity, YCgCo, constant luminance,
+    /// ICtCp, …): ImageIO converts those itself. Measured (macOS 26.6) against ImageIO's own RGB of the same files: a
+    /// 10-bit BT.709 AVIF 41 dB converted as BT.601, 62 dB as BT.709; a BT.2020 one 40 dB vs 65 dB.
+    static func matrix(coefficients code: Int?) -> Matrix? {
+        switch code {
+        case nil, 2, 5, 6: return bt601
+        case 1: return bt709
+        case 4: return Matrix(kr: 0.30, kb: 0.11)    // FCC
+        case 7: return Matrix(kr: 0.212, kb: 0.087)  // SMPTE 240M
+        case 9: return bt2020                       // BT.2020 non-constant luminance
+        default: return nil
+        }
+    }
+
+    /// The matrix of ImageIO's tone-mapped SDR rendition of a PQ / HLG image (`kCGImageSourceDecodeToSDR`): BT.2020
+    /// whatever the source's matrix and primaries (measured on BT.709- and BT.2020-matrix, BT.2020- and P3-primaries
+    /// sources: as BT.601 green is +0.65 levels off on average and a saturated HLG green 21 levels; 0.00 as BT.2020).
+    static let sdrRendition = bt2020
+
+    /// `surface` (in `matrix`) as RGB in `colorSpace`, reduced by `scale` ∈ {1, 2, 4, 8} (output size rounded up), or
+    /// nil (not a supported layout, larger than a texture, no Metal, out of memory).
+    static func convert(_ surface: IOSurfaceRef, matrix: Matrix, scale: Int = 1, pool: PixelBufferPool,
+                        colorSpace: CGColorSpace) -> PixelBuffer? {
         guard let format = format(of: surface), let gpu = GPU.shared(pool.device) else { return nil }
         let width = IOSurfaceGetWidth(surface), height = IOSurfaceGetHeight(surface)
         let chromaWidth = IOSurfaceGetWidthOfPlane(surface, 1), chromaHeight = IOSurfaceGetHeightOfPlane(surface, 1)
@@ -67,7 +99,7 @@ enum YCbCrConverter {
               let chroma = planeTexture(1, format.deep ? .rg16Unorm : .rg8Unorm, chromaWidth, chromaHeight),
               let out = buffer.makeTexture(descriptor: outDescriptor, offset: 0, bytesPerRow: pixels.bytesPerRow),
               let commands = gpu.queue.makeCommandBuffer(), let encoder = commands.makeComputeCommandEncoder() else { return nil }
-        var params = Params(format: format, matrix: matrix(surface), scale: scale,
+        var params = Params(format: format, matrix: matrix, scale: scale,
                             chromaScale: SIMD2(Float(chromaWidth) / Float(width), Float(chromaHeight) / Float(height)))
         commands.label = "YCbCr → RGB"
         encoder.setComputePipelineState(gpu.pipeline)
@@ -83,15 +115,6 @@ enum YCbCrConverter {
         return commands.status == .completed ? pixels : nil
     }
 
-    /// Kr, Kb of the surface's YCbCr matrix (BT.601 when it carries none).
-    static func matrix(_ surface: IOSurfaceRef) -> (kr: Float, kb: Float) {
-        let name = IOSurfaceCopyValue(surface, "IOSurfaceYCbCrMatrix" as CFString) as? String ?? ""
-        if name.hasPrefix("ITU_R_709") { return (0.2126, 0.0722) }
-        if name.hasPrefix("ITU_R_2020") { return (0.2627, 0.0593) }
-        if name.hasPrefix("SMPTE_240M") { return (0.212, 0.087) }
-        return (0.299, 0.114)
-    }
-
     /// Mirrors `struct P` in the kernel.
     struct Params {
         var r: SIMD4<Float>, g: SIMD4<Float>, b: SIMD4<Float>
@@ -101,7 +124,7 @@ enum YCbCrConverter {
         var reduction: Int32
         var pad: Int32 = 0
 
-        init(format: Format, matrix m: (kr: Float, kb: Float), scale reduction: Int, chromaScale: SIMD2<Float>) {
+        init(format: Format, matrix m: Matrix, scale reduction: Int, chromaScale: SIMD2<Float>) {
             let kg = 1 - m.kr - m.kb
             // Y' + matrix · (Cb, Cr) with Y' ∈ [0, 1], Cb, Cr ∈ [−½, ½].
             r = SIMD4(1, 0, 2 * (1 - m.kr), 0)
