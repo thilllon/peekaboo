@@ -90,7 +90,8 @@ errors. A key made of anything other than letters, digits, `_` and `-` must be q
 
 Peekaboo reads the manifest of the latest release on GitHub (`latest.json`, a few hundred bytes) — never
 while it launches, and never on the main thread. When a newer release exists, a banner at the bottom of the
-window and an item in the Peekaboo menu offer it:
+window (it waits until you pause, so it never lands between two images) and an item in the Peekaboo menu
+offer it:
 
 - With `auto_install = true` the release is downloaded in the background and checked before anything else
   happens: its SHA-256 must match the manifest, and its code signature must be valid and carry Peekaboo's

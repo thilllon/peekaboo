@@ -211,7 +211,9 @@ viewers score 21–26 dB and alias 10–25× more.
   utility queue with an ephemeral `URLSession`. A newer zip is verified (SHA-256,
   code signature with Peekaboo's identifier and the running app's Developer ID team), staged on the app's volume and
   swapped in with one `renamex_np(RENAME_SWAP)` by the app's own executable (`--install-update`) once the app has quit.
-  Nothing of it runs before the first frame; launch → first frame is unchanged.
+  Nothing of it runs before the first frame; launch → first frame is unchanged. The banner (an AppKit text field and
+  buttons: 5–20 ms of main-thread work to build) waits for 1.5 s without input unless the user asked for it, so it
+  never lands between two images or in a gesture.
 
 ### Animation
 

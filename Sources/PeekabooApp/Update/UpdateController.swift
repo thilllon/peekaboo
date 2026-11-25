@@ -9,8 +9,17 @@ final class UpdateController {
     private var banner: UpdateBanner?
     /// Banners shown in this run (an automatic re-check does not show one again).
     private var bannered: Set<String> = []
+    /// The banner of the latest phase, waiting for a pause in the input (`showPending`).
+    private var pending: (text: String, buttons: [(title: String, action: () -> Void)])?
+    private var waitsForQuiet = false
     private var observer: NSObjectProtocol?
     private static let bannerSeconds: TimeInterval = 30
+    /// An automatic banner waits until the app has taken no event (key, pointer, gesture) for this long.
+    private static let quietSeconds: TimeInterval = 1.5
+    /// Seconds since the last event the app took from its queue (internal for tests).
+    var secondsSinceInput: () -> TimeInterval = {
+        ProcessInfo.processInfo.systemUptime - (NSApp?.currentEvent?.timestamp ?? 0)
+    }
 
     init(updater: Updater, viewer: @escaping () -> ViewerWindowController?) {
         self.updater = updater
@@ -96,11 +105,33 @@ final class UpdateController {
 
     private func showBanner(_ text: String, again: Bool,
                             _ buttons: [(title: String, action: () -> Void)]) {
-        guard again || !bannered.contains(text), let content = viewer()?.window?.contentView else { return }
-        bannered.insert(text)
+        guard again || !bannered.contains(text) else {
+            pending = nil  // an older phase's banner is stale now
+            return
+        }
+        pending = (text, buttons)
+        showPending(now: again)
+    }
+
+    /// Show the pending banner: at once when the user asked for it, otherwise once the input has paused. Building it
+    /// (an AppKit text field and buttons) blocks the main thread for 5–20 ms, which must not land between two images
+    /// the user is flipping through or in a zoom gesture.
+    private func showPending(now: Bool = false) {
+        guard let pending, let content = viewer()?.window?.contentView else { return }
+        let quiet = secondsSinceInput()
+        if !now, quiet < Self.quietSeconds {
+            guard !waitsForQuiet else { return }
+            waitsForQuiet = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.quietSeconds - quiet) { [weak self] in
+                self?.waitsForQuiet = false
+                self?.showPending()
+            }
+            return
+        }
         hideBanner()
+        bannered.insert(pending.text)
         // Every button also dismisses the banner.
-        let banner = UpdateBanner(text: text, buttons: buttons.map { button in
+        let banner = UpdateBanner(text: pending.text, buttons: pending.buttons.map { button in
             (button.title, { [weak self] in
                 self?.hideBanner()
                 button.action()
@@ -108,7 +139,7 @@ final class UpdateController {
         })
         banner.show(in: content)
         self.banner = banner
-        Trace.log("update: banner “\(text)”")
+        Trace.log("update: banner “\(pending.text)”")
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.bannerSeconds) { [weak self, weak banner] in
             guard let self, let banner, self.banner === banner else { return }
             self.hideBanner()
@@ -116,6 +147,7 @@ final class UpdateController {
     }
 
     private func hideBanner() {
+        pending = nil
         banner?.removeFromSuperview()
         banner = nil
     }

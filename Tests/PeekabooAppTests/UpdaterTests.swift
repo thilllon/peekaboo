@@ -20,26 +20,9 @@ final class UpdaterTests: XCTestCase {
         super.tearDown()
     }
 
-    /// A bundle that passes for Peekaboo.app `version` (unsigned: nothing may be installed from or over it).
-    private func fakeApp(_ version: String) throws -> Bundle {
-        let contents = root.appendingPathComponent("Peekaboo.app/Contents")
-        try FileManager.default.createDirectory(at: contents.appendingPathComponent("MacOS"), withIntermediateDirectories: true)
-        let info: [String: Any] = ["CFBundleIdentifier": "com.thilllon.Peekaboo", "CFBundleShortVersionString": version,
-                                   "CFBundleExecutable": "Peekaboo", "CFBundlePackageType": "APPL"]
-        try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
-            .write(to: contents.appendingPathComponent("Info.plist"))
-        FileManager.default.createFile(atPath: contents.appendingPathComponent("MacOS/Peekaboo").path, contents: Data())
-        return try XCTUnwrap(Bundle(url: contents.deletingLastPathComponent()))
-    }
+    private func fakeApp(_ version: String) throws -> Bundle { try fakePeekabooApp(in: root, version: version) }
 
-    /// Serve `latest.json` announcing `version` through `PEEKABOO_UPDATE_URL`.
-    private func publish(_ version: String) throws {
-        let url = root.appendingPathComponent("latest.json")
-        let json: [String: Any] = ["version": version, "minimumSystemVersion": "26.0", "url": "https://example.com/Peekaboo.zip",
-                                   "sha256": String(repeating: "0", count: 64), "size": 10]
-        try JSONSerialization.data(withJSONObject: json).write(to: url)
-        setenv("PEEKABOO_UPDATE_URL", url.absoluteString, 1)
-    }
+    private func publish(_ version: String) throws { try publishManifest(in: root, version: version) }
 
     /// Statuses posted until one starts with `final`.
     private func statuses(until final: String, after trigger: () -> Void) -> [String] {
@@ -94,5 +77,62 @@ final class UpdaterTests: XCTestCase {
         XCTAssertEqual(text(.checking), "Checking for updates…")
         XCTAssertEqual(text(.upToDate), "Up to date (20261125)")
         XCTAssertEqual(text(.failed("Could not check for updates: offline")), "Could not check for updates: offline")
+    }
+}
+
+/// A bundle in `root` that passes for Peekaboo.app `version` (unsigned: nothing may be installed from or over it).
+private func fakePeekabooApp(in root: URL, version: String) throws -> Bundle {
+    let contents = root.appendingPathComponent("Peekaboo.app/Contents")
+    try FileManager.default.createDirectory(at: contents.appendingPathComponent("MacOS"), withIntermediateDirectories: true)
+    let info: [String: Any] = ["CFBundleIdentifier": "com.thilllon.Peekaboo", "CFBundleShortVersionString": version,
+                               "CFBundleExecutable": "Peekaboo", "CFBundlePackageType": "APPL"]
+    try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+        .write(to: contents.appendingPathComponent("Info.plist"))
+    FileManager.default.createFile(atPath: contents.appendingPathComponent("MacOS/Peekaboo").path, contents: Data())
+    return try XCTUnwrap(Bundle(url: contents.deletingLastPathComponent()))
+}
+
+/// Serve a `latest.json` in `root` announcing `version` through `PEEKABOO_UPDATE_URL`.
+private func publishManifest(in root: URL, version: String) throws {
+    let url = root.appendingPathComponent("latest.json")
+    let json: [String: Any] = ["version": version, "minimumSystemVersion": "26.0", "url": "https://example.com/Peekaboo.zip",
+                               "sha256": String(repeating: "0", count: 64), "size": 10]
+    try JSONSerialization.data(withJSONObject: json).write(to: url)
+    setenv("PEEKABOO_UPDATE_URL", url.absoluteString, 1)
+}
+
+/// The banner in a real viewer window: building it blocks the main thread, so an automatic one waits for a pause in
+/// the input, and one the user asked for shows at once.
+final class UpdateBannerTests: ViewerTestCase {
+    override func tearDown() {
+        unsetenv("PEEKABOO_UPDATE_URL")
+        super.tearDown()
+    }
+
+    private func banner(_ viewer: ViewerWindowController) -> UpdateBanner? {
+        viewer.window?.contentView?.subviews.lazy.compactMap { $0 as? UpdateBanner }.first
+    }
+
+    func testAnAutomaticBannerWaitsForAPauseInTheInput() throws {
+        let viewer = try makeViewer()
+        try publishManifest(in: root, version: "20261126")
+        let app = try fakePeekabooApp(in: root, version: "20261125")
+        let updater = try XCTUnwrap(Updater(settings: AppConfig.Updates(check: false, autoInstall: false), bundle: app))
+        let controller = UpdateController(updater: updater) { viewer }
+        var idle: TimeInterval = 0.2  // the user is flipping through images
+        controller.secondsSinceInput = { idle }
+        updater.checkNow(show: false)
+        XCTAssertTrue(spin(10) { if case .available = updater.phase { return true } else { return false } })
+        spin(0.3)
+        XCTAssertNil(banner(viewer), "a banner was built while the user was busy")
+        idle = 5
+        XCTAssertTrue(spin(5) { self.banner(viewer) != nil }, "no banner once the input paused")
+        let automatic = banner(viewer)
+
+        // "Check for Updates…" while the user is busy: the outcome comes with its banner at once.
+        idle = 0.2
+        updater.checkNow(show: true)
+        XCTAssertTrue(spin(10) { self.banner(viewer).map { $0 !== automatic } ?? false }, "the asked-for banner waited")
+        XCTAssertEqual(viewer.window?.contentView?.subviews.filter { $0 is UpdateBanner }.count, 1)
     }
 }
