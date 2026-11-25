@@ -522,7 +522,8 @@ final class EarlyRendition: @unchecked Sendable {
         guard sink.wanted() else { return }
         let qos = DispatchQoS.QoSClass(rawValue: qos_class_self()) ?? .userInitiated
         DispatchQueue.global(qos: qos).async { [self] in
-            guard !isFinished else { return }
+            // Asked again: on a saturated machine the block may start late, after the user moved on.
+            guard !isFinished, sink.wanted() else { return }
             let t0 = Trace.now()
             let decoded = autoreleasepool {
                 try? bytes.withUnsafeBytes { try TurboJPEG.decodeFirstPasses($0, targetLongSide: target, pool: pool) }
