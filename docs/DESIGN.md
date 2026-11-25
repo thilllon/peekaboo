@@ -216,6 +216,16 @@ viewers score 21–26 dB and alias 10–25× more.
   config apply, never looked up per decode.
 - File actions: trash with ⌘Z undo, move/copy to slots with undo, reveal, copy path/name/image, open with;
   stars/labels/flags as Finder tags.
+- Picks (no database: the Finder tag `Pick` on the file): the folder's tags are read once per listing on a utility
+  queue after the first frame (one `getxattr` per file, four lanes: ~40 ms for 5,000 files; a rescan reads only the
+  files that are new, changed in size, date or inode, or back after the viewer moved them out) and kept current from
+  the flags the app writes. The picks-only view is a browsing set of its own handed to the pipeline (`setFiles`), so
+  navigation, prefetch and the HUD work on it unchanged; the full set waits beside it. Entering it finds the picks
+  through the pipeline's lookup by name (O(picks), not a hash of every file), and every toggle restarts the
+  pipeline's navigation clock, so the new neighbours are prefetched however long the photo was looked at. Replaced
+  lists are freed on a utility queue (their last release is 0.65 ms per 5,000 files on the main thread). Copying
+  every pick reads the tags again, then copies on a utility queue through the same never-overwrite placement as
+  `file.copy`.
 - HUD as `CATextLayer`s above the Metal layer (no blur views), updated only on state changes; toasts.
 - Full screen: instant borderless (notch-aware) by default; native as an option.
 - Updates (no Sparkle): `latest.json` of the latest GitHub release, read 11 s after launch (the updater is set up 1 s

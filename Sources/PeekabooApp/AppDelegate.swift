@@ -295,6 +295,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         // Plain-key equivalents must never fire while another window (open panel, alert) is key.
         let plain = !item.keyEquivalent.isEmpty && item.keyEquivalentModifierMask.isDisjoint(with: [.command, .control])
         guard let viewer else { return action == .open || action == .quit }
+        if action == .picksOnly { item.state = viewer.isPicksOnly ? .on : .off }
         return viewer.canPerform(action, plainKeyEquivalent: plain)
     }
 }

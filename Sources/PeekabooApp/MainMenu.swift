@@ -67,6 +67,7 @@ enum MainMenu {
         main.addItem(submenu("File", [
             item(.open), item(.openWithChooser), .separator(),
             item(.trash), item(.reveal), .separator(),
+            item(.copyPicks("ask")), .separator(),
             item(.close),
         ]))
 
@@ -80,6 +81,7 @@ enum MainMenu {
 
         main.addItem(submenu("View", [
             item(.hud, "Cycle Info Overlay"), item(.hudHide), item(.help), .separator(),
+            item(.picksOnly), .separator(),
             item(.zoomFit), item(.zoomFill), item(.zoomActual), item(.zoomSet(2)), item(.zoomIn), item(.zoomOut),
             item(.zoomToggle), item(.zoomKeep), .separator(),
             item(.rotateClockwise), item(.rotateCounterClockwise), item(.flipHorizontal), item(.flipVertical), .separator(),

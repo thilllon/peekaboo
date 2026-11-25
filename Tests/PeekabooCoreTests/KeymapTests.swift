@@ -35,6 +35,7 @@ final class KeymapTests: XCTestCase {
             ("shift+6", [.label("red"), .next]), ("shift+9", [.label("blue"), .next]),
             ("p", [.flag("pick")]), ("x", [.flag("reject")]), ("u", [.flag("none")]),
             ("shift+p", [.flag("pick"), .next]), ("shift+x", [.flag("reject"), .next]), ("shift+u", [.flag("none"), .next]),
+            ("v", [.picksOnly]), ("shift+c", [.copyPicks("ask")]),
             ("cmd+,", [.config]), ("?", [.help]), ("cmd+/", [.help]), ("cmd+w", [.close]), ("q", [.close]),
             ("cmd+q", [.quit]), ("cmd+o", [.open]),
         ]
@@ -78,8 +79,10 @@ final class KeymapTests: XCTestCase {
         XCTAssertEqual(resolve(map, "w"), .actions([.zoomFit]))
         XCTAssertEqual(resolve(map, "h", .zoomed), .actions([.pan(.left)]))
         XCTAssertEqual(resolve(map, "shift+j", .zoomed), .actions([.panEdge(.bottom)]))
-        // The default layer stays.
+        // The default layer stays, the picks keys included.
         XCTAssertEqual(resolve(map, "right"), .actions([.next]))
+        XCTAssertEqual(resolve(map, "v"), .actions([.picksOnly]))
+        XCTAssertEqual(resolve(map, "shift+c"), .actions([.copyPicks("ask")]))
         XCTAssertTrue(map.conflicts().isEmpty)
         XCTAssertEqual(resolve(Keymap.default, "g"), .unbound)
     }
@@ -140,6 +143,11 @@ final class KeymapTests: XCTestCase {
         XCTAssertThrowsError(try config("[keys]\n\"file.move:keep\" = \"k\"\n")) { error in
             XCTAssertEqual((error as! ConfigError).messages, ["config.toml:2: unknown slot \"keep\" (add it under [slots])"])
         }
+        XCTAssertThrowsError(try config("[keys]\n\"k\" = \"file.copy_picks:selects\"\n")) { error in
+            XCTAssertEqual((error as! ConfigError).messages, ["config.toml:2: unknown slot \"selects\" (add it under [slots])"])
+        }
+        let picks = try config("[slots]\nselects = \"~/Selects\"\n[keys]\n\"k\" = \"file.copy_picks:selects\"\n").keymap
+        XCTAssertEqual(resolve(picks, "k"), .actions([.copyPicks("selects")]))
     }
 
     func testDefaultsOffStartsEmpty() throws {

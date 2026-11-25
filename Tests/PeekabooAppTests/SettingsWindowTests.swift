@@ -372,6 +372,19 @@ final class SettingsWindowTests: ViewerTestCase {
         pane.cancelRecording()
     }
 
+    /// The picks actions (#76) are listed with their built-in keys: the view under View, copying every pick under Files.
+    func testPicksActionsAreListedWithTheirKeys() throws {
+        let controller = try makeController(toml: "")
+        let pane = shortcuts(controller)
+        for (action, group, key) in [(Action.picksOnly, "view", "v"), (.copyPicks("ask"), "file", "shift+c")] {
+            let row = try XCTUnwrap(pane.rows().first { $0.actions == [action] }, action.id)
+            XCTAssertEqual(row.group, group, action.id)
+            XCTAssertEqual(row.title, KeyLabels.title(action))
+            XCTAssertEqual(row.sequences, [try KeyChord.parseSequence(key)], action.id)
+            XCTAssertFalse(row.modified, action.id)
+        }
+    }
+
     /// The window handles text editing shortcuts itself (the app menu has no Edit › Paste), and ⌘W closes it rather
     /// than the viewer.
     func testCommandWClosesTheSettingsWindow() throws {

@@ -19,10 +19,14 @@ public enum Action: Hashable, Sendable {
     case rotateClockwise, rotateCounterClockwise, flipHorizontal, flipVertical
     /// Animations (GIF, APNG, WebP, HEICS, AVIS): play / pause, and pause then step one frame.
     case playPause, frameNext, framePrevious
+    /// Toggle the picks-only view: browse only the photos flagged Pick (the folder's order).
+    case picksOnly
     // file
     case trash, delete, reveal, copyPath, copyName, copyImage, openWithChooser
     /// Move / copy the current file: a slot name, a path (`~` and `./relative` allowed), `ask` or `last`.
     case move(String), copy(String)
+    /// Copy every picked photo of the browsing set to a folder (the targets of `copy`).
+    case copyPicks(String)
     /// Open with an app slot, bundle id, app name or path.
     case openWith(String)
     // meta (stored as Finder tags)
@@ -51,6 +55,7 @@ public enum Action: Hashable, Sendable {
         "view.rotate_cw": .rotateClockwise, "view.rotate_ccw": .rotateCounterClockwise,
         "view.flip_h": .flipHorizontal, "view.flip_v": .flipVertical,
         "view.play_pause": .playPause, "view.frame_next": .frameNext, "view.frame_prev": .framePrevious,
+        "view.picks_only": .picksOnly,
         "file.trash": .trash, "file.delete": .delete, "file.reveal": .reveal, "file.copy_path": .copyPath,
         "file.copy_name": .copyName, "file.copy_image": .copyImage, "file.open_with_chooser": .openWithChooser,
         "app.undo": .undo, "app.redo": .redo, "app.config": .config, "app.config_file": .configFile,
@@ -85,6 +90,7 @@ public enum Action: Hashable, Sendable {
             self = .panEdge(edge)
         case "file.move": self = .move(arg)
         case "file.copy": self = .copy(arg)
+        case "file.copy_picks": self = .copyPicks(arg)
         case "file.open_with": self = .openWith(arg)
         case "meta.rate":
             guard let n = Int(arg), (0...5).contains(n) else { return nil }
@@ -109,6 +115,7 @@ public enum Action: Hashable, Sendable {
         case .panEdge(let edge): return "pan.edge:\(edge.rawValue)"
         case .move(let target): return "file.move:\(target)"
         case .copy(let target): return "file.copy:\(target)"
+        case .copyPicks(let target): return "file.copy_picks:\(target)"
         case .openWith(let app): return "file.open_with:\(app)"
         case .rate(let n): return "meta.rate:\(n)"
         case .label(let color): return "meta.label:\(color)"

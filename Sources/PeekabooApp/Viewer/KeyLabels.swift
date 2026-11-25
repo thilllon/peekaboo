@@ -121,6 +121,7 @@ enum KeyLabels {
         case .playPause: return "Play / Pause Animation"
         case .frameNext: return "Next Frame"
         case .framePrevious: return "Previous Frame"
+        case .picksOnly: return "Show Picks Only"
         case .trash: return "Move to Trash"
         case .delete: return "Delete Immediately"
         case .reveal: return "Reveal in Finder"
@@ -130,6 +131,12 @@ enum KeyLabels {
         case .openWithChooser: return "Open With…"
         case .move(let t): return "Move to \(t)"
         case .copy(let t): return "Copy to \(t)"
+        case .copyPicks(let t):
+            switch t {
+            case "ask": return "Copy All Picks to…"
+            case "last": return "Copy All Picks to the Last Folder"
+            default: return "Copy All Picks to \(t)"
+            }
         case .openWith(let a): return "Open With \(a)"
         case .rate(let n): return n == 0 ? "Clear Rating" : "Rate " + String(repeating: "★", count: n)
         case .label(let c): return c == "none" ? "Clear Label" : "Label \(c.capitalized)"
@@ -159,12 +166,12 @@ enum KeyLabels {
              .rotateClockwise, .rotateCounterClockwise, .flipHorizontal, .flipVertical,
              .playPause, .frameNext, .framePrevious: return 3
         case .trash, .delete, .reveal, .copyPath, .copyName, .copyImage, .openWithChooser, .move, .copy, .openWith, .exec: return 4
-        case .rate, .label, .flag: return 5
+        case .rate, .label, .flag, .picksOnly, .copyPicks: return 5
         default: return 6
         }
     }
 
-    static let sectionNames = ["Navigate", "Zoom", "Pan (zoomed)", "View", "File", "Rate & Label", "App"]
+    static let sectionNames = ["Navigate", "Zoom", "Pan (zoomed)", "View", "File", "Rate, Label & Pick", "App"]
 
     /// Help text generated from the live keymap: one line per binding target, grouped by section.
     static func helpSections(_ keymap: Keymap) -> [(title: String, lines: [(keys: String, title: String)])] {

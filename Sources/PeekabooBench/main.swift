@@ -5,6 +5,7 @@ import Foundation
 let suites: [String: (ArraySlice<String>) throws -> Void] = [
     "anim": runAnimBench,
     "decode": runDecodeBench,
+    "picks": runPicksBench,
     "pipeline": runPipelineBench,
     "render": runRenderBench,
 ]

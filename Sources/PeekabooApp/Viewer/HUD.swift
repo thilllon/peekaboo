@@ -5,7 +5,7 @@ import QuartzCore
 
 /// What the info overlay shows for the current image.
 struct HUDContent: Equatable {
-    /// `name · index/count · dims · zoom % · rating/label`
+    /// `name · index/count · Picks N · dims · zoom % · rating/label` (`name · Picks index/count · …` in the picks-only view)
     var line = ""
     /// Full-mode rows (label, value).
     var details: [Row] = []
@@ -209,8 +209,13 @@ final class HUD {
 
     // MARK: Toast
 
-    /// Show `text` for `seconds` (1.2 confirms an action) at the same spot (replaces the previous toast).
-    func showToast(_ text: String, seconds: TimeInterval = 1.2) {
+    /// The toast `showToast` returned `generation` for is still the one shown: no other toast replaced it.
+    func isShowingToast(_ generation: Int) -> Bool { toastGeneration == generation }
+
+    /// Show `text` for `seconds` (1.2 confirms an action) at the same spot (replaces the previous toast). Returns the
+    /// toast's generation.
+    @discardableResult
+    func showToast(_ text: String, seconds: TimeInterval = 1.2) -> Int {
         Trace.log("toast: \(text)")
         toastGeneration += 1
         let generation = toastGeneration
@@ -238,6 +243,7 @@ final class HUD {
                 self.transaction { self.toast.box.isHidden = true }
             }
         }
+        return generation
     }
 
     // MARK: Progress line

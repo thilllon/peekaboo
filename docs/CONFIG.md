@@ -102,7 +102,7 @@ Reset All removes every entry of `[keys]` and `[keys.zoomed]`. Actions with an a
 | `[fullscreen]` `avoid_notch` | `true` | keep the image below the camera housing on notched displays |
 | `[hud]` `mode` | `"minimal"` | `"off"`, `"minimal"`, `"full"` (cycle with `i`) |
 | `[cache]` `memory_mb` | `"auto"` | decoded-image memory budget in MB (64–1048576), or `"auto"` to derive it from installed memory |
-| `[rating]` `storage` | `"finder-tags"` | `"finder-tags"` or `"none"` (turns `meta.*` actions off) |
+| `[rating]` `storage` | `"finder-tags"` | `"finder-tags"` or `"none"` (turns `meta.*` actions and [picks](#picks) off) |
 | `[rating]` `star` | `"★"` | the character a rating is spelled with: 3 stars is the Finder tag `★★★` |
 | `[rating]` `auto_advance` | `false` | `true`: plain `0`–`9`, `p`, `x`, `u` also go to the next image (`shift+` always does) |
 | `[keymap]` `defaults` | `true` | `false` starts from an empty keymap: only your `[keys]` (and the vim layer, if on) apply |
@@ -233,6 +233,7 @@ Ids are `namespace.verb`, optionally followed by `:argument`.
 | `view.rotate_cw`, `view.rotate_ccw`, `view.flip_h`, `view.flip_v` | rotate / flip the view (the file is not changed) |
 | `view.play_pause` | play or pause an animation (GIF, APNG, WebP, HEIC / AVIF sequence); after its last loop, play again |
 | `view.frame_next`, `view.frame_prev` | pause the animation and step one frame (wraps around; hold to keep stepping) |
+| `view.picks_only` | browse only the photos flagged Pick, or every photo again (see [picks](#picks)) |
 | `view.help` | the key cheat sheet |
 
 ### Files
@@ -242,6 +243,7 @@ Ids are `namespace.verb`, optionally followed by `:argument`.
 | `file.trash` | move to the Trash, instantly; undo with ⌘Z |
 | `file.delete` | delete permanently, after a confirmation; cannot be undone |
 | `file.move:<target>`, `file.copy:<target>` | move / copy to a slot, a path, `ask` (picker) or `last` (previous destination); undoable |
+| `file.copy_picks:<target>` | copy every photo of the folder flagged Pick to a slot, a path, `ask` or `last` (see [picks](#picks)) |
 | `file.reveal` | show the file in Finder |
 | `file.copy_path`, `file.copy_name` | copy the POSIX path / the file name as text |
 | `file.copy_image` | copy the file and its image (pasting into Finder pastes the file; image apps get pixels) |
@@ -304,6 +306,7 @@ Ids are `namespace.verb`, optionally followed by `:argument`.
 | `meta.label:red` `yellow` `green` `blue` | `6` `7` `8` `9` |
 | `meta.flag:pick` `reject` `none` | `p` `x` `u` |
 | the same, then `nav.next` | `shift+` the key: `shift+3` rates 3 and advances, `shift+p` picks and advances |
+| `view.picks_only` / `file.copy_picks:ask` | `v` / `shift+c` |
 | `app.config` | `cmd+,` |
 | `view.help` | `?` `cmd+/` |
 | `app.close` | `cmd+w` `q` |
@@ -408,6 +411,39 @@ They are stored as Finder tags, so they show in Finder, survive copies and are s
 
 Other tags on the file are kept. Every change can be undone. Lightroom, Bridge and Photo Mechanic read
 XMP rather than Finder tags.
+
+### Picks
+
+For culling a large shoot: pick with `p` (or `shift+p`, which picks and advances), then work with the picks
+alone. There is no database: a pick is the Finder tag `Pick` on the file. Peekaboo reads the folder's tags once,
+in the background after the first image is on screen (about 40 ms for 5,000 photos), and keeps them current as
+you mark. When the folder changes, it reads only the files that are new, changed (another app saved them anew,
+which can drop their tags) or back (moved out and put back).
+
+- **Counter.** While the folder has picks the HUD says how many: `IMG_0042.jpg · 42/5000 · Picks 37 · …`. It
+  shows once the folder's tags are read.
+- **Picks-only view** (`view.picks_only`, `v`, View › Show Picks Only). Only the picks, in the folder's
+  order: next, previous, first, last, jumps and prefetching work within them, and the HUD counts within them
+  (`Picks 12/37`). The photo on screen never changes when you switch the view on or off. A photo on screen that
+  is not a pick (you un-picked it, or the view began on it) stays until you move on, shown as
+  `Not a pick · Picks 36`: → then goes to the next pick after it, ← to the one before. When no pick is left,
+  the next move goes on among every photo. With no picks, the view does not start.
+- **Copy all picks** (`file.copy_picks:<target>`, `shift+c` for `ask`, File › Copy All Picks to…). Copies
+  every pick of the folder, in its order, to a slot, a path, the last destination (`last`) or a folder you
+  choose (`ask`, the same picker as `file.copy:ask`). It reads the tags again first, so picks changed in Finder
+  meanwhile count, and runs in the background (yielding to the viewer on a slow disk) with a progress toast and
+  a summary. It never replaces a file: a name that is taken gets a number (`IMG_0042 2.jpg`), and a pick the
+  folder already holds is skipped (a copy made earlier: the same name, size and date; on a disk that keeps dates
+  less precisely, such as a FAT or exFAT card, an HFS+ disk or a network share, also the same first and last
+  64 KB), so copying again after picking more adds only the new picks. Copies keep their tags. Copying is not
+  undone by ⌘Z (it only adds files): the summary says so.
+
+A tag changed in Finder on a photo that is already listed raises no folder event: the counter and the view show it
+after the next copy of the picks (which reads every tag again) or when the folder is opened again. A FAT card
+stores local times, so after a change of time zone or daylight saving time its dates are an hour off and copying
+again there makes numbered copies.
+
+`[rating] storage = "none"` turns picks off with the other `meta.*` actions: no tags are read.
 
 ### exec commands
 

@@ -243,7 +243,7 @@ private struct ConfigReader {
     /// Move/copy targets must be a path, `ask`, `last` or a slot defined under `[slots]`.
     private mutating func validate(_ action: Action, _ entry: TOMLEntry) -> Bool {
         switch action {
-        case .move(let target), .copy(let target):
+        case .move(let target), .copy(let target), .copyPicks(let target):
             if !FileOperations.isPathLike(target), target != "ask", target != "last", config.slots[target] == nil {
                 fail(entry, "unknown slot \"\(target)\" (add it under [slots])")
                 return false
@@ -273,8 +273,8 @@ private struct ConfigReader {
     /// ` (did you mean "nav.next"?)` for near misses of parameterless ids.
     private static func suggestion(for id: String) -> String {
         let name = id.split(separator: ":").first.map(String.init) ?? id
-        let known = Action.simpleIDs + ["nav.jump", "zoom.set", "pan.edge", "file.move", "file.copy", "file.open_with",
-                                        "meta.rate", "meta.label", "meta.flag", "exec"]
+        let known = Action.simpleIDs + ["nav.jump", "zoom.set", "pan.edge", "file.move", "file.copy", "file.copy_picks",
+                                        "file.open_with", "meta.rate", "meta.label", "meta.flag", "exec"]
         if known.contains(name) { return " (check its argument)" }
         let best = known.min { distance($0, name) < distance($1, name) }
         guard let best, distance(best, name) <= 3 else { return "" }
