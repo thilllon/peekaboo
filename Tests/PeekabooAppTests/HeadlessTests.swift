@@ -94,14 +94,19 @@ final class HeadlessTests: ViewerTestCase {
         // Four times the layer's drawables, as fast as the run loop turns.
         let view: ViewerView = try XCTUnwrap(property(viewer, "viewerView"))
         let started = Trace.now()
+        var longestWait = 0.0
         for i in 0..<12 {
+            let asked = Trace.now()
             let drawable = try XCTUnwrap(view.metalLayer.nextDrawable(), "no drawable \(i)")
+            longestWait = max(longestWait, Trace.ms(since: asked))
             let commands = try XCTUnwrap(RenderContext.shared.queue.makeCommandBuffer())
             commands.present(drawable)
             commands.commit()
             spin(0.005)
         }
-        XCTAssertLessThan(Trace.ms(since: started), 5000, "the layer's drawables are throttled")
+        let total = Trace.ms(since: started)
+        print(String(format: "headless drawables: 12 in %.1f ms, longest nextDrawable wait %.1f ms", total, longestWait))
+        XCTAssertLessThan(total, 5000, "the layer's drawables are throttled")
     }
 
     /// The window server agrees: every window of the process it has ordered in is transparent and off every display.
