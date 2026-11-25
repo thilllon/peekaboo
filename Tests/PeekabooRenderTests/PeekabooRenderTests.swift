@@ -469,14 +469,22 @@ final class PeekabooRenderTests: XCTestCase {
     // MARK: Oldest supported system
 
     /// The shaders compile at runtime in the newest Metal language version of the running system, so the source
-    /// must stay within what the oldest supported macOS compiles: macOS 14 has MSL 3.1.
+    /// must stay within what the oldest supported macOS compiles: macOS 14 has MSL 3.1. Every runtime-compiled source,
+    /// with the options it is compiled with: the renderer's and the YCbCr converter's (HEIF / AVIF decode lanes).
     func testShadersCompileAsMetal31ForMacOS14() throws {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let options = RenderContext.compileOptions()
-        options.languageVersion = .version3_1
-        let oldest = try device.makeLibrary(source: Shaders.source, options: options)
-        let current = try device.makeLibrary(source: Shaders.source, options: RenderContext.compileOptions())
-        XCTAssertEqual(Set(oldest.functionNames), Set(current.functionNames))
+        let sources: [(name: String, source: String, options: () -> MTLCompileOptions?)] = [
+            ("renderer", Shaders.source, RenderContext.compileOptions),
+            ("YCbCr converter", YCbCrConverter.shaderSource, { nil }),
+        ]
+        for (name, source, runtimeOptions) in sources {
+            let options = runtimeOptions() ?? MTLCompileOptions()
+            options.languageVersion = .version3_1
+            let oldest = try device.makeLibrary(source: source, options: options)
+            let current = try device.makeLibrary(source: source, options: runtimeOptions())
+            XCTAssertFalse(oldest.functionNames.isEmpty, name)
+            XCTAssertEqual(Set(oldest.functionNames), Set(current.functionNames), name)
+        }
     }
 
     // MARK: Present latency

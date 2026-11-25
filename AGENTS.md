@@ -76,8 +76,8 @@ mise run deps      # static libjpeg-turbo for the deployment target → .deps/ (
   config/keymap, update verification and install (`Update/`). No AppKit. Shared contract types live in
   `Sources/PeekabooCore/Model`.
 - `Sources/CPeekabooDecode` — own C decoders where ImageIO is slow: PNG (system zlib) and the
-  first-pass rendition of progressive JPEGs (libjpeg-turbo). They parse untrusted files: keep
-  every bound checked and the mutation tests (`PNGDecodeTests`, `EarlyRenditionTests`) passing.
+  first-pass rendition of progressive JPEGs (libjpeg-turbo's libjpeg API, headers from `.deps/`). They parse
+  untrusted files: keep every bound checked and the mutation tests (`PNGDecodeTests`, `EarlyRenditionTests`) passing.
 - `Sources/PeekabooRender` — Metal renderer (zero-copy textures, quality pyramid,
   resampling kernels, progressive refinement).
 - `Sources/PeekabooApp` — programmatic AppKit shell (no storyboards, nibs or SwiftUI); `Settings/` is the Settings
@@ -154,7 +154,8 @@ signature carries the running app's identifier and team.
   `if #available(macOS 15 / 26, *)` with the newest path first, so macOS 26 runs exactly the code it ran before;
   never put the check in a per-pixel or per-frame loop. C code is built for the same target (`mise run deps`,
   SwiftPM C targets); the linker must not warn about objects "built for newer macOS". The binaries record SDK 26.0
-  (see `linkedSDK` in Package.swift).
+  (see `linkedSDK` in Package.swift). Metal source compiled at runtime must stay within MSL 3.1, macOS 14's newest:
+  add every such source to `testShadersCompileAsMetal31ForMacOS14`.
 - Tests that need Metal, a display or the benchmark corpus must `XCTSkip` when it is unavailable.
 - Prefer Apple frameworks (ImageIO, Metal, Accelerate) and static C libraries over new
   dependencies.

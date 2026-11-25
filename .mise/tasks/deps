@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#MISE description="Build the static libjpeg-turbo PeekabooCore links into .deps/ (pinned release, SHA-256 checked, arm64 + Neon, macOS 14)"
+#MISE description="Build the static libjpeg-turbo PeekabooCore links, and its headers, into .deps/ (pinned release, SHA-256 checked, arm64 + Neon, macOS 14)"
 # mise runs file tasks from the project root. A no-op while .deps/ matches the pin and the flags below.
 set -euo pipefail
 VERSION=3.2.1
@@ -17,8 +17,12 @@ FLAGS=(
   -DREQUIRE_SIMD=ON
   -DWITH_TOOLS=OFF
 )
+# turbojpeg.h for CTurboJPEG; the libjpeg API for CPeekabooDecode's early rendition of progressive JPEGs: jpeglib.h,
+# jmorecfg.h and the jconfig.h this build generates. They must come from the same build as the library:
+# jpeg_CreateDecompress rejects a caller compiled for another JPEG_LIB_VERSION or struct size.
+HEADERS=(src/turbojpeg.h src/jpeglib.h src/jmorecfg.h)
 PREFIX="$PWD/.deps/libjpeg-turbo"
-STAMP="$VERSION $SHA256 ${FLAGS[*]}"
+STAMP="$VERSION $SHA256 ${FLAGS[*]} ${HEADERS[*]} jconfig.h"
 if [[ -f "$PREFIX/lib/libturbojpeg.a" && "$(cat "$PREFIX/.stamp" 2>/dev/null)" == "$STAMP" ]]; then
   echo "$PREFIX: libjpeg-turbo $VERSION up to date"
   exit 0
@@ -39,7 +43,8 @@ cmake --build "$WORK/build" --target turbojpeg-static --parallel "$(sysctl -n hw
 rm -rf "$PREFIX"
 mkdir -p "$PREFIX/include" "$PREFIX/lib"
 cp "$WORK/build/libturbojpeg.a" "$PREFIX/lib/"
-cp "$SRC/src/turbojpeg.h" "$PREFIX/include/"
+for header in "${HEADERS[@]}"; do cp "$SRC/$header" "$PREFIX/include/"; done
+cp "$WORK/build/jconfig.h" "$PREFIX/include/"
 cp "$SRC/LICENSE.md" "$PREFIX/"
 echo "$STAMP" > "$PREFIX/.stamp"
 echo "$PREFIX: libjpeg-turbo $VERSION built for macOS $MACOS arm64"

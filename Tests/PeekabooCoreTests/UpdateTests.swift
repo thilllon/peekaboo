@@ -62,7 +62,7 @@ final class UpdateTests: XCTestCase {
 
     private func manifest(_ fields: [String: Any]) -> Data {
         var json: [String: Any] = [
-            "version": "20261126-000026", "build": 26, "minimumSystemVersion": "26.0",
+            "version": "20261126-000026", "build": 26, "minimumSystemVersion": "14.0",
             "url": "https://github.com/thilllon/peekaboo/releases/download/v20261126-000026/Peekaboo-20261126-000026.zip",
             "sha256": String(repeating: "aB", count: 32), "size": 2_412_345,
             "dmg": "https://github.com/thilllon/peekaboo/releases/download/v20261126-000026/Peekaboo-20261126-000026.dmg",
