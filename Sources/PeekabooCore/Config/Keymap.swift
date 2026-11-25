@@ -133,6 +133,10 @@ public struct Keymap: Sendable, Equatable {
             normal(.rotateCounterClockwise, "shift+r", "cmd+l", "<")
             normal(.flipHorizontal, "|")
             normal(.flipVertical, "_")
+            // Animations: YouTube's keys (k plays and pauses, comma and period step a frame).
+            normal(.playPause, "k")
+            normal(.frameNext, ".")
+            normal(.framePrevious, ",")
             normal(.trash, "cmd+backspace", "forwarddelete")
             normal(.undo, "cmd+z")
             normal(.redo, "cmd+shift+z")

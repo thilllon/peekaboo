@@ -118,6 +118,9 @@ enum KeyLabels {
         case .rotateCounterClockwise: return "Rotate Left"
         case .flipHorizontal: return "Flip Horizontal"
         case .flipVertical: return "Flip Vertical"
+        case .playPause: return "Play / Pause Animation"
+        case .frameNext: return "Next Frame"
+        case .framePrevious: return "Previous Frame"
         case .trash: return "Move to Trash"
         case .delete: return "Delete Immediately"
         case .reveal: return "Reveal in Finder"
@@ -152,7 +155,8 @@ enum KeyLabels {
         case .zoomFit, .zoomFill, .zoomActual, .zoomIn, .zoomOut, .zoomToggle, .zoomKeep, .zoomSet: return 1
         case .pan, .panEdge, .panCenter: return 2
         case .fullscreen, .fullscreenNative, .hud, .hudHide, .background, .help,
-             .rotateClockwise, .rotateCounterClockwise, .flipHorizontal, .flipVertical: return 3
+             .rotateClockwise, .rotateCounterClockwise, .flipHorizontal, .flipVertical,
+             .playPause, .frameNext, .framePrevious: return 3
         case .trash, .delete, .reveal, .copyPath, .copyName, .copyImage, .openWithChooser, .move, .copy, .openWith, .exec: return 4
         case .rate, .label, .flag: return 5
         default: return 6

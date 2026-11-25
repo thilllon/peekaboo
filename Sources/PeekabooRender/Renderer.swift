@@ -427,6 +427,34 @@ public final class Renderer {
         clampCenter()
     }
 
+    /// Show a frame of the animation on screen: same file, same geometry (zoom, pan, rotation and flips stay). Frames
+    /// bypass the prepared-neighbour cache, so playback never evicts the next image's prepared textures.
+    ///
+    /// While `playing`, frames build no pyramid: a view that needs a pyramid level (the frame shown below half size)
+    /// draws bilinear from level 0, every other view takes its usual path (a level-0 HQ canvas, 1:1 copy, sharp
+    /// bilinear). Measured on M4 Pro at 3456×2234 / 1440×900: the pyramid of a 3840×2160 frame costs 4.1 ms GPU
+    /// (9 ms wall) per frame, the level-0 canvas 0.4–1.6 ms, bilinear 0.1–0.7 ms. Not playing (paused, stepped,
+    /// finished): the full-quality path, pyramid included. The same frame again only switches that.
+    public func setFrame(_ frame: DecodedImage, playing: Bool) {
+        if let current = gpu, current.image.pixels === frame.pixels {
+            current.defersPyramid = playing
+            if !playing { current.startPyramid(context: context) }
+            return
+        }
+        let made = GPUImage(image: frame, device: context.device)
+        made.defersPyramid = playing
+        if let previous = gpu, !prepared.contains(where: { $0.gpu === previous }) { previous.cancel() }
+        image = frame
+        gpu = made
+        previousTier = nil
+        // The canvas shows the previous frame (it would be kept while a pyramid level builds, see `encodeFrame`).
+        canvas = nil
+        attach(made)
+        made.startPyramid(context: context)
+        configureDynamicRange(hdr: frame.isHDR)
+        clampCenter()
+    }
+
     /// Build GPU resources (textures, colour transform, pyramid) for an image that will probably be shown next,
     /// off the critical path. Cheap on the calling (main) thread; the pyramid builds in the background.
     ///

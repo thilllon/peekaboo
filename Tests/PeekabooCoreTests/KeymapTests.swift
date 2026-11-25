@@ -24,6 +24,7 @@ final class KeymapTests: XCTestCase {
             ("r", [.rotateClockwise]), ("cmd+r", [.rotateClockwise]), (">", [.rotateClockwise]),
             ("shift+r", [.rotateCounterClockwise]), ("cmd+l", [.rotateCounterClockwise]), ("<", [.rotateCounterClockwise]),
             ("|", [.flipHorizontal]), ("_", [.flipVertical]),
+            ("k", [.playPause]), (".", [.frameNext]), (",", [.framePrevious]),
             ("cmd+backspace", [.trash]), ("forwarddelete", [.trash]), ("cmd+z", [.undo]), ("cmd+shift+z", [.redo]),
             ("m", [.move("ask")]), ("c", [.copy("ask")]), ("opt+1", [.move("1")]), ("opt+9", [.move("9")]),
             ("opt+shift+1", [.copy("1")]), ("opt+shift+9", [.copy("9")]),

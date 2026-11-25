@@ -3,6 +3,7 @@ import Foundation
 // peekaboo-bench <suite> [options]
 // Each workstream owns one suite file in this directory and registers it here.
 let suites: [String: (ArraySlice<String>) throws -> Void] = [
+    "anim": runAnimBench,
     "decode": runDecodeBench,
     "pipeline": runPipelineBench,
     "render": runRenderBench,

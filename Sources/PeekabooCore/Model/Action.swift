@@ -17,6 +17,8 @@ public enum Action: Hashable, Sendable {
     // view
     case fullscreen, fullscreenNative, hud, hudHide, background, help
     case rotateClockwise, rotateCounterClockwise, flipHorizontal, flipVertical
+    /// Animations (GIF, APNG, WebP, HEICS, AVIS): play / pause, and pause then step one frame.
+    case playPause, frameNext, framePrevious
     // file
     case trash, delete, reveal, copyPath, copyName, copyImage, openWithChooser
     /// Move / copy the current file: a slot name, a path (`~` and `./relative` allowed), `ask` or `last`.
@@ -48,6 +50,7 @@ public enum Action: Hashable, Sendable {
         "view.hud_hide": .hudHide, "view.background": .background, "view.help": .help,
         "view.rotate_cw": .rotateClockwise, "view.rotate_ccw": .rotateCounterClockwise,
         "view.flip_h": .flipHorizontal, "view.flip_v": .flipVertical,
+        "view.play_pause": .playPause, "view.frame_next": .frameNext, "view.frame_prev": .framePrevious,
         "file.trash": .trash, "file.delete": .delete, "file.reveal": .reveal, "file.copy_path": .copyPath,
         "file.copy_name": .copyName, "file.copy_image": .copyImage, "file.open_with_chooser": .openWithChooser,
         "app.undo": .undo, "app.redo": .redo, "app.config": .config, "app.reload_config": .reloadConfig,

@@ -9,9 +9,10 @@ import UniformTypeIdentifiers
 /// precomputed natural-sort keys order them like Finder (10k ≈ 7 ms; `localizedStandardCompare` ≈ 30 ms).
 /// A FileManager listing is the fallback for file systems without bulk attributes.
 public enum FolderScanner {
-    /// Lower-cased filename extensions ImageIO can decode on this system.
+    /// Lower-cased filename extensions ImageIO can decode on this system. ImageIO reads by content, but no system type
+    /// claims `.apng` (animated PNG) or `.avifs` (AVIF sequence): they are added by hand.
     public static let supportedExtensions: Set<String> = {
-        var result: Set<String> = []
+        var result: Set<String> = ["apng", "avifs"]
         let identifiers = (CGImageSourceCopyTypeIdentifiers() as? [String]) ?? []
         for identifier in identifiers {
             guard let type = UTType(identifier) else { continue }

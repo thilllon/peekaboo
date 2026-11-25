@@ -72,6 +72,7 @@ enum MainMenu {
             item(.zoomFit), item(.zoomFill), item(.zoomActual), item(.zoomSet(2)), item(.zoomIn), item(.zoomOut),
             item(.zoomToggle), item(.zoomKeep), .separator(),
             item(.rotateClockwise), item(.rotateCounterClockwise), item(.flipHorizontal), item(.flipVertical), .separator(),
+            item(.playPause), item(.frameNext), item(.framePrevious), .separator(),
             item(.background), .separator(),
             item(.fullscreen, "Enter Full Screen"), item(.fullscreenNative, "Enter Native Full Screen"),
         ]))

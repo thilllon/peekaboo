@@ -58,16 +58,17 @@ enum NativeImage {
 
     /// Copy `image` into a pooled buffer without converting. Returns nil when the layout is not
     /// representable (the caller then draws into `.bgra8`, which converts — rare formats only).
-    static func copy(_ image: CGImage, pool: PixelBufferPool) -> PixelBuffer? {
-        guard let (layout, alpha) = layout(of: image), image.colorSpace?.model ?? .rgb == .rgb else { return nil }
+    /// `alpha`: how to read the fourth byte instead of what the image says (animation frames, see `AnimationDecoder`).
+    static func copy(_ image: CGImage, pool: PixelBufferPool, alpha forced: AlphaMode? = nil) -> PixelBuffer? {
+        guard let (layout, declared) = layout(of: image), image.colorSpace?.model ?? .rgb == .rgb else { return nil }
+        let alpha = forced ?? declared
         let space = rgbSpace(image)
         guard let pixels = pool.make(width: image.width, height: image.height, layout: layout, alpha: alpha,
                                      colorSpace: space) else { return nil }
         let rowBytes = image.width * layout.bytesPerPixel
-        if let provider = image.dataProvider, let retainBytes, let releaseBytes, let source = retainBytes(provider) {
-            defer { releaseBytes(provider) }
-            let srcStride = image.bytesPerRow
-            guard srcStride >= rowBytes else { return nil }
+        let srcStride = image.bytesPerRow
+        guard srcStride >= rowBytes else { return nil }
+        func rows(from source: UnsafeRawPointer) {
             let dst = pixels.baseAddress
             if srcStride == pixels.bytesPerRow {
                 memcpy(dst, source, srcStride * (image.height - 1) + rowBytes)
@@ -76,6 +77,16 @@ enum NativeImage {
                     memcpy(dst + y * pixels.bytesPerRow, source + y * srcStride, rowBytes)
                 }
             }
+        }
+        if let provider = image.dataProvider, let retainBytes, let releaseBytes, let source = retainBytes(provider) {
+            defer { releaseBytes(provider) }
+            rows(from: source)
+            return pixels
+        }
+        // A draw would read a forced fourth byte as padding: take the provider's bytes as they are.
+        if forced != nil, let data = image.dataProvider?.data, CFDataGetLength(data) >= srcStride * (image.height - 1) + rowBytes,
+           let source = CFDataGetBytePtr(data) {
+            rows(from: UnsafeRawPointer(source))
             return pixels
         }
         return draw(image, into: pixels) ? pixels : nil
@@ -112,8 +123,8 @@ enum NativeImage {
     }
 
     /// Native copy when possible, converting draw otherwise.
-    static func pixels(_ image: CGImage, pool: PixelBufferPool, opaque: Bool) throws -> PixelBuffer {
-        if let pixels = copy(image, pool: pool) { return pixels }
+    static func pixels(_ image: CGImage, pool: PixelBufferPool, opaque: Bool, alpha: AlphaMode? = nil) throws -> PixelBuffer {
+        if let pixels = copy(image, pool: pool, alpha: alpha) { return pixels }
         if let pixels = convert(image, pool: pool, opaque: opaque) { return pixels }
         throw DecodeError.outOfMemory
     }
