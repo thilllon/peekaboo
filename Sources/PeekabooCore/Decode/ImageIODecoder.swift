@@ -175,10 +175,10 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
 
     /// PNG through `CPeekabooDecode`: streaming zlib inflate on a second thread, branchless unfiltering on this one,
     /// the samples as stored (RGBA 8-bit, or 16-bit at full size), box-filtered by the power of two (≤ 8) covering
-    /// `target`. 24 MP RGB: 153 ms vs 281 ms through ImageIO (whose subsample factor saves nothing), the same sample
-    /// values. Prefetch takes the second thread too: one-thread decodes (~200 ms) left fewer previews ready while
+    /// `target`. 24 MP RGB: 143–154 ms vs 303–334 ms through ImageIO (whose subsample factor saves nothing), the same
+    /// sample values. Prefetch takes the second thread too: one-thread decodes (~200 ms) left fewer previews ready while
     /// skimming a PNG folder (first pixel p90 108–123 vs 24–32 ms). Nil hands the file to ImageIO: grayscale (ImageIO's
-    /// gray colour space and converting draw), Adam7, APNG, anything malformed.
+    /// gray colour space and converting draw), Adam7, APNG, anything malformed or out of range.
     private func png(_ probe: DecodeProbe, url: URL, target: Int, pool: PixelBufferPool) throws -> Output? {
         guard let bytes = try? Data(contentsOf: url, options: [.alwaysMapped]) else { return nil }
         return try bytes.withUnsafeBytes { raw -> Output? in

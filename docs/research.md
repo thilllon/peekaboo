@@ -224,6 +224,13 @@ neighbour in a register per byte keeps three independent chains in flight), two 
 every IDAT cost ≤ 5 ms and are kept (a corrupt file goes to ImageIO). Samples are identical to ImageIO's for RGB/RGBA
 8/16-bit, palette 1/2/4/8-bit with and without tRNS, colour keys and every filter type (`PNGDecodeTests`).
 
+SwiftPM compiles release C at `-Os`, which keeps the unfilter's per-byte loops rolled (the left neighbours go through
+memory): in the app the 24 MP decode took 158–167 ms (one thread, in a C harness: 272 ms); the target now builds at
+`-O3`: 143–154 ms (one thread 202 ms). The inflate-bound 12 MP, RGBA and 16-bit files are unchanged. CRC32 of the
+40 MB file costs 1 ms (hardware CRC), the zlib stream's Adler-32 3.6 ms: raw inflate would save 3 %. Values the format
+leaves undefined go to ImageIO, which answers them its own way: an 8-bit colour key above 255 (ImageIO matches its low
+byte) and palette indices past the palette (ImageIO draws the last entry, or black with tRNS).
+
 Apple's `iDOT` PNGs (screenshots) split the rows in two halves that ImageIO inflates in parallel. The IDAT data is
 still one zlib stream (fully flushed at the split, the split row Sub-filtered), so the decoder reads it as one: a
 system-resource iDOT PNG decodes identically to ImageIO (5.7 vs 6.4 ms), and a 12 MP iDOT re-encode of the corpus
@@ -269,6 +276,29 @@ workloads; a temporary watchdog that sampled the main thread during them found i
 instructions (a struct copy, the run loop's port poll), not waiting on a lock, a fault or the decoders. Decoding
 prefetched PNGs on one thread instead of two removed nothing measurable there but left fewer previews ready while
 skimming (first pixel p90 108–123 ms instead of 24–35), so prefetch keeps the second thread.
+
+### Review re-measurement
+
+An independent A/B of `main` against the branch with the review fixes (C at `-O3`, out-of-range PNG values to
+ImageIO), same Mac, still shared (load average 5–12), release builds interleaved:
+
+- `peekaboo-bench decode`, 5 rounds × 5 iterations, ms: PNG 24 MP 321 / 303 / 334 → **143 / 143 / 154**, PNG 12 MP
+  133 / 118 / 155 → **63 / 63 / 63**. Progressive screen tiers unchanged within noise (332 → 337, 170 → 177,
+  789 → 790, 1060 → 1075; every pair overlaps round by round), early renditions 78 / 40 / 101 / 166 ms with the exact
+  decode beside them at 335 / 172 / 792 / 1096 ms. Baseline JPEG 39.3 → 39.4, HEIC 35.8 → 35.1 ms.
+- `peekaboo-bench pipeline --cold`, 3 rounds: progressive random jumps early p90 / p99 323 / 713 → **103 / 360 ms**,
+  sharp 323 / 713 → 235 / 417 ms; PNG random jumps 282 / 296 → **147 / 147 ms**; PNG key repeat first pixel p90
+  129 → **25 ms**, sharp after the dwell 186 → **120 ms**; steady and A/B 100 % hits in both.
+- Key repeat then a dwell on the 101 MP file: early 856 → **195 ms**, sharp 856 → 849 ms (6 interleaved runs of that
+  trace alone; in the 3 runs of the whole bench 836 → 1085, the noisiest number here). At the dwell 4–5 screen-tier
+  prefetches of images already passed are still running in both builds (170–885 ms each): the cost model seeds every
+  `.jpg` with the baseline 45 ms, so while skimming progressive files their screen tiers look feasible. A planner
+  follow-up, not part of this change.
+- The rendition costs the exact decode nothing while a core is free: a visible 101 MP screen decode beside 5 busy
+  decode threads 808 ms alone, 795 ms with it (early at 114 ms). With 12 busy threads (no free core) its own CPU
+  time shows: 990 → 1031 ms (+4 %) for 101 MP, 427 → 455 ms (+7 %) for 24 MP 4:4:4, early at 103–114 ms.
+- Fuzzing under ASan/UBSan (mutations of 16 PNG and 5 JPEG seeds, output buffers ending at a guard page): 1.25 M PNG
+  and 2.2 M JPEG cases (0.7 M with a first-pass cut), no report.
 
 ### Persistent cache
 

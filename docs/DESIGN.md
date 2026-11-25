@@ -71,9 +71,12 @@ parallel (the luma chain is ≥ 55 % of the work: ≤ 1.4×, needs libjpeg inter
 interlaced. The system zlib (as fast as libdeflate here: 127 vs 115 ms for 24 MP, Wuffs 152 ms) inflates on a second
 thread into a ring of rows while the calling thread unfilters (branchless scalar Paeth: 62 ms for 24 MP; libpng-style
 NEON 89 ms, branchy 151 ms) and writes RGBA, box-filtered /2–/8 for reduced tiers (premultiplied when there is alpha).
-24 MP: 153–164 ms at every tier vs ImageIO 277–317 ms (12 MP: 60–66 vs 117–133 ms), with ImageIO's sample values
+24 MP: 143–154 ms at every tier vs ImageIO 303–334 ms (12 MP: 63 vs 118–155 ms), with ImageIO's sample values
 (tests compare every colour type, depth, filter type and tRNS form; the corpus files are identical) and ImageIO's colour
-space. Grayscale (ImageIO's gray colour space and converting draw), Adam7, APNG and malformed files go to ImageIO.
+space. The target builds at `-O3`: SwiftPM's release default `-Os` leaves the unfilter's per-byte loops rolled
+(24 MP 158–167 ms). Grayscale (ImageIO's gray colour space and converting draw), Adam7, APNG and malformed files go to
+ImageIO, and so do values the format leaves undefined, where ImageIO has its own answer: an 8-bit colour key above 255,
+palette indices past the palette.
 
 | Source | `.preview` (≤ 512 px) | `.screen` | `.full` |
 |---|---|---|---|
@@ -82,7 +85,7 @@ space. Grayscale (ImageIO's gray colour space and converting draw), Adam7, APNG 
 | JPEG baseline > 102 MP | embedded thumb, else `Subsample 4` | libjpeg-turbo, DCT scale covering the screen | libjpeg-turbo (tiles above 16384 px) |
 | HEIC / HEIF / AVIF | embedded thumbnail item (~2 ms); else thumbnail 1024 (70–76 ms @ 50 MP) | thumbnail at the screen long side (62–73 ms @ 50 MP) | ImageIO full via IOSurface (94–110 ms; 195–227 ms if copied out) |
 | Camera RAW | embedded preview, thumbnail without `Always` (ARW 15, RAF 19, NEF 43 ms); CR3 via own BMFF parse | embedded preview at screen size if it covers the screen (RAF 70, NEF 93 ms), else RAW decode in the background | RAW decode (ProRAW 133 … ARW 61 MP 886 ms), only on zoom |
-| PNG (RGB, RGBA, palette; not interlaced) | own decoder, box filter /8 (24 MP 164 ms) | own decoder, box filter covering the screen (24 MP 154 ms) | own decoder (16-bit stays 16-bit; 24 MP 153 ms) |
+| PNG (RGB, RGBA, palette; not interlaced) | own decoder, box filter /8 (24 MP 143 ms) | own decoder, box filter covering the screen (24 MP 143 ms) | own decoder (16-bit stays 16-bit; 24 MP 145–154 ms) |
 | WebP / TIFF / GIF / JXL / PSD / EXR, other PNG | thumbnail ≤ 512 (TIFF 23, AVIF 48, WebP 350 ms) | IOSurface SPI /n (lazy draw as fallback) | IOSurface SPI (lazy draw as fallback) |
 
 HDR (gain-map HEIC/JPEG): `kCGImageSourceDecodeRequest = DecodeToHDR` (10-bit PQ / half-float) when the screen

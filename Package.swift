@@ -22,7 +22,7 @@ let package = Package(
         .systemLibrary(name: "CTurboJPEG", path: "Sources/CTurboJPEG"),
         // Own C decoders where ImageIO is slow: PNG (system zlib) and the early rendition of progressive JPEGs.
         // SwiftPM builds release C at -Os, which leaves the unfilter's per-byte loops rolled (the left neighbours go
-        // through memory): 24 MP PNG 158–165 vs 138–143 ms at -O3 with two threads, 272 vs 202 ms with one.
+        // through memory): 24 MP PNG 158–167 ms, 143–154 ms at -O3 (one thread: 272 vs 202 ms).
         .target(name: "CPeekabooDecode", cSettings: [.unsafeFlags(["-O3"], .when(configuration: .release))],
                 linkerSettings: [.linkedLibrary("z")]),
         // Decode tiers, tiered cache, prefetch scheduler, folder model, config/keymap. No AppKit.
