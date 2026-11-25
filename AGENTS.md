@@ -113,8 +113,9 @@ Developer ID when the keychain has one and fall back to ad-hoc for local builds 
 
 Installed apps read `https://github.com/thilllon/peekaboo/releases/latest/download/latest.json`
 (`Sources/PeekabooApp/Update`, `Sources/PeekabooCore/Update`): keep its fields and the zip layout stable, since every
-installed version parses them. The updater never runs before launch + 10 s, never on the main thread, and installs
-only a download whose SHA-256 matches and whose signature carries the running app's identifier and team.
+installed version parses them. The updater is set up 1 s after launch (0.3 ms), touches the network and the disk
+only from 11 s on and never on the main thread, and installs only a download whose SHA-256 matches and whose
+signature carries the running app's identifier and team.
 
 ## Performance rules
 

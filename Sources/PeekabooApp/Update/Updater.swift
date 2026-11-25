@@ -5,9 +5,10 @@ import PeekabooCore
 /// In-app updates (no Sparkle): reads `latest.json` of the latest GitHub release and installs a newer release
 /// through `UpdateInstaller`.
 ///
-/// Nothing of it runs on the launch path: the first check waits `UpdatePolicy.firstCheckDelay` after launch, then
-/// it re-checks every 6 h and when the network comes back (at most hourly). Network, disk and code-signature work
-/// run on a utility queue (E-cores); the main thread only receives each new `Phase`.
+/// Nothing of it runs on the launch path: the app creates it a second after launch, the first check waits
+/// `UpdatePolicy.firstCheckDelay` more, then it re-checks every 6 h and when the network comes back (at most hourly).
+/// Network, disk and code-signature work run on a utility queue (E-cores); the main thread only receives each new
+/// `Phase`.
 final class Updater {
     /// Posted by the Settings window's "Check Now" button: checks at once (the outcome is in the status).
     static let checkNowNotification = Notification.Name("PeekabooCheckForUpdatesNow")

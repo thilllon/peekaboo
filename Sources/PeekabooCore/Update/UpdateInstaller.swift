@@ -259,7 +259,11 @@ public enum UpdateInstaller {
         let open = Process()
         open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         open.arguments = ["-a", app.path] + (file.map { [$0.path] } ?? [])
-        try? open.run()
-        open.waitUntilExit()
+        do {
+            try open.run()
+            open.waitUntilExit()
+        } catch {
+            Trace.log("update: cannot relaunch \(app.path): \(error)")
+        }
     }
 }
