@@ -125,7 +125,7 @@ and action.
 ```sh
 mise install              # pinned gitleaks, lefthook, cmake
 mise run setup            # git hooks
-mise run deps             # static libjpeg-turbo (pinned, checksum-verified) for macOS 14 → .deps/
+mise run deps             # static libjpeg-turbo and libwebp (pinned, checksum-verified) for macOS 14 → .deps/
 mise run install          # build the release app into ~/Applications
 ```
 
@@ -148,6 +148,7 @@ The decisions and the measurements behind them are in [docs/DESIGN.md](docs/DESI
 
 [MIT](LICENSE)
 
-Peekaboo links [libjpeg-turbo](https://libjpeg-turbo.org) statically. This software is based in part on the work of the
-Independent JPEG Group. libjpeg-turbo's license (IJG, Modified BSD, zlib) ships in the app as
-`Contents/Resources/LICENSE-libjpeg-turbo.md`.
+Peekaboo links [libjpeg-turbo](https://libjpeg-turbo.org) and [libwebp](https://chromium.googlesource.com/webm/libwebp)
+statically. This software is based in part on the work of the Independent JPEG Group. libjpeg-turbo's license (IJG,
+Modified BSD, zlib) ships in the app as `Contents/Resources/LICENSE-libjpeg-turbo.md`, libwebp's (BSD-3-Clause and its
+patent grant) as `Contents/Resources/LICENSE-libwebp.txt`.

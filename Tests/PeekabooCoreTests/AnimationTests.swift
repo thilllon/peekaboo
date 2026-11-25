@@ -153,6 +153,61 @@ final class AnimationTests: XCTestCase {
         XCTAssertEqual(grids[3], (top3 + bottom).joined(separator: " "), "an unblended frame replaces what it covers")
     }
 
+    /// ImageIO's composited frame `index`, drawn into premultiplied BGRA like libwebp's.
+    private func imageIOFrame(_ url: URL, _ index: Int, width: Int, height: Int) throws -> [UInt8] {
+        let source = try XCTUnwrap(CGImageSourceCreateWithURL(url as CFURL, nil))
+        let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, index, nil))
+        var bytes = [UInt8](repeating: 0, count: width * height * 4)
+        let info = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        try bytes.withUnsafeMutableBytes { raw in
+            let context = try XCTUnwrap(CGContext(data: raw.baseAddress, width: width, height: height, bitsPerComponent: 8,
+                                                  bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                                  bitmapInfo: info))
+            context.setBlendMode(.copy)
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        return bytes
+    }
+
+    private func rows(_ pb: PixelBuffer) -> [UInt8] {
+        (0..<pb.height).flatMap { y in
+            Array(UnsafeRawBufferPointer(start: pb.baseAddress + y * pb.bytesPerRow, count: pb.width * 4))
+        }
+    }
+
+    /// libwebp composites like ImageIO: every frame of the hand-made file and of the corpus animation (lossy, 44 frames)
+    /// matches ImageIO's within codec rounding. A wrong disposal or blend differs by whole colours.
+    func testWebPFramesMatchImageIO() throws {
+        var files = [try file("dispose.webp", AnimationFixtures.webp)]
+        let corpus = URL(fileURLWithPath: ProcessInfo.processInfo.environment["PEEKABOO_CORPUS"]
+            ?? NSString(string: "~/Library/Caches/peekaboo-corpus").expandingTildeInPath)
+            .appendingPathComponent("anim/webp_rotating_earth.webp")
+        if FileManager.default.fileExists(atPath: corpus.path) { files.append(corpus) }
+        for url in files {
+            let info = try ImageIODecoder().probe(url)
+            let decoder = try AnimationDecoder(url: url, info: info)
+            XCTAssertTrue(decoder.decodesWithLibWebP, url.lastPathComponent)
+            for i in 0..<decoder.frameCount {
+                let ours = rows(try decoder.frame(i, pool: pool))
+                let theirs = try imageIOFrame(url, i, width: info.pixelWidth, height: info.pixelHeight)
+                let diffs = zip(ours, theirs).map { abs(Int($0) - Int($1)) }
+                let mean = Double(diffs.reduce(0, +)) / Double(diffs.count)
+                XCTAssertLessThanOrEqual(diffs.max() ?? 0, 8, "\(url.lastPathComponent) frame \(i)")
+                XCTAssertLessThan(mean, 0.5, "\(url.lastPathComponent) frame \(i)")
+            }
+        }
+    }
+
+    /// Frames asked for out of order (the player's window, a loop restart) are the frames in order.
+    func testWebPFramesOutOfOrder() throws {
+        let url = try file("dispose.webp", AnimationFixtures.webp)
+        let (_, inOrder, _) = try frames(url)
+        let decoder = try AnimationDecoder(url: url, info: try ImageIODecoder().probe(url))
+        for i in [3, 3, 1, 2, 0, 3, 2] {
+            XCTAssertEqual(grid(try decoder.frame(i, pool: pool)), inOrder[i], "frame \(i)")
+        }
+    }
+
     // MARK: Player
 
     private func spin(until condition: () -> Bool, timeout: TimeInterval = 5) {

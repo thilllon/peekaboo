@@ -37,14 +37,14 @@ first by launch-to-first-pixel, next/previous latency, time to sharp and zoom/pa
 ```sh
 mise install       # pinned gitleaks, lefthook, cmake (mise.toml)
 mise run setup     # installs the git hooks
-mise run deps      # static libjpeg-turbo for the deployment target → .deps/ (linked into PeekabooCore)
+mise run deps      # static libjpeg-turbo and libwebp for the deployment target → .deps/ (linked into PeekabooCore)
 ```
 
 ## Commands
 
 | Task | Command |
 |---|---|
-| Static C dependencies | `mise run deps`: pinned libjpeg-turbo, SHA-256 checked, built for macOS 14 arm64 into `.deps/` (no-op when up to date) |
+| Static C dependencies | `mise run deps`: pinned libjpeg-turbo and libwebp, SHA-256 checked, built for macOS 14 arm64 into `.deps/` (no-op when up to date) |
 | Debug build | `swift build` (`mise run build`) |
 | Unit tests | `swift test` (`mise run test`) |
 | Release app bundle | `mise run app` → `build/Peekaboo.app` (version and build number of `HEAD`; `VERSION=` / `BUILD=` override) |
@@ -78,6 +78,7 @@ mise run deps      # static libjpeg-turbo for the deployment target → .deps/ (
 - `Sources/CPeekabooDecode` — own C decoders where ImageIO is slow: PNG (system zlib) and the
   first-pass rendition of progressive JPEGs (libjpeg-turbo's libjpeg API, headers from `.deps/`). They parse
   untrusted files: keep every bound checked and the mutation tests (`PNGDecodeTests`, `EarlyRenditionTests`) passing.
+- `Sources/CTurboJPEG`, `Sources/CWebP` — module maps for the static libjpeg-turbo and libwebp in `.deps/`.
 - `Sources/PeekabooRender` — Metal renderer (zero-copy textures, quality pyramid,
   resampling kernels, progressive refinement).
 - `Sources/PeekabooApp` — programmatic AppKit shell (no storyboards, nibs or SwiftUI); `Settings/` is the Settings

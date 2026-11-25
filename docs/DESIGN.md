@@ -242,22 +242,26 @@ an early rendition (`isApproximate`) on screen holds autoplay back until its exa
 and an early rendition never replaces a frame.
 
 - **Frames**: ImageIO composites them (disposal none / background / previous, blending source / over), checked against
-  hand-made GIF, APNG and WebP files. One quirk: ImageIO declares some composited GIF frames opaque although an earlier
+  hand-made GIF, APNG and WebP files; animated WebP through libwebp instead (below). One quirk: ImageIO declares some composited GIF frames opaque although an earlier
   "restore to background" left them transparent; their fourth byte is the canvas alpha and is honoured.
 - **Timing**: per-frame unclamped delays (APNG needs the frame's own properties; its container holds ImageIO's clamp at
   50 ms), browser clamping (≤ 10 ms plays as 100 ms), ImageIO's loop counts (plays; 0 = forever; a GIF without the
   NETSCAPE extension plays once), the last frame stays after the last play.
 - **Decoding**: one serial queue, in order, into a page-granular pool of the player's own. When all frames fit
   `min(screen budget / 8, 256 MB)` each is decoded once and kept (later loops decode nothing); otherwise a window of up to
-  8 frames ahead. Corpus: 400×400 GIF 0.8 ms / WebP 11 ms per frame, 44 frames = 27.5 MB kept. Frames are canvas-sized,
+  8 frames ahead. Corpus: 400×400 GIF 0.8 ms / WebP 0.5 ms per frame, 44 frames = 27.5 MB kept. Frames are canvas-sized,
   so an animation one frame of which does not fit that budget stays a still (`AnimationPlayer.fits`: an 11 KB WebP
   declaring a 12000×12000 canvas kept 1.1 GB of frames, a 2.3 GB footprint, 0.5 s per frame).
-- **Known limit — animated WebP**: ImageIO re-composites a WebP from its first frame for every frame it returns (with any
-  caching option, and in its own `CGAnimateImageAtURLWithBlock` too), so frame *i* costs O(*i*): the corpus WebP grows
-  from 3 to 31 ms per frame over its 44 frames, a 1920×1080 × 50-frame one from 34 to 309 ms (8.3 s per loop, M4 Pro).
-  Small WebPs that fit the budget play from their second loop on; large ones play below their frame rate on every loop.
-  GIF and APNG keep the previous canvas (flat ~1 ms per 480×270 frame over 600 frames), but a backward step outside the
-  kept frames re-composites from the start (600 frames: 0.46 s).
+- **Animated WebP through libwebp**: ImageIO re-composites a WebP from its first frame for every frame it returns (with
+  any caching option, and in its own `CGAnimateImageAtURLWithBlock` too), so frame *i* cost O(*i*): the corpus WebP
+  grew from 3 to 31 ms per frame over its 44 frames, a 1920×1080 × 50-frame one from 34 to 309 ms and played 41 of 100
+  frames late. `WebPFrames` decodes with libwebp's `WebPAnimDecoder` (libwebp 1.6.0, built by `mise run deps`), which
+  keeps the canvas and adds only the next frame; ImageIO still reads the timing. `peekaboo-bench anim`, M4 Pro, ImageIO
+  → libwebp: 400×400 × 44 p50 11.0 → 0.53 ms, p95 21.9 → 0.80 ms per frame; 1920×1080 × 50 p50 157 → 6.4 ms, p95 298 →
+  11.9 ms, late frames 41 → 0 of 100, on-screen duration error +63 → 0 ms. The frames match ImageIO's within codec
+  rounding (max 8 levels, mean < 0.5; `AnimationTests`). A file libwebp reads differently (frame count, canvas) stays
+  with ImageIO. GIF and APNG keep the previous canvas (flat ~1 ms per 480×270 frame over 600 frames), but a backward
+  step outside the kept frames re-composites from the start (600 frames: 0.46 s); so does a WebP's.
 - **Pacing**: the view's display link, running only around frame deadlines (paused between them, woken by a timer 1.5
   refreshes early). A frame due within half a refresh is shown at that refresh; the timeline does not drift and is
   re-anchored when a frame is more than one frame late (no catch-up burst). Headless at 120 Hz over 3 loops of the corpus
