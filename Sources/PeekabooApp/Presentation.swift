@@ -28,6 +28,17 @@ extension NSWindow {
         orderBack(nil)
     }
 
+    /// `.headless`, from creation on: whenever the window moves onto a screen, put it back off every screen. AppKit
+    /// moves an ordered-in titled window onto the screen when the app's presentation options change (instant full
+    /// screen shows the menu bar and the Dock again), without asking `constrainFrameRect`. Returns the observer, for
+    /// `NotificationCenter.removeObserver`.
+    func keepOffScreen() -> NSObjectProtocol {
+        NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification, object: self, queue: nil) { [weak self] _ in
+            guard let self, NSScreen.screens.contains(where: { $0.frame.intersects(self.frame) }) else { return }
+            self.setFrameOrigin(Self.offScreenOrigin(for: self.frame.size))
+        }
+    }
+
     /// Bottom-left corner of a frame of `size` that is off every screen: left of all of them.
     static func offScreenOrigin(for size: NSSize) -> NSPoint {
         let screens = NSScreen.screens.reduce(NSRect.zero) { $0.union($1.frame) }

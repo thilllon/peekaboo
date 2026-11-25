@@ -46,6 +46,7 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate, NSW
 
     /// In front and key, or out of sight for tests (`.headless`).
     let presentation: Presentation
+    private var offScreenObserver: NSObjectProtocol?
 
     /// `updateStatus`: the updater's status line now (`AppDelegate.updateStatus`; nil without an updater), shown when
     /// the Updates pane opens. `openConfigFile`: `app.config_file`.
@@ -96,11 +97,14 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate, NSW
         }
         select(.general)
         window.center()
+        if presentation == .headless { offScreenObserver = window.keepOffScreen() }
     }
 
     required init?(coder: NSCoder) { fatalError("unused") }
 
-    deinit { if let observer { NotificationCenter.default.removeObserver(observer) } }
+    deinit {
+        for observer in [observer, offScreenObserver].compactMap({ $0 }) { NotificationCenter.default.removeObserver(observer) }
+    }
 
     /// Bring the window to the front, on `pane` if given; headless: order it in out of sight (`Presentation`).
     func show(_ pane: Pane? = nil) {

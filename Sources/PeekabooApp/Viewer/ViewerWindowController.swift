@@ -1601,6 +1601,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         observers.append(center.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main) { [weak self] _ in
             self?.visibilityChanged()
         })
+        if presentation == .headless, let window { observers.append(window.keepOffScreen()) }
         let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .main)
         source.setEventHandler { [weak self, weak source] in
             guard let self, let source else { return }

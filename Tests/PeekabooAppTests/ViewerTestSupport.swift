@@ -12,7 +12,8 @@ import XCTest
 ///
 /// Nothing of a test run reaches the screen or the keyboard focus: the process can never become the active app, and
 /// viewers are `.headless` (ordered in, rendering, but transparent and off every screen). Every test fails if the
-/// process activated or a window became key or came on screen meanwhile (`assertNothingOnScreen`).
+/// process activated or a window became key or came on screen meanwhile (`assertNothingOnScreen`), or if it leaves a
+/// viewer or Settings window open.
 class ViewerTestCase: XCTestCase {
     /// Scratch directory of the test; `folder` (the browsed images) lives inside it.
     private(set) var root: URL!
