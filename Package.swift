@@ -20,10 +20,12 @@ let package = Package(
     targets: [
         // libjpeg-turbo (static): parallel CPU JPEG decoding with DCT scaling and ROI crops.
         .systemLibrary(name: "CTurboJPEG", path: "Sources/CTurboJPEG"),
+        // Own C decoders where ImageIO is slow: PNG (system zlib) and the early rendition of progressive JPEGs.
+        .target(name: "CPeekabooDecode", linkerSettings: [.linkedLibrary("z")]),
         // Decode tiers, tiered cache, prefetch scheduler, folder model, config/keymap. No AppKit.
         .target(
             name: "PeekabooCore",
-            dependencies: ["CTurboJPEG"],
+            dependencies: ["CTurboJPEG", "CPeekabooDecode"],
             swiftSettings: speed,
             linkerSettings: [.unsafeFlags(["/opt/homebrew/opt/jpeg-turbo/lib/libturbojpeg.a"])]),
         // Metal renderer: textures, quality pyramid, resampling kernels, progressive refinement.

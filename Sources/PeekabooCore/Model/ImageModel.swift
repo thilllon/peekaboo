@@ -89,9 +89,12 @@ public struct DecodedImage: @unchecked Sendable {
     public let isHDR: Bool
     /// Wall time spent decoding, for tracing and the scheduler's cost model.
     public let decodeNanos: UInt64
+    /// An early rendition of `tier` (same geometry, fewer bits: the first-pass scans of a progressive JPEG) delivered
+    /// through a `PartialSink` while the exact decode continues. Never cached; the exact tier replaces it.
+    public let isApproximate: Bool
 
     public init(pixels: PixelBuffer, tier: Tier, fullWidth: Int, fullHeight: Int,
-                orientation: CGImagePropertyOrientation, isHDR: Bool, decodeNanos: UInt64) {
+                orientation: CGImagePropertyOrientation, isHDR: Bool, decodeNanos: UInt64, isApproximate: Bool = false) {
         self.pixels = pixels
         self.tier = tier
         self.fullWidth = fullWidth
@@ -99,6 +102,20 @@ public struct DecodedImage: @unchecked Sendable {
         self.orientation = orientation
         self.isHDR = isHDR
         self.decodeNanos = decodeNanos
+        self.isApproximate = isApproximate
+    }
+}
+
+/// Where a decoder hands an early, approximate rendition of the tier it is decoding (`DecodedImage.isApproximate`),
+/// from any thread, before the exact one is returned.
+public struct PartialSink: Sendable {
+    /// Whether an early rendition is still worth its cost (the image is on screen and this tier not yet decoded).
+    public let wanted: @Sendable () -> Bool
+    public let deliver: @Sendable (DecodedImage) -> Void
+
+    public init(wanted: @escaping @Sendable () -> Bool, deliver: @escaping @Sendable (DecodedImage) -> Void) {
+        self.wanted = wanted
+        self.deliver = deliver
     }
 }
 
@@ -125,10 +142,18 @@ public protocol ImageDecoder: Sendable {
     /// Decode one tier. `targetLongSide` bounds the output long side for `.preview`/`.screen`
     /// (the decoder may return up to ~2x larger when that is cheaper); ignored for `.full`.
     func decode(_ url: URL, tier: Tier, targetLongSide: Int, pool: PixelBufferPool) throws -> DecodedImage
+    /// `decode`, handing `partial` an early rendition first when the file allows a cheap one (progressive JPEG).
+    func decode(_ url: URL, tier: Tier, targetLongSide: Int, pool: PixelBufferPool, partial: PartialSink?) throws
+        -> DecodedImage
     /// The lane `decode` would use for this file and tier (cheap; `info` may be nil before probing).
     func lane(for url: URL, info: ImageInfo?, tier: Tier) -> DecodeLane
 }
 
 public extension ImageDecoder {
     func lane(for url: URL, info: ImageInfo?, tier: Tier) -> DecodeLane { .general }
+
+    func decode(_ url: URL, tier: Tier, targetLongSide: Int, pool: PixelBufferPool, partial: PartialSink?) throws
+        -> DecodedImage {
+        try decode(url, tier: tier, targetLongSide: targetLongSide, pool: pool)
+    }
 }

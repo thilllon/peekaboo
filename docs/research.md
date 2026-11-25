@@ -47,7 +47,8 @@ So the app is Swift/AppKit/Metal/ImageIO, with libjpeg-turbo linked statically f
 - Embedded previews are nearly free: JPEG EXIF thumbnail 0.3–0.5 ms, HEIC thumbnail item ~2 ms, RAW previews
   11 ms (ARW 1616×1080) to 94 ms (NEF full size). CR3 previews are not exposed by ImageIO.
 - Progressive JPEG is never hardware-decoded (24 MP: 310 ms) but `SubsampleFactor 8` takes a DC-only path (32 ms).
-- PNG (24 MP 268 ms) and WebP (290 ms) have no fast path. HEIC always decodes fully (any output size).
+- PNG (24 MP 268 ms) and WebP (290 ms) have no fast path. HEIC always decodes fully (any output size). Both are now
+  measured in detail below ("Slow formats"): PNG has its own decoder, WebP stays with ImageIO.
 - Native outputs are RGBX / XRGB / 16-bit, not BGRA: converting by drawing costs +62 ms per 24 MP, so the renderer
   samples every layout directly via texture swizzles.
 - Metadata is cheap and lazy: 0.07–0.6 ms per file (RAW 1.3–2.6 ms).

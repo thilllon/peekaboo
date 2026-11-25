@@ -40,6 +40,9 @@ struct DecodeOutcome: Sendable {
     let wallMs: Double
     /// Decodes running when this one started, itself included.
     let concurrency: Int
+    /// An early, approximate rendition delivered while the job still runs (`DecodedImage.isApproximate`); the job's
+    /// own outcome follows.
+    var partial = false
 }
 
 /// Lane limits (docs/DESIGN.md §3 "Lanes").
@@ -82,6 +85,8 @@ final class DecodeScheduler: @unchecked Sendable {
     private var queued: [JobKey: DecodeJob] = [:]
     private var active: [JobKey: Active] = [:]
     private var visibleKeys: Set<JobKey> = []
+    /// Tiers whose early renditions are still wanted (the image on screen, not yet decoded at that tier).
+    private var partialKeys: Set<JobKey> = []
     /// Jobs per resource on the decode lanes, and on the sweep lanes (counted apart so a starved utility thread
     /// never holds capacity the visible image's neighbours need).
     private var runningByLane: [DecodeLane: Int] = [:]
@@ -148,8 +153,9 @@ final class DecodeScheduler: @unchecked Sendable {
     }
 
     /// Replace the queued set with `jobs` (keys already running or awaiting delivery are skipped).
-    /// `visible` names the visible image's tiers: while one of them runs, prefetch is gated.
-    func submit(_ jobs: [DecodeJob], visible: Set<JobKey>) {
+    /// `visible` names the visible image's tiers: while one of them runs, prefetch is gated. `partial` names the tiers
+    /// whose decodes should hand over an early rendition (queued or already running).
+    func submit(_ jobs: [DecodeJob], visible: Set<JobKey>, partial: Set<JobKey> = []) {
         condition.lock()
         var next: [JobKey: DecodeJob] = [:]
         next.reserveCapacity(jobs.count)
@@ -164,8 +170,15 @@ final class DecodeScheduler: @unchecked Sendable {
         }
         queued = next
         visibleKeys = visible
+        partialKeys = partial
         condition.broadcast()
         condition.unlock()
+    }
+
+    /// Whether `key`'s decode should still produce an early rendition (asked from the decoding thread).
+    private func wantsPartial(_ key: JobKey) -> Bool {
+        condition.lock(); defer { condition.unlock() }
+        return !stopped && partialKeys.contains(key)
     }
 
     /// The main thread consumed the outcome of `key`.
@@ -276,9 +289,19 @@ final class DecodeScheduler: @unchecked Sendable {
             }
             result = preview.map { .success($0) } ?? .failure(QuickLookPreview.Miss())
         } else {
+            // Screen and full tiers may hand over an early rendition (progressive JPEG) while the image is on screen.
+            let key = job.key, snapshot = job
+            let partial = tier == .preview ? nil : PartialSink(
+                wanted: { [weak self] in self?.wantsPartial(key) ?? false },
+                deliver: { [weak self] image in
+                    self?.deliver(DecodeOutcome(job: snapshot, result: .success(image), info: snapshot.info, stamp: nil,
+                                                changedDuringDecode: false, stampedAt: Trace.now(), wallMs: 0,
+                                                concurrency: 0, partial: true))
+                })
             result = Result {
                 try autoreleasepool {
-                    try decoder.decode(url, tier: job.key.tier, targetLongSide: job.targetLongSide, pool: pool)
+                    try decoder.decode(url, tier: job.key.tier, targetLongSide: job.targetLongSide, pool: pool,
+                                       partial: partial)
                 }
             }
         }

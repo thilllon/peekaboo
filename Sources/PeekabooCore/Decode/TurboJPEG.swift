@@ -1,3 +1,4 @@
+import CPeekabooDecode
 import CTurboJPEG
 import CoreGraphics
 import Foundation
@@ -51,6 +52,30 @@ enum TurboJPEG {
 
     enum Failure: Error { case header, cmyk, decode(String), memory }
 
+    /// Output of a decode at the DCT scale covering a target: size and colour space (the embedded ICC profile, sRGB
+    /// when absent).
+    private struct Plan {
+        let factor: (num: Int, denom: Int)
+        let width: Int
+        let height: Int
+        let space: CGColorSpace
+    }
+
+    /// Parse the header into `handle` and choose the scale for `targetLongSide` (`<= 0`: full size).
+    private static func plan(_ handle: tjhandle, _ base: UnsafePointer<UInt8>, _ count: Int, targetLongSide: Int) throws
+        -> Plan {
+        _ = tj3Set(handle, Int32(TJPARAM_SAVEMARKERS.rawValue), 2)  // ICC only
+        guard tj3DecompressHeader(handle, base, count) == 0 else { throw Failure.header }
+        let colorspace = tj3Get(handle, Int32(TJPARAM_COLORSPACE.rawValue))
+        if colorspace == Int32(TJCS_CMYK.rawValue) || colorspace == Int32(TJCS_YCCK.rawValue) { throw Failure.cmyk }
+        let width = Int(tj3Get(handle, Int32(TJPARAM_JPEGWIDTH.rawValue)))
+        let height = Int(tj3Get(handle, Int32(TJPARAM_JPEGHEIGHT.rawValue)))
+        guard width > 0, height > 0 else { throw Failure.header }
+        let factor = coveringScale(width: width, height: height, target: targetLongSide)
+        return Plan(factor: factor, width: scaled(width, factor), height: scaled(height, factor),
+                    space: iccColorSpace(handle) ?? sRGB)
+    }
+
     /// Decode an in-memory JPEG straight into a pooled `.bgra8` (opaque) buffer, DCT-scaled to the
     /// smallest supported factor that covers `targetLongSide` (`<= 0`: full size).
     /// The buffer's colour space is the embedded ICC profile, sRGB when absent.
@@ -58,20 +83,12 @@ enum TurboJPEG {
         guard let handle = pb_tj3Init(Int32(TJINIT_DECOMPRESS.rawValue)) else { throw Failure.memory }
         defer { tj3Destroy(handle) }
         guard let base = data.baseAddress?.assumingMemoryBound(to: UInt8.self) else { throw Failure.header }
-        _ = tj3Set(handle, Int32(TJPARAM_SAVEMARKERS.rawValue), 2)  // ICC only
-        guard tj3DecompressHeader(handle, base, data.count) == 0 else { throw Failure.header }
-        let colorspace = tj3Get(handle, Int32(TJPARAM_COLORSPACE.rawValue))
-        if colorspace == Int32(TJCS_CMYK.rawValue) || colorspace == Int32(TJCS_YCCK.rawValue) { throw Failure.cmyk }
-        let width = Int(tj3Get(handle, Int32(TJPARAM_JPEGWIDTH.rawValue)))
-        let height = Int(tj3Get(handle, Int32(TJPARAM_JPEGHEIGHT.rawValue)))
-        guard width > 0, height > 0 else { throw Failure.header }
-        let factor = coveringScale(width: width, height: height, target: targetLongSide)
-        if factor.num != factor.denom {
-            _ = tj3SetScalingFactor(handle, tjscalingfactor(num: Int32(factor.num), denom: Int32(factor.denom)))
+        let plan = try plan(handle, base, data.count, targetLongSide: targetLongSide)
+        if plan.factor.num != plan.factor.denom {
+            _ = tj3SetScalingFactor(handle, tjscalingfactor(num: Int32(plan.factor.num), denom: Int32(plan.factor.denom)))
         }
-        let outW = scaled(width, factor), outH = scaled(height, factor)
-        let space = iccColorSpace(handle) ?? sRGB
-        guard let pixels = pool.make(width: outW, height: outH, layout: .bgra8, alpha: .opaque, colorSpace: space) else {
+        guard let pixels = pool.make(width: plan.width, height: plan.height, layout: .bgra8, alpha: .opaque,
+                                     colorSpace: plan.space) else {
             throw Failure.memory
         }
         let dst = pixels.baseAddress.assumingMemoryBound(to: UInt8.self)
@@ -79,6 +96,35 @@ enum TurboJPEG {
         if status != 0, tj3GetErrorCode(handle) == Int32(TJERR_FATAL.rawValue) {
             throw Failure.decode(String(cString: tj3GetErrorStr(handle)))
         }
+        return pixels
+    }
+
+    /// A progressive JPEG's first-pass rendition is worth decoding beside the exact one only when the refinement
+    /// scans after it are a good part of the file: they cost most of the decode (24 MP: the first 52 % of the bytes
+    /// decode in 77 of 300 ms; 101 MP: the first 23 % in 104 of 735 ms).
+    static let firstPassMaxFraction = 0.85
+
+    /// The first-pass scans of a progressive JPEG (`pb_jpeg_first_pass_end`), decoded at the scale and into the colour
+    /// space `decode` uses for `targetLongSide`: every coefficient at reduced precision, 32–52 dB PSNR of the exact
+    /// decode on the corpus. Nil when the file has no such early point (baseline, spectral selection only, or
+    /// refinement scans too small to be worth it).
+    static func decodeFirstPasses(_ data: UnsafeRawBufferPointer, targetLongSide: Int, pool: PixelBufferPool) throws
+        -> PixelBuffer? {
+        guard let base = data.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return nil }
+        let end = pb_jpeg_first_pass_end(base, data.count)
+        guard end > 0, Double(end) <= firstPassMaxFraction * Double(data.count) else { return nil }
+        guard let handle = pb_tj3Init(Int32(TJINIT_DECOMPRESS.rawValue)) else { throw Failure.memory }
+        defer { tj3Destroy(handle) }
+        let plan = try plan(handle, base, data.count, targetLongSide: targetLongSide)
+        guard let pixels = pool.make(width: plan.width, height: plan.height, layout: .bgra8, alpha: .opaque,
+                                     colorSpace: plan.space) else {
+            throw Failure.memory
+        }
+        var message = [CChar](repeating: 0, count: 160)
+        let status = pb_jpeg_decode_truncated(base, end, Int32(plan.factor.denom), Int32(plan.width), Int32(plan.height),
+                                              pixels.baseAddress.assumingMemoryBound(to: UInt8.self), pixels.bytesPerRow,
+                                              &message, message.count)
+        guard status == 0 else { throw Failure.decode(String(cString: message)) }
         return pixels
     }
 

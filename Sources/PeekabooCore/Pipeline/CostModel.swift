@@ -45,7 +45,7 @@ struct CostModel {
         case .jpeg: return (4, 45, 50)
         case .heic: return (3, 35, 50)
         case .avif: return (48, 60, 70)
-        case .png: return (277, 270, 280)
+        case .png: return (150, 150, 150)  // own decoder, inflate-bound at every tier
         case .webp: return (303, 290, 290)
         case .tiff: return (23, 100, 150)
         case .gif: return (10, 20, 20)
