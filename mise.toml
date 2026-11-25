@@ -17,5 +17,11 @@ description = "Run unit tests"
 run = "swift test"
 
 [tasks.secrets]
-description = "Scan the whole git history and the working tree for secrets"
-run = ["gitleaks git --config .gitleaks.toml --redact --no-banner -v", "gitleaks dir --config .gitleaks.toml --redact --no-banner -v ."]
+description = "Scan the whole git history, and everything in the working tree that git could commit, for secrets"
+# The tree scan stages the working tree into a throwaway index (tracked changes and untracked files that are not
+# git-ignored) and scans that diff. Local ignored files such as .env.production are skipped: they cannot be
+# committed without `git add -f`, which the pre-commit hook blocks.
+run = [
+  "gitleaks git --config .gitleaks.toml --redact --no-banner -v",
+  '''idx="$(mktemp)" && trap 'rm -f "$idx"' EXIT && cp "$(git rev-parse --git-path index)" "$idx" && GIT_INDEX_FILE="$idx" git add -A && GIT_INDEX_FILE="$idx" gitleaks git --config .gitleaks.toml --pre-commit --staged --redact --no-banner -v''',
+]

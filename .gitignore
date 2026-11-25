@@ -12,8 +12,9 @@ target/
 *.dSYM
 
 # Secrets & credentials — never commit (gitleaks also blocks these)
-.env
-.env.*
+# Every env file (.env, .env.production, .env-prod, .envlocal, …) except the keys-only template
+.env*
+!.env.example
 *.pem
 *.key
 *.p12
