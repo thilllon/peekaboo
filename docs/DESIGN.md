@@ -245,6 +245,24 @@ viewers score 21–26 dB and alias 10–25× more.
   from one `statfs` off the main thread), else Full Disk Access, the only setting for Mail, Messages or Time Machine
   backups; EACCES (the folder's own permissions) points to Finder › Get Info › Sharing & Permissions. While the
   folder is refused, the window becoming key lists it again (back from System Settings), off the main thread.
+- One Peekaboo.app (`AppInstall`, `Installation`): a copy that runs from a disk image (a read-only volume under
+  `/Volumes`) or from App Translocation's read-only path cannot update itself, and each downloaded version used to
+  leave one more Peekaboo. Such a copy builds no window: it keeps the launch's files (command line, open-documents
+  events) and, once launching has finished, a user-initiated queue installs it at `/Applications/Peekaboo.app`
+  (`~/Applications` when `/Applications` is not writable). An older or the same build there is replaced: copied into a
+  new folder on the target's volume, its quarantine flag removed (Gatekeeper would ask again, or translocate it),
+  verified like an update (identifier, version and build, the running app's signing requirement) and swapped in with
+  one `renamex_np(RENAME_SWAP)`; 21–128 ms from a quarantined UDZO image for the 4.4 MB release bundle, 14–53 ms of it
+  the signature check. A newer build is kept, a running copy is left alone and gets the files, another app of that
+  name is never touched. The copy then opens the files in the installed one, a new instance
+  (`NSWorkspace.OpenConfiguration.createsNewApplicationInstance`) started with `--eject-disk-images=<pid>` (it never
+  installs again), and quits. A second after launch, on a utility queue, the installed copy waits for that process to
+  exit and ejects every read-only local volume under `/Volumes` with a Peekaboo.app of this identifier at its top
+  (`NSWorkspace.unmountAndEjectDevice`: 86 ms; an image still in use fails after ~1 s with `fBsyErr` and is tried
+  once more 2 s later), then says so in one toast that names the images left. If the install or the start fails, the
+  copy launches as usual, with a toast. A normal launch pays two C string comparisons on `argv[0]`, 0.3–0.6 µs on the
+  first call (Foundation's `String.contains` on `Bundle.main.bundlePath` took 30–55 µs); tests (headless),
+  `--selftest` and `PEEKABOO_ACTIONS` never install or eject.
 
 ### Animation
 

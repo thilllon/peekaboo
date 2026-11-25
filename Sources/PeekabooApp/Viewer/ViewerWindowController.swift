@@ -269,8 +269,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         updateHUD()
     }
 
-    /// Show a toast (e.g. a config error).
-    func toast(_ text: String) { hud.showToast(text) }
+    /// Show a toast (e.g. a config error) for `seconds`.
+    func toast(_ text: String, seconds: TimeInterval = 1.2) { hud.showToast(text, seconds: seconds) }
 
     /// `[decode]` and `[debug]`: process-wide flags the decode lanes and the trace read, set here once per apply (the
     /// environment variables force them). A change of `hdr` decodes the gain-map and PQ / HLG photos again; the one on

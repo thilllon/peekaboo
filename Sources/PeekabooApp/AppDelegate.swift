@@ -21,8 +21,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private(set) var settings: SettingsWindowController?
     /// First launch: macOS asks for Desktop, Documents and Downloads then (built a second after launch; tests set it).
     lazy var folderAccess = FolderAccessRequest()
+    /// This launch installs Peekaboo into Applications instead of opening a window: it was started from a disk image or
+    /// a translocated path (tests set one). nil again once Peekaboo stays here after all.
+    var installation: Installation?
+    /// Ejects the Peekaboo disk images in a copy that one of them installed (tests set one).
+    lazy var diskImageEjector = DiskImageEjector()
 
     func applicationWillFinishLaunching(_ notification: Notification) {
+        let arguments = Array(CommandLine.arguments.dropFirst())
+        // All a normal launch pays for it: two C string comparisons on the executable's path (tests: not even that).
+        if presentation == .interactive, installation == nil, let executable = CommandLine.unsafeArgv[0],
+           AppInstall.mayNeedInstalling(executable: executable) {
+            installation = Installation.forLaunch(arguments: arguments)
+        }
+        if let installation {
+            // No window: the files go to the installed copy.
+            return installation.collect(Self.paths(in: arguments))
+        }
+        launchViewer(arguments)
+    }
+
+    /// Every launch but an installation's: the viewer window, the config and the menu.
+    private func launchViewer(_ arguments: [String]) {
         // The View menu carries its own full-screen items (instant and native); stop AppKit
         // from inserting a second "Enter Full Screen".
         UserDefaults.standard.register(defaults: ["NSFullScreenMenuItemEverywhere": false])
@@ -44,7 +64,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         configStore.onError = { [weak self] message in self?.viewer?.toast(message) }
         configStore.startWatching()
 
-        let arguments = Array(CommandLine.arguments.dropFirst())
         if let flag = arguments.firstIndex(of: "--selftest") {
             let path = arguments.indices.contains(flag + 1) ? arguments[flag + 1] : FileManager.default.currentDirectoryPath
             let test = SelfTest(folder: URL(fileURLWithPath: (path as NSString).expandingTildeInPath, isDirectory: true), viewer: viewer)
@@ -56,13 +75,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return
         }
         // `Peekaboo <path>` from a terminal: start immediately.
-        let paths = arguments.filter { !$0.hasPrefix("-") && FileManager.default.fileExists(atPath: $0) }
-        if !paths.isEmpty { open(paths.map { URL(fileURLWithPath: $0) }) }
+        let paths = Self.paths(in: arguments)
+        if !paths.isEmpty { open(paths) }
         // After the first frame: the menu is not needed to draw it.
         rebuildMenu(configStore.config.keymap)
     }
 
+    /// `Peekaboo <path>…` from a terminal: the arguments that name existing files.
+    private static func paths(in arguments: [String]) -> [URL] {
+        arguments.filter { !$0.hasPrefix("-") && FileManager.default.fileExists(atPath: $0) }.map { URL(fileURLWithPath: $0) }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if let installation { return install(installation) }
+        finishLaunchingViewer()
+    }
+
+    /// Install into Applications and hand over to the installed copy, which quits this one. If Peekaboo stays here
+    /// instead (the install or the start failed), launch as usual now, with the files collected meanwhile.
+    private func install(_ installation: Installation) {
+        installation.run { [weak self] reason in
+            guard let self else { return }
+            self.installation = nil
+            self.launchViewer([])
+            self.finishLaunchingViewer()
+            self.open(installation.urls, dedupe: false)
+            self.viewer?.toast(reason, seconds: 6)
+        }
+    }
+
+    private func finishLaunchingViewer() {
         viewer?.presentsSynchronously = false
         activate()
         // `load()` ran before `onError` was set: show a broken config, or the keys it skipped, now.
@@ -74,12 +116,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             self.viewer?.showEmpty(nil)
         }
         // In-app updates start a second after launch, behind the first frame and its sharp tier; the first check
-        // waits 10 s more. The first launch's folder-access prompts start then too.
+        // waits 10 s more. The first launch's folder-access prompts start then too, and a copy just installed from a disk
+        // image ejects the disk images then.
         if selfTest == nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
                 self?.startUpdates()
                 self?.requestFolderAccess()
+                self?.ejectDiskImages()
             }
+        }
+    }
+
+    /// Started by the copy that installed this one (`--eject-disk-images=<pid>`): eject the Peekaboo disk images on a
+    /// utility queue and say so. Never headless: tests eject nothing.
+    private func ejectDiskImages() {
+        guard presentation == .interactive, let pid = AppInstall.installingProcess(in: CommandLine.arguments) else { return }
+        diskImageEjector.run(after: pid) { [weak self] toast, failed in
+            self?.viewer?.toast(toast, seconds: failed ? 6 : 2)
         }
     }
 
@@ -110,6 +163,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
+        if let installation { return installation.collect(urls) }
         guard selfTest == nil else { return }
         open(urls)
     }

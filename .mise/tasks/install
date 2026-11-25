@@ -1,14 +1,30 @@
 #!/usr/bin/env bash
-#MISE description="Build and install Peekaboo.app into ~/Applications and link the peekaboo CLI into ~/.local/bin (override with DEST=, BIN_DIR=)"
+#MISE description="Build Peekaboo.app and install it into /Applications (replacing it; ~/Applications when /Applications is not writable; DEST= overrides), remove the ~/Applications copy older builds of this task left, and link the peekaboo CLI into ~/.local/bin (BIN_DIR=)"
 #MISE depends=["app"]
 set -euo pipefail
-DEST="${DEST:-$HOME/Applications}"
+# One Peekaboo.app, where the app installs itself when it runs from a disk image (`AppInstall.target`).
+if [[ -z "${DEST:-}" ]]; then
+  if [[ -w /Applications ]]; then DEST=/Applications; else DEST="$HOME/Applications"; fi
+fi
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 mkdir -p "$DEST"
 rm -rf "$DEST/Peekaboo.app"
 ditto build/Peekaboo.app "$DEST/Peekaboo.app"
 # Register with LaunchServices so Finder's "Open With" and `open -a Peekaboo` find it.
-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$DEST/Peekaboo.app"
+"$LSREGISTER" -f "$DEST/Peekaboo.app"
 echo "Installed: $DEST/Peekaboo.app"
+
+# Older builds of this task installed into ~/Applications: remove that copy (Peekaboo's only, never the one just
+# installed) and its LaunchServices record, so that one app is left.
+DEST_DIR="$(cd "$DEST" && pwd -P)"
+OLD_DIR="$(cd "$HOME/Applications" 2>/dev/null && pwd -P || true)"
+OLD="$OLD_DIR/Peekaboo.app"
+if [[ -n "$OLD_DIR" && "$OLD_DIR" != "$DEST_DIR" && -d "$OLD" ]] \
+  && [[ "$(plutil -extract CFBundleIdentifier raw -o - "$OLD/Contents/Info.plist" 2>/dev/null || true)" == com.thilllon.Peekaboo ]]; then
+  "$LSREGISTER" -u "$OLD" || true
+  rm -rf "$OLD"
+  echo "Removed:   $OLD"
+fi
 
 # CLI launcher: `peekaboo <image-or-folder> ...` (override the link directory with BIN_DIR=...).
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"

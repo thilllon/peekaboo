@@ -63,7 +63,7 @@ public enum UpdateInstaller {
         return root
     }
 
-    private static func device(_ url: URL) -> dev_t? {
+    static func device(_ url: URL) -> dev_t? {
         var info = stat()
         return stat(url.path, &info) == 0 ? info.st_dev : nil
     }
@@ -317,7 +317,7 @@ public enum UpdateInstaller {
     }
 
     /// Wait until process `pid` has exited (true) or `timeout` passed (false).
-    static func waitForExit(_ pid: pid_t, timeout: TimeInterval) -> Bool {
+    public static func waitForExit(_ pid: pid_t, timeout: TimeInterval) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while kill(pid, 0) == 0 || errno != ESRCH {
             if Date() >= deadline { return false }
