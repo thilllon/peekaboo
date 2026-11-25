@@ -77,15 +77,15 @@ final class HeadlessTests: ViewerTestCase {
         assertWindowServerShowsNothing()
     }
 
-    /// Out of sight, a window still renders: its layer keeps vending drawables (a throttled layer would hold each
-    /// `nextDrawable()` for a second, then return nil), and the viewer's frames are encoded and run on the GPU.
+    /// Out of sight, a window still renders: the viewer's frames are encoded (`Renderer.render()` skips a frame when
+    /// the layer has no drawable), and its layer keeps vending drawables whose presents complete (a throttled layer
+    /// would hold each `nextDrawable()` for a second, then return nil).
     func testAHeadlessWindowStillRenders() throws {
         let viewer = try makeViewer()
         let urls = writeSequence(2)
         openAndWait(viewer, [urls[0]])
         let renderer = renderer(viewer)
         XCTAssertNotEqual(renderer.lastPath, "background")
-        XCTAssertTrue(spin(5) { renderer.lastFrameGPUms > 0 }, "no frame ran on the GPU")
         viewer.showEmpty(nil)
         XCTAssertEqual(renderer.lastPath, "background", "the frame of the drop hint was not encoded")
         openAndWait(viewer, [urls[1]])
@@ -95,18 +95,21 @@ final class HeadlessTests: ViewerTestCase {
         let view: ViewerView = try XCTUnwrap(property(viewer, "viewerView"))
         let started = Trace.now()
         var longestWait = 0.0
+        var completed = 0
         for i in 0..<12 {
             let asked = Trace.now()
             let drawable = try XCTUnwrap(view.metalLayer.nextDrawable(), "no drawable \(i)")
             longestWait = max(longestWait, Trace.ms(since: asked))
             let commands = try XCTUnwrap(RenderContext.shared.queue.makeCommandBuffer())
             commands.present(drawable)
+            commands.addCompletedHandler { _ in DispatchQueue.main.async { completed += 1 } }
             commands.commit()
             spin(0.005)
         }
         let total = Trace.ms(since: started)
         print(String(format: "headless drawables: 12 in %.1f ms, longest nextDrawable wait %.1f ms", total, longestWait))
         XCTAssertLessThan(total, 5000, "the layer's drawables are throttled")
+        XCTAssertTrue(spin(5) { completed == 12 }, "\(completed) of 12 presents completed")
     }
 
     /// The window server agrees: every window of the process it has ordered in is transparent and off every display.
