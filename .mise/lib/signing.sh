@@ -24,12 +24,14 @@ sign_identity() {
     return
   fi
   local id
-  id="$(security find-identity -v -p codesigning 2>/dev/null | awk '/"Developer ID Application: / { print $2; exit }')"
+  id="$(security find-identity -v -p codesigning 2>/dev/null | awk '/"Developer ID Application: / && !id { id = $2 } END { print id }')"
   echo "${id:--}"
 }
 
-# is_developer_id <code>: signed with a Developer ID Application certificate.
-is_developer_id() { codesign -dvv "$1" 2>&1 | grep -q '^Authority=Developer ID Application: '; }
+# is_developer_id <code>: signed with a Developer ID Application certificate. The filters read all of their input:
+# one that quits at the first match (`grep -q`, awk's `exit`) kills the writer with SIGPIPE on its next line, and
+# under `set -o pipefail` the whole test then fails although it matched.
+is_developer_id() { codesign -dvv "$1" 2>&1 | grep '^Authority=Developer ID Application: ' >/dev/null; }
 
 # notarize <zip|dmg>: submit to Apple's notary service and wait; fails, printing Apple's log, unless accepted.
 notarize() {
