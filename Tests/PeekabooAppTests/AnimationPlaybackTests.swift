@@ -91,6 +91,19 @@ final class AnimationPlaybackTests: ViewerTestCase {
         XCTAssertEqual(toastText(viewer), "Not an animation")
     }
 
+    /// `view.play_pause` on an animation whose player has not started (hidden window, a skim just ended on it) plays it.
+    func testPlayStartsAnAnimationThatHasNotStarted() throws {
+        let gif = try writeGIF(folder.appendingPathComponent("a.gif"))
+        let viewer = try makeViewer()
+        openAndWait(viewer, [gif])
+        guard player(viewer) == nil else { throw XCTSkip("the window is visible: the animation started on its own") }
+        viewer.perform(.playPause)
+        XCTAssertEqual(player(viewer)?.isPlaying, true)
+        XCTAssertEqual(toastText(viewer), "Playing")
+        viewer.perform(.playPause)
+        XCTAssertEqual(player(viewer)?.isPlaying, false)
+    }
+
     func testStillsNeverGetAPlayer() throws {
         let urls = writeSequence(4, width: 320, height: 240)
         let viewer = try makeViewer()

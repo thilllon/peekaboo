@@ -1186,16 +1186,18 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     }
 
     private func togglePlayback() {
+        // An animation that has not started yet (a skim just ended on it, the window was hidden) starts playing.
+        let wasPlaying = self.player?.isPlaying ?? false
         guard let player = currentPlayer() else {
             hud.showToast("Not an animation")
             return
         }
         pausedWhileHidden = false
-        if player.isPlaying {
+        if wasPlaying {
             player.pause()
             hud.showToast("Paused · frame \(player.index + 1)/\(player.frameCount)")
         } else {
-            if let frame = player.play(at: CACurrentMediaTime()) { showFrame(frame, index: player.index, playing: true) }
+            if !player.isPlaying, let frame = player.play(at: CACurrentMediaTime()) { showFrame(frame, index: player.index, playing: true) }
             hud.showToast("Playing")
         }
         animationStateChanged()
