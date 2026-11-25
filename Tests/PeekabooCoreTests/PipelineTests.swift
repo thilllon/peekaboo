@@ -392,11 +392,14 @@ final class PipelineTests: PipelineTestCase {
         let pipeline = makePipeline(decoder) { config in
             config.sweepLanes = 4
             config.previewBudget = 160 << 20
+            // The sweep only takes previews the cost model calls cheap, and the model learns from measured times:
+            // on a slow CI machine the fake 1 ms previews measure above the 8 ms threshold. Call every preview cheap.
+            config.tuning.cheapPreviewMs = .infinity
         }
         let files = makeFiles(400)
         pipeline.setFiles(files, index: 200)
         // Utility-QoS lanes can be slow on a loaded machine: generous timeouts.
-        XCTAssertTrue(spin(timeout: 10) { pipeline.stats.sweepDecodes > 50 })
+        XCTAssertTrue(spin(timeout: 10) { pipeline.stats.sweepDecodes > 50 }, "sweep decodes: \(pipeline.stats.sweepDecodes)")
         XCTAssertTrue(spin(timeout: 10) { self.has(pipeline, files[200 + 40], .preview) && self.has(pipeline, files[200 - 40], .preview) },
                       "the sweep reaches beyond the prefetch windows")
         spin(for: 0.3)
