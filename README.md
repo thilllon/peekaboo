@@ -57,7 +57,8 @@ Everything below was measured on a MacBook Pro M4 Pro (see [docs/research.md](do
   grids, sequences, depth and Live Photo stills, `.hif`), AVIF, PNG, WebP, TIFF, GIF, JPEG XL, PSD, EXR and camera RAW
   (embedded previews first).
 - Plays animated GIF, APNG, animated WebP and HEIC / AVIF sequences with their frame timing and loop counts: `k` pauses,
-  `,` and `.` step a frame. Stills pay nothing for it.
+  `,` and `.` step a frame. Stills pay nothing for it. (Large animated WebPs play below their frame rate: ImageIO
+  re-composites every WebP frame from the first one.)
 - Keyboard-first, fully remappable in a TOML file that reloads as you save it; shortcuts keep working with non-Latin input
   methods (Korean, Japanese, …).
 - Culling keys borrowed from Lightroom: 0–5 stars, 6–9 colour labels, P / X / U flags, Shift to act and advance — stored as

@@ -52,9 +52,15 @@ ImageIO facts that drive the routing:
   for `'420f'` makes ImageIO convert on the CPU, 39 ms). Reduced decodes (`SubsampleFactor`) are CPU work too (12 MP /4
   30 ms; 10-bit 24 MP /2…/8 36–75 ms): decode at /1 and reduce on the GPU. Before, 10-bit images took the public path,
   which drew them into 8-bit BGRA on the CPU: 24 MP 115 ms (Display P3) to 212 ms (PQ).
+- Those bi-planar surfaces are all tagged `IOSurfaceYCbCrMatrix = ITU_R_601_4`, but their pixels keep the file's matrix
+  (`'420f'` requests convert only the range): the matrix comes from the primary item's `colr` `nclx` box, which ImageIO
+  follows over the codec's own colour description (`HEIFColour`; BT.601 when absent). Converted as BT.601 against
+  ImageIO's own RGB: a 10-bit BT.709 AVIF 41 dB (62 dB as BT.709), a BT.2020 one 40 dB (65 dB); a BT.709-labelled saturated
+  green 40 levels off. Matrices the converter lacks (identity, YCgCo, ICtCp, …) keep ImageIO's conversion.
 - PQ / HLG images (camera HIF, HDR AVIF) decoded by default keep PQ code values in a BT.2100 space: shown as SDR they were
   ~6× too dark. The SPI honours `kCGImageSourceDecodeToSDR` (ImageIO's tone-mapped SDR rendition, `'420f'`, Display P3,
-  24 MP 15 ms).
+  24 MP 15 ms). That rendition's YCbCr is BT.2020 whatever the source's matrix and primaries (as BT.601 a saturated HLG
+  green came out 21 levels too bright).
 - The first HEVC decode of a process waits for the hardware decoder: 62 ms wall (12 ms CPU) for a 16 px HEIC, then ~2 ms;
   it stays warm (45 s idle measured) and costs 3.4 MB.
 - Default outputs are not BGRA (full decode = RGBX, thumbnails = XRGB); converting by drawing costs +62 ms per
@@ -213,6 +219,12 @@ the user is not skimming past it), an `AnimationPlayer` takes over. Stills never
 - **Decoding**: one serial queue, in order, into a page-granular pool of the player's own. When all frames fit
   `min(screen budget / 8, 256 MB)` each is decoded once and kept (later loops decode nothing); otherwise a window of up to
   8 frames ahead. Corpus: 400×400 GIF 0.8 ms / WebP 11 ms per frame, 44 frames = 27.5 MB kept.
+- **Known limit — animated WebP**: ImageIO re-composites a WebP from its first frame for every frame it returns (with any
+  caching option, and in its own `CGAnimateImageAtURLWithBlock` too), so frame *i* costs O(*i*): the corpus WebP grows
+  from 3 to 31 ms per frame over its 44 frames, a 1920×1080 × 50-frame one from 34 to 309 ms (8.3 s per loop, M4 Pro).
+  Small WebPs that fit the budget play from their second loop on; large ones play below their frame rate on every loop.
+  GIF and APNG keep the previous canvas (flat ~1 ms per 480×270 frame over 600 frames), but a backward step outside the
+  kept frames re-composites from the start (600 frames: 0.46 s).
 - **Pacing**: the view's display link, running only around frame deadlines (paused between them, woken by a timer 1.5
   refreshes early). A frame due within half a refresh is shown at that refresh; the timeline does not drift and is
   re-anchored when a frame is more than one frame late (no catch-up burst). Headless at 120 Hz over 3 loops of the corpus
