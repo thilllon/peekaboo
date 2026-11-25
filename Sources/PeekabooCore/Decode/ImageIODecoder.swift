@@ -164,7 +164,10 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
         case .raw(let cr3):
             return try decodeRAW(probe, cr3: cr3, url: url, tier: tier, target: target, pool: pool)
         case .other:
-            if info.typeIdentifier == "public.png", let output = try png(probe, url: url, target: target, pool: pool) {
+            // PQ / HLG PNGs (16-bit, cICP or a BT.2100 profile) take ImageIO's tone-mapped SDR rendition below: the own
+            // decoder would hand over the PQ / HLG code values, shown far too dark.
+            if info.typeIdentifier == "public.png", !probe.hdrTransfer,
+               let output = try png(probe, url: url, target: target, pool: pool) {
                 return output
             }
             if tier == .preview {

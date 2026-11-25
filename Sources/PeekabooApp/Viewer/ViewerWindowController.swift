@@ -1095,13 +1095,14 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private var animationBudget: Int { min(pipeline.config.screenBudget / 8, 256 << 20) }
 
     /// `file` shows its first pixels: play it if it is an animation, once a skim past it is over and while the window is
-    /// visible (`visibilityChanged` starts it later). `asked`: a play / step action, which starts it in any case.
+    /// visible (`visibilityChanged` starts it later), on an exact tier (an early rendition's exact decode shows, and
+    /// starts it, next). `asked`: a play / step action, which starts it in any case.
     private func startAnimationIfNeeded(_ file: ImageFile, asked: Bool = false) {
         guard player == nil, file == pipeline.currentFile, let info = pipeline.info(for: file), info.isAnimated,
               AnimationPlayer.fits(info, budgetBytes: animationBudget) else { return }
         startAnimationWork?.cancel()
         startAnimationWork = nil
-        guard asked || isWindowVisible else { return }
+        guard asked || (isWindowVisible && !shownApproximate) else { return }
         if !asked, pipeline.isSkimming {
             let work = DispatchWorkItem { [weak self] in
                 guard let self, self.isShowing(file) else { return }
@@ -1139,7 +1140,10 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         player.stop()
         self.player = nil
         // A frame of the player is on screen: the pipeline's still replaces it on the next present.
-        if shownFrame != nil { shownTier = nil }
+        if shownFrame != nil {
+            shownTier = nil
+            shownApproximate = false
+        }
         shownFrame = nil
         pausedWhileHidden = false
         animationClock.schedule(nil)
@@ -1172,7 +1176,10 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
 
     private func showFrame(_ frame: DecodedImage, index: Int, playing: Bool) {
         renderer.setFrame(frame, playing: playing)
+        // Frames are exact: an early rendition shown before must not outlive them (neighbours would stay unprepared, and
+        // its exact tier would replace the frame).
         shownTier = .full
+        shownApproximate = false
         shownFrame = index
         renderFrame()
         guard hud.mode == .full, !playing || Trace.ms(since: frameHUDUpdated) >= 100 else { return }

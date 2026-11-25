@@ -117,6 +117,37 @@ final class AnimationPlaybackTests: ViewerTestCase {
         XCTAssertEqual(toastText(viewer), "Too large to animate")
     }
 
+    /// Early renditions (`DecodedImage.isApproximate`, progressive JPEG) and frames share the viewer's tier state: a frame
+    /// is exact (it clears an early rendition shown before it, so neighbours are prepared and that rendition's exact tier
+    /// never replaces the frame), and an early rendition never replaces a frame.
+    func testEarlyRenditionsAndFramesCoexist() throws {
+        let gif = try writeGIF(folder.appendingPathComponent("a.gif"))
+        let viewer = try makeViewer()
+        openAndWait(viewer, [gif])
+        let file = try XCTUnwrap(viewer.pipeline.currentFile)
+        func early(_ tier: Tier) throws -> DecodedImage {
+            let pixels = try XCTUnwrap(viewer.pipeline.pool.make(width: 96, height: 64, layout: .bgra8, alpha: .opaque,
+                                                                 colorSpace: XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))))
+            return DecodedImage(pixels: pixels, tier: tier, fullWidth: 96, fullHeight: 64, orientation: .up, isHDR: false,
+                                decodeNanos: 1, isApproximate: true)
+        }
+        if player(viewer) == nil {
+            // Not started (hidden window): an early rendition of a higher tier shows like any tier, as approximate.
+            viewer.pipeline.onDecoded?(file, try early(.full))
+            XCTAssertEqual(property(viewer, "shownApproximate"), true)
+            XCTAssertNil(player(viewer))
+        }
+        viewer.perform(.frameNext)
+        XCTAssertTrue(spin(5) { self.shownFrame(viewer) != nil })
+        XCTAssertEqual(property(viewer, "shownApproximate"), false, "a frame is exact")
+        XCTAssertEqual(viewer.shownTierForTests, .full)
+        let frame = try XCTUnwrap(renderer(viewer).image?.pixels)
+        for tier in [Tier.full, .screen] { viewer.pipeline.onDecoded?(file, try early(tier)) }
+        XCTAssertTrue(renderer(viewer).image?.pixels === frame, "an early rendition never replaces a frame")
+        XCTAssertEqual(property(viewer, "shownApproximate"), false)
+        XCTAssertNotNil(shownFrame(viewer))
+    }
+
     func testStillsNeverGetAPlayer() throws {
         let urls = writeSequence(4, width: 320, height: 240)
         let viewer = try makeViewer()
