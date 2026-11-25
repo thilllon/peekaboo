@@ -71,6 +71,7 @@ mise run deps      # static libjpeg-turbo and libwebp for the deployment target 
 | `defaults delete com.thilllon.Peekaboo PeekabooFolderAccessRequested` | Peekaboo.app's next launch from Finder, the Dock or `open -a` lists Desktop, Documents and Downloads again; a run of its executable from a shell never does, because macOS would ask for the terminal (traced, with Peekaboo quit first: `open --env PEEKABOO_TRACE=1 --stderr <file> -a build/Peekaboo.app`). macOS prompts only for a folder it has no answer for: `tccutil reset SystemPolicyDownloadsFolder com.thilllon.Peekaboo`, likewise `…DesktopFolder`, `…DocumentsFolder` |
 | `peekaboo-bench decode / pipeline [--cold] / render [--png DIR]` | regression benches (corpus from `PEEKABOO_CORPUS`, built by `mise run corpus`) |
 | `peekaboo-bench anim [file …]` | headless animation playback: on-screen duration vs declared delay, late frames, decode per frame, memory |
+| `peekaboo-bench picks [folder] [--files N]` | picks: reading a folder's Pick tags (utility QoS: first, warm, after a rescan), the main-thread cost of entering and leaving the picks-only view and of dropping a listing, and on a folder of photos how soon the next photo is sharp after a toggle (a folder is only read; default 5,000 synthetic files) |
 
 ## Layout
 

@@ -159,6 +159,9 @@ public struct Keymap: Sendable, Equatable {
                 bind(.normal, autoAdvance ? [action, .next] : [action], [key])
                 bind(.normal, [action, .next], ["shift+\(key)"])
             }
+            // Then the picks alone: browse only them, copy them all to a folder.
+            normal(.picksOnly, "v")
+            normal(.copyPicks("ask"), "shift+c")
             normal(.config, "cmd+,")
             normal(.help, "?", "cmd+/")
             normal(.close, "cmd+w", "q")

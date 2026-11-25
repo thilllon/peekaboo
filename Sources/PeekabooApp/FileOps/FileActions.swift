@@ -10,14 +10,22 @@ enum FileActionOutcome: Equatable {
     case removed(ImageFile)
     /// Undo brought a file back to its original location.
     case restored(ImageFile)
-    /// Metadata changed (tags, rating): refresh the HUD.
-    case changed(ImageFile)
+    /// Metadata changed (tags, rating): refresh the HUD. `picked`: whether the file carries the Pick flag now (nil when
+    /// not known).
+    case changed(ImageFile, picked: Bool?)
 }
 
 struct FileActionResult: Equatable {
     var outcome: FileActionOutcome = .unchanged
     /// Short confirmation for the toast, e.g. "Moved to Trash · ⌘Z".
     var toast: String?
+    /// How long the toast stays (nil: the usual 1.2 s); longer for a summary worth reading.
+    var toastSeconds: Double?
+    /// The toast reports work running in the background: `.start` begins a run of progress toasts, and each `.update`
+    /// shows only while the one before it is still on screen, so it never covers what the user did meanwhile.
+    var progress: ProgressToast?
+
+    enum ProgressToast { case start, update }
 }
 
 struct FileActionContext {
@@ -209,8 +217,11 @@ final class FileActions {
                 : FileActionResult(outcome: .removed(FileOperations.imageFile(at: from)), toast: "\(verb): Move to \(name)")
         case .copied(_, let to):
             return FileActionResult(toast: "\(verb): Copy to \(to.deletingLastPathComponent().lastPathComponent)")
-        case .tagged(let url, _, _):
-            return FileActionResult(outcome: .changed(FileOperations.imageFile(at: url)), toast: "\(verb): Tags")
+        case .tagged(let url, let before, let after):
+            let tags = undo ? before : after
+            return FileActionResult(outcome: .changed(FileOperations.imageFile(at: url),
+                                                      picked: tags.names.contains(FileOperations.pickTag)),
+                                    toast: "\(verb): Tags")
         }
     }
 
@@ -232,20 +243,38 @@ final class FileActions {
         }
     }
 
-    private func transfer(_ target: String, copy: Bool, context: FileActionContext) -> FileActionResult {
-        let folder: URL
+    enum Destination {
+        case folder(URL)
+        /// No folder: the picker was dismissed (an empty result), or why there is none.
+        case none(FileActionResult)
+    }
+
+    /// The folder of a move or copy target: the picker (`ask`, headed `title`; its folder panel's button says `prompt`),
+    /// the previous destination (`last`), a slot or a path.
+    private func destination(_ target: String, title: String, prompt: String, context: FileActionContext) -> Destination {
         switch target {
         case "ask":
-            guard let chosen = askDestination(copy: copy, context: context) else { return FileActionResult() }
-            folder = chosen
+            guard let chosen = askDestination(title: title, prompt: prompt, context: context) else {
+                return .none(FileActionResult())
+            }
+            return .folder(chosen)
         case "last":
-            guard let last = lastDestination else { return FileActionResult(toast: "No previous destination yet") }
-            folder = last
+            guard let last = lastDestination else { return .none(FileActionResult(toast: "No previous destination yet")) }
+            return .folder(last)
         default:
             guard let resolved = FileOperations.destination(for: target, slots: config().slots, imageURL: context.file.url) else {
-                return FileActionResult(toast: "Slot \(target) is not set: add it under [slots] in config.toml")
+                return .none(FileActionResult(toast: "Slot \(target) is not set: add it under [slots] in config.toml"))
             }
-            folder = resolved
+            return .folder(resolved)
+        }
+    }
+
+    private func transfer(_ target: String, copy: Bool, context: FileActionContext) -> FileActionResult {
+        let folder: URL
+        switch destination(target, title: copy ? "Copy to…" : "Move to…", prompt: copy ? "Copy Here" : "Move Here",
+                           context: context) {
+        case .folder(let url): folder = url
+        case .none(let result): return result
         }
         let existed = FileManager.default.fileExists(atPath: folder.path)
         let file = context.file
@@ -304,8 +333,128 @@ final class FileActions {
         }
     }
 
+    // MARK: Copy all picks
+
+    /// The copy of every pick in progress: how many of how many files are done (set on the copying thread), and the
+    /// timer that shows it.
+    private final class PicksCopy: @unchecked Sendable {
+        let folderName: String
+        var timer: Timer?
+        private let lock = NSLock()
+        private var doneCount = 0
+        private var totalCount: Int?
+
+        init(folderName: String) { self.folderName = folderName }
+
+        /// Files copied so far, of `total` (nil while the tags are being read).
+        var progress: (done: Int, total: Int?) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (doneCount, totalCount)
+        }
+
+        func setTotal(_ n: Int) {
+            lock.lock()
+            totalCount = n
+            lock.unlock()
+        }
+
+        func setDone(_ n: Int) {
+            lock.lock()
+            doneCount = n
+            lock.unlock()
+        }
+    }
+
+    private var picksCopy: PicksCopy?
+    /// Seconds between progress toasts while picks are copied (they also keep the toast on screen).
+    private static let picksProgressInterval = 0.5
+
+    /// `file.copy_picks:<target>`: the folder to copy the browsing set's `count` picks to (`ask`: the picker, headed
+    /// "Copy 37 Picks to…"), or why there is none.
+    func picksDestination(_ target: String, count: Int, context: FileActionContext) -> Destination {
+        guard picksCopy == nil else {
+            return .none(FileActionResult(toast: "Still copying the picks: wait for it to finish"))
+        }
+        guard count > 0 else { return .none(FileActionResult(toast: "No picks to copy yet: P picks the photo on screen")) }
+        let noun = count == 1 ? "Pick" : "Picks"
+        return destination(target, title: "Copy \(count) \(noun) to…", prompt: "Copy \(noun) Here", context: context)
+    }
+
+    /// Copy every pick of `listing` (the browsing set, whose `count` picks the viewer knows) into `folder`, in its
+    /// order, with `FileOperations.copyAll`: nothing is replaced (a taken name gets a number) and a pick the folder
+    /// already holds is skipped. It runs on a utility queue, so on a slow disk its reads yield to the viewer's decodes.
+    /// The tags are read again first (≈ 40 ms for 5,000 files): another app may have changed them since the viewer
+    /// read them, and what is copied is what the files say; `onRead` gets that read on the main thread. A toast shows
+    /// the progress, then a summary. Not undoable: it only adds copies (the summary says so).
+    func copyPicks(of listing: [ImageFile], count: Int, to folder: URL, onRead: @escaping (PicksRead) -> Void)
+        -> FileActionResult {
+        lastDestination = folder
+        let job = PicksCopy(folderName: folder.lastPathComponent)
+        picksCopy = job
+        let timer = Timer(timeInterval: Self.picksProgressInterval, repeats: true) { [weak self] _ in
+            guard let self, let job = self.picksCopy else { return }
+            let progress = job.progress
+            guard let total = progress.total else { return }
+            let text = "Copying picks to \(job.folderName): \(progress.done) of \(total)…"
+            self.onLateResult?(FileActionResult(toast: text, progress: .update))
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        job.timer = timer
+        let owner = WeakFileActions(self)
+        let onRead = MainThreadCallback(call: onRead)
+        let started = Trace.now()
+        DispatchQueue.global(qos: .utility).async {
+            let read = FileOperations.readPicks(of: listing)
+            let chosen = listing.filter { read.picks.contains($0.url) }
+            job.setTotal(chosen.count)
+            DispatchQueue.main.async { onRead.call(read) }
+            let result = FileOperations.copyAll(chosen.map(\.url), toFolder: folder) { job.setDone($0) }
+            DispatchQueue.main.async {
+                job.timer?.invalidate()
+                guard let actions = owner.value else { return }
+                actions.picksCopy = nil
+                Trace.log(String(format: "copy picks: %d to %@ in %.1f ms: %d copied, %d renamed, %d already there, %d failed",
+                                 chosen.count, job.folderName, Trace.ms(since: started), result.copied, result.renamed,
+                                 result.alreadyThere, result.failures.count))
+                for failure in result.failures { Trace.log("copy picks: \(failure)") }
+                actions.onLateResult?(Self.summary(of: result, total: chosen.count, folder: job.folderName))
+            }
+        }
+        return FileActionResult(toast: "Copying \(count) \(count == 1 ? "pick" : "picks") to \(job.folderName)…",
+                                progress: .start)
+    }
+
+    /// The toast after copying the picks, e.g. `Copied 37 picks to Selects · 1 saved under a new name (IMG_0042 2.jpg)
+    /// · ⌘Z won't remove the copies`.
+    static func summary(of result: FileOperations.BatchCopy, total: Int, folder: String) -> FileActionResult {
+        let copied = result.copied + result.renamed
+        var text: String
+        if total == 0 {
+            text = "Nothing to copy: no photo of the folder is flagged Pick now"
+        } else if copied == 0, result.failures.isEmpty {
+            text = total == 1 ? "The pick is already in \(folder)" : "All \(total) picks are already in \(folder)"
+        } else {
+            text = copied == total ? "Copied \(total) \(total == 1 ? "pick" : "picks") to \(folder)"
+                : "Copied \(copied) of \(total) picks to \(folder)"
+            if let name = result.firstRenamed {
+                // A file of that name was there already (it is left as it is).
+                text += result.renamed == 1 ? " · 1 saved under a new name (\(name))"
+                    : " · \(result.renamed) saved under new names (\(name), …)"
+            }
+            if result.alreadyThere > 0 { text += " · \(result.alreadyThere) already there" }
+            if let first = result.failures.first {
+                text += " · \(result.failures.count) failed: \(first)"
+                    + (result.failures.count > 1 ? " (+\(result.failures.count - 1) more)" : "")
+            }
+            // ⌘Z next would undo the change before this one (a flag, say), not the copy: say so before it is pressed.
+            if copied > 0 { text += " · ⌘Z won't remove the copies" }
+        }
+        return FileActionResult(toast: text, toastSeconds: result.failures.isEmpty ? 2.5 : 6)
+    }
+
     /// Slot picker: 1–9 (or the slot's key) choose, Return repeats the last destination.
-    private func askDestination(copy: Bool, context: FileActionContext) -> URL? {
+    private func askDestination(title: String, prompt: String, context: FileActionContext) -> URL? {
         let slots = config().slots
         let names = slots.keys.sorted { a, b in
             switch (Int(a), Int(b)) {
@@ -316,9 +465,9 @@ final class FileActions {
             }
         }
         let picker = MenuPicker()
-        let menu = NSMenu(title: copy ? "Copy to" : "Move to")
+        let menu = NSMenu(title: title)
         menu.autoenablesItems = false
-        let header = menu.addItem(withTitle: copy ? "Copy to…" : "Move to…", action: nil, keyEquivalent: "")
+        let header = menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
         header.isEnabled = false
         var choices: [URL] = []
         func add(_ title: String, _ url: URL, key: String) {
@@ -340,17 +489,17 @@ final class FileActions {
         other.keyEquivalentModifierMask = []
         other.target = picker
         other.tag = -1
-        guard let view = context.window?.contentView else { return chooseFolder(copy: copy) }
+        guard let view = context.window?.contentView else { return chooseFolder(prompt: prompt) }
         guard let tag = picker.run(menu, in: view) else { return nil }
-        return tag >= 0 ? choices[tag] : chooseFolder(copy: copy)
+        return tag >= 0 ? choices[tag] : chooseFolder(prompt: prompt)
     }
 
-    private func chooseFolder(copy: Bool) -> URL? {
+    private func chooseFolder(prompt: String) -> URL? {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.canCreateDirectories = true
-        panel.prompt = copy ? "Copy Here" : "Move Here"
+        panel.prompt = prompt
         if let last = lastDestination { panel.directoryURL = last }
         return panel.runModal() == .OK ? panel.url : nil
     }
@@ -364,8 +513,10 @@ final class FileActions {
         }
         let url = context.file.url
         do {
-            try operations.setTags(change(FileOperations.tags(of: url)), of: url)
-            return FileActionResult(outcome: .changed(context.file), toast: done)
+            let tags = change(FileOperations.tags(of: url))
+            try operations.setTags(tags, of: url)
+            return FileActionResult(outcome: .changed(context.file, picked: tags.names.contains(FileOperations.pickTag)),
+                                    toast: done)
         } catch {
             return FileActionResult(toast: "\(error)")
         }
@@ -530,6 +681,11 @@ final class FileActions {
 private struct WeakFileActions: @unchecked Sendable {
     weak var value: FileActions?
     init(_ value: FileActions) { self.value = value }
+}
+
+/// A main-thread callback carried by a background job, which calls it on the main thread only.
+private struct MainThreadCallback<Value>: @unchecked Sendable {
+    let call: (Value) -> Void
 }
 
 /// Runs a picker menu and reports the chosen item's tag. Items use `pick(_:)` as their action; the

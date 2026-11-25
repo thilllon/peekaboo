@@ -135,6 +135,31 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     }
     private var tags: [URL: FileTags] = [:]
     private var tagSummaries: [URL: String] = [:]
+    /// The latest tag read asked for each file: an older one that lands later is stale.
+    private var tagReadSerials: [URL: Int] = [:]
+    private var tagReadSerial = 0
+
+    // Picks
+    /// The browsing set's picks (the Finder tag "Pick"): read off the main thread once per listing and kept current as
+    /// the user marks. Empty while `[rating] storage = "none"`.
+    private var picks = PickSet()
+    /// The picks-only view (`view.picks_only`): `pipeline.files` holds the picks of `allFiles` in their order, plus the
+    /// photo on screen when it is not a pick (it was un-picked there, or the view began on it) until the user moves on.
+    private var picksOnly = false
+    /// The whole browsing set while `picksOnly` (otherwise that is `pipeline.files`).
+    private var allFiles: [ImageFile] = []
+    /// The listing the picks were last read for, as it was listed then (sizes, dates, inodes): the next read of the
+    /// folder reads only the files that are new or changed since. Empty until the first read of the folder lands.
+    private var picksListing: [ImageFile] = []
+    /// Files the viewer took out of the browsing set (moved away, trashed) since the folder was opened: one that comes
+    /// back (Finder, Put Back) is read again rather than taken for what it was before it left.
+    private var picksForgotten: Set<URL> = []
+    /// Drops the result of a folder-wide read that a newer listing (or another folder) replaced.
+    private var picksReadGeneration = 0
+    /// The generation of the toast that shows the progress of copying the picks: a newer toast (another action's)
+    /// stops the progress toasts, so they never hide what the user did meanwhile.
+    private var progressToast: Int?
+    private var lastAppliedRatingStorage: AppConfig.RatingStorage?
     private var loadingWork: DispatchWorkItem?
     private var navigationStart: UInt64 = 0
     private var lastAppliedHUDMode: AppConfig.HUDMode?
@@ -263,6 +288,12 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             hud.mode = config.hud
             lastAppliedHUDMode = config.hud
         }
+        if lastAppliedRatingStorage != config.ratingStorage {
+            // Picks follow the tag storage: turned off, they are forgotten; turned on, the folder's tags are read.
+            let changed = lastAppliedRatingStorage != nil
+            lastAppliedRatingStorage = config.ratingStorage
+            if changed, config.ratingStorage == .finderTags { readPicks() } else if changed { forgetPicks() }
+        }
         applyPipelineConfig(config)
         if hud.isHelpVisible { hud.setHelp(KeyLabels.helpSections(config.keymap)) }
         if instantFullscreen != nil, let screen = window?.screen { rootView.topInset = notchInset(screen) }
@@ -321,6 +352,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         failures.removeAll()
         unlistedFile = nil
         refusedListing = nil
+        forgetPicks(replacingFiles: true)
         listingPending = true
         // First pixel first: decode the opened file before listing its folder, and submit that decode before the
         // window is ordered in and flushed (window-server work it can overlap). Decide "file or folder" from the URL
@@ -390,6 +422,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             if singleFile {
                 if let refusal = refusedListing { hud.showToast(refusal, seconds: Self.accessDeniedToastSeconds) }
                 updateHUD()
+                readPicks()
             } else {
                 showEmpty(urls.count == 1 ? urls.first : nil)
             }
@@ -421,6 +454,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         presentCurrent()
         updateHUD()
         watchFolder()
+        readPicks()
         Trace.log("folder listed: \(browsed.files.count) files, \(String(format: "%.1f", Trace.ms(since: opened))) ms after open")
     }
 
@@ -475,11 +509,11 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         return statfs(path, &volume) == 0 && volume.f_flags & UInt32(MNT_LOCAL) == 0
     }
 
-    /// Index of `url` in the browsing set when it is a listed file of the folder being browsed.
+    /// Index of `url` in the browsing set (`browsingSet`) when it is a listed file of the folder being browsed.
     private func indexInBrowsingSet(_ url: URL) -> Int? {
         guard !listingPending, isInBrowsedFolder(url) else { return nil }
         let name = url.lastPathComponent
-        return pipeline.files.firstIndex { $0.name == name }
+        return browsingSet.firstIndex { $0.name == name }
     }
 
     /// Finder (or a drop) opened another file of the folder being browsed: navigate to it and keep the listing and
@@ -487,8 +521,12 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private func openWithinBrowsingSet(_ index: Int) {
         showWindow(nil)
         makeKeyAndOrderFront()
-        if index != pipeline.index {
-            navigate(to: index, isRepeat: false)
+        // In the picks-only view the file is looked up among the view's few files; a photo the view leaves out ends it,
+        // on that photo.
+        let position = picksOnly ? pipeline.files.firstIndex(of: browsingSet[index]) : index
+        if picksOnly, position == nil { leavePicksOnly(showing: index, toast: "All photos") }
+        if let position, position != pipeline.index {
+            navigate(to: position, isRepeat: false)
         } else {
             presentCurrent()
             renderFrame()
@@ -533,6 +571,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// Nothing to show: an empty folder (or one Peekaboo may not read: `refusedListing`), or no file opened yet.
     func showEmpty(_ folder: URL?) {
         stopAnimation()
+        forgetPicks(replacingFiles: true)
         replaceFiles([], index: 0)
         shownFile = nil
         shownTier = nil
@@ -778,6 +817,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             // A folder Peekaboo may not list browses the opened image alone: say why, not that it is the last one.
             if let refusal = refusedListing {
                 if !isRepeat { hud.showToast(refusal, seconds: Self.accessDeniedToastSeconds) }
+            } else if picksOnly {
+                hud.showToast(index < 0 ? "First pick" : "Last pick")
             } else {
                 hud.showToast(index < 0 ? "First image" : "Last image")
             }
@@ -785,7 +826,11 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         }
         guard target != pipeline.index || shownFile == nil else { return }
         beginNavigation()
+        progressToast = nil  // back to judging photos: a copy's progress toasts stop covering them (its summary comes)
+        let leaving = picksOnly ? pipeline.currentFile : nil
         pipeline.navigate(to: target, isRepeat: isRepeat)
+        // Moving on from a photo that is not a pick takes it out of the picks-only view.
+        if let leaving, leaving != pipeline.currentFile, !picks.contains(leaving) { dropFromPicksView(leaving) }
         let t1 = Trace.now()
         presentCurrent()
         let t2 = Trace.now()
@@ -822,10 +867,29 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             setTitle("Peekaboo")
             return
         }
-        let index = listingPending ? "…" : "\(pipeline.index + 1)"
-        // A folder that may not be listed has images nobody counted.
-        let count = listingPending ? "…" : refusedListing == nil ? "\(pipeline.files.count)" : "?"
-        var parts = [file.name, "\(index)/\(count)"]
+        let position: String
+        var counter: String?
+        if listingPending {
+            position = "…/…"
+        } else if picksOnly {
+            if picks.contains(file) {
+                // Until the folder's first tag read lands, the view's size is not known yet.
+                position = "Picks \(pipeline.index + 1)/\(picksKnown ? "\(pipeline.files.count)" : "…")"
+            } else {
+                // A photo that is not a pick (un-picked on screen, or the view began on it) stays until the user moves
+                // on.
+                let picksInView = pipeline.files.count - 1
+                position = "Not a pick"
+                counter = !picksKnown ? "Picks …" : picksInView == 0 ? "No picks left" : "Picks \(picksInView)"
+            }
+        } else {
+            // A folder that may not be listed has images nobody counted.
+            position = "\(pipeline.index + 1)/\(refusedListing == nil ? "\(pipeline.files.count)" : "?")"
+            // Shown once the folder's first tag read has landed: before, it would count only the picks seen so far.
+            if picksKnown, !picks.isEmpty { counter = "Picks \(picks.count)" }
+        }
+        var parts = [file.name, position]
+        if let counter { parts.append(counter) }
         let info = pipeline.info(for: file)
         let onScreen = isShowing(file) ? renderer.image : nil
         if let info {
@@ -839,7 +903,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         var content = HUDContent(line: parts.joined(separator: "  ·  "))
         if hud.mode == .full { content.details = detailRows(file, info, onScreen) }
         hud.setContent(content)
-        setTitle("\(file.name) — \(index)/\(count)")
+        setTitle("\(file.name) — \(position)")
     }
 
     /// The title is hidden (Window menu and Mission Control only) and costs ~0.5 ms to set, so it
@@ -905,19 +969,249 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private func loadTags(for file: ImageFile, force: Bool = false) {
         if !force, tags[file.url] != nil { return }
         let url = file.url
+        // Two reads of one file can land out of order (a tag written between them): only the last one asked for counts.
+        tagReadSerial &+= 1
+        let serial = tagReadSerial
+        tagReadSerials[url] = serial
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             // A fresh URL: NSURL caches resource values, which would hide a tag just written.
             let values = try? URL(fileURLWithPath: url.path, isDirectory: false).resourceValues(forKeys: [.tagNamesKey, .labelNumberKey])
             let result = FileTags(names: values?.tagNames ?? [], labelNumber: values?.labelNumber ?? 0)
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, self.tagReadSerials[url] == serial else { return }
+                self.tagReadSerials[url] = nil
                 if self.tags.count > 4096 { self.tags.removeAll(); self.tagSummaries.removeAll() }
                 let changed = self.tags[url] != result
                 self.tags[url] = result
                 self.tagSummaries[url] = result.summary
-                if changed, self.pipeline.currentFile?.url == url { self.updateHUD() }
+                // The read also says whether the file is a pick (e.g. one an undo brought back).
+                let pickChanged = self.config.ratingStorage == .finderTags
+                    && self.setPicked(url, result.names.contains(FileOperations.pickTag))
+                if changed || pickChanged, self.pipeline.currentFile?.url == url { self.updateHUD() }
             }
         }
+    }
+
+    // MARK: Picks
+
+    /// The picks-only view is on (the View menu's check mark).
+    var isPicksOnly: Bool { picksOnly }
+
+    /// Every file browsed: `allFiles` in the picks-only view, else the pipeline's set.
+    private var browsingSet: [ImageFile] { picksOnly ? allFiles : pipeline.files }
+
+    /// The folder's first tag read has landed: every pick of the listing is known (until then the counter would count
+    /// only the picks seen so far, such as the photo on screen).
+    private var picksKnown: Bool { !picksListing.isEmpty }
+
+    /// Which files of the browsing set are picks: read off the main thread (utility QoS) after this run-loop turn, so at
+    /// launch after the first frame. Files of the listing read last keep their known state while they are unchanged on
+    /// disk; new, changed and returning files are read.
+    private func readPicks() {
+        guard config.ratingStorage == .finderTags else { return }
+        let listing = browsingSet
+        guard !listing.isEmpty else { return }
+        picksReadGeneration &+= 1
+        let generation = picksReadGeneration
+        let previous = picksListing
+        let known = picks.urls
+        let unknown = picksForgotten
+        picks.beginRead()
+        DispatchQueue.main.async { [weak self] in
+            guard let self, generation == self.picksReadGeneration else {
+                Retired.release(listing, previous)  // possibly the last references to a replaced listing
+                return
+            }
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let started = Trace.now()
+                let read = FileOperations.readPicks(of: listing, previous: previous, known: known, unknown: unknown)
+                let ms = Trace.ms(since: started)
+                DispatchQueue.main.async {
+                    guard let self, generation == self.picksReadGeneration else {
+                        Retired.release(read)
+                        return
+                    }
+                    self.finishReadingPicks(read, ms: ms)
+                }
+            }
+        }
+    }
+
+    private func finishReadingPicks(_ read: PicksRead, ms: Double) {
+        let before = picks.urls
+        let wasKnown = picksKnown
+        picks.finishRead(read)
+        Retired.release(picksListing)
+        picksListing = read.listing
+        Trace.log(String(format: "picks: %d of %d files (%d read in %.1f ms)", picks.count, read.listing.count, read.read,
+                         ms))
+        if picksOnly, picks.isEmpty {
+            leavePicksOnly(toast: "No picks in this folder")
+            return
+        }
+        guard picks.urls != before || !wasKnown else { return }
+        refreshPicksView()
+        updateHUD()
+    }
+
+    /// `url` is a pick now, or no longer (a flag written, a tag read). In the picks-only view another photo joins or
+    /// leaves the view at once; the photo on screen stays until the user moves on. Returns whether the picks changed.
+    @discardableResult
+    private func setPicked(_ url: URL, _ picked: Bool) -> Bool {
+        guard picks.set(url, picked: picked) else { return false }
+        if picksOnly, url != pipeline.currentFile?.url { refreshPicksView() }
+        return true
+    }
+
+    /// `view.picks_only`: browse only the picks, or every photo again. The photo on screen stays either way: a photo
+    /// that is not a pick stays in the picks-only view until the user moves on (→ goes to the next pick after it).
+    private func togglePicksOnly() {
+        if picksOnly {
+            leavePicksOnly(toast: "All photos: \(allFiles.count)")
+            return
+        }
+        guard config.ratingStorage == .finderTags else {
+            hud.showToast("Picks are off ([rating] storage = \"none\")")
+            return
+        }
+        guard let current = pipeline.currentFile else { return }
+        guard !listingPending else {
+            hud.showToast("Still listing the folder")
+            return
+        }
+        guard !picks.isEmpty || !picksKnown else {
+            hud.showToast("No picks yet: P picks the photo on screen")
+            return
+        }
+        let started = Trace.now()
+        let all = pipeline.files
+        // Found through the pipeline's lookup by name: the cost is the picks', not a hash of every file of the folder.
+        let view = picks.view(of: all, keeping: current) { self.pipeline.index(of: $0) }
+        picksOnly = true
+        allFiles = all
+        pipeline.setFiles(view, index: view.firstIndex(of: current) ?? 0)
+        restartPrefetch()
+        presentCurrent()
+        updateHUD()
+        hud.showToast(picksKnown ? "Picks only: \(picks.count)" : "Picks only (reading the tags…)")
+        Trace.log(String(format: "picks only: %d of %d files, %.2f ms", view.count, all.count, Trace.ms(since: started)))
+    }
+
+    /// Back to every photo, on the photo at `showing` in `allFiles` (default: the photo on screen).
+    private func leavePicksOnly(showing: Int? = nil, toast: String?) {
+        guard picksOnly else { return }
+        let started = Trace.now()
+        let current = pipeline.currentFile
+        // One walk of the folder puts the view's newer stamps back and says where the photo on screen is in it.
+        let positions = mergeViewIntoAllFiles()
+        let all = allFiles
+        picksOnly = false
+        allFiles = []
+        let target: Int
+        if let showing {
+            target = showing
+            beginNavigation()
+        } else if positions.count == pipeline.files.count, positions.indices.contains(pipeline.index) {
+            target = positions[pipeline.index]
+        } else {
+            target = current.flatMap { all.firstIndex(of: $0) } ?? 0  // not expected: the view is a part of the folder
+        }
+        pipeline.setFiles(all, index: target)
+        if pipeline.currentFile == current { restartPrefetch() }
+        presentCurrent()
+        updateHUD()
+        if let toast { hud.showToast(toast) }
+        Trace.log(String(format: "all photos: %d files, %.2f ms", all.count, Trace.ms(since: started)))
+    }
+
+    /// Rebuild the picks-only view after the picks changed for photos not on screen (an undo, a redo, a read), keeping
+    /// the photo on screen.
+    private func refreshPicksView() {
+        guard picksOnly, let current = pipeline.currentFile else { return }
+        mergeViewIntoAllFiles()
+        let view = picks.filter(allFiles, keeping: current)
+        guard view != pipeline.files else { return }
+        pipeline.setFiles(view, index: view.firstIndex(of: current) ?? 0)
+        restartPrefetch()
+        updateHUD()
+    }
+
+    /// The browsing set changed around the photo on screen (the picks-only view began, ended or changed): prefetch for
+    /// its new neighbours as right after a key press. `setFiles` keeps the pipeline's navigation clock, so after a look
+    /// at the photo longer than the prefetch horizon (2.5 s) the new neighbours would seem too far off to decode, and
+    /// the next key press would find nothing ready. A step of 0 keeps the direction and the rhythm.
+    private func restartPrefetch() {
+        pipeline.navigate(to: pipeline.index, isRepeat: false)
+        prepareNeighbours()
+    }
+
+    /// The picks-only view's newer stamps back in `allFiles` (`PickSet.merge`); returns where each entry of the view is
+    /// in it.
+    @discardableResult
+    private func mergeViewIntoAllFiles() -> [Int] { PickSet.merge(pipeline.files, into: &allFiles) }
+
+    /// The user moved on from `file`, which is no longer a pick: it leaves the picks-only view.
+    private func dropFromPicksView(_ file: ImageFile) {
+        var view = pipeline.files
+        guard let i = view.firstIndex(of: file) else { return }
+        view.remove(at: i)
+        pipeline.setFiles(view, index: pipeline.index > i ? pipeline.index - 1 : pipeline.index)
+    }
+
+    /// Forget the picks: another folder opens, or `[rating] storage` became "none". The picks-only view ends; with
+    /// `replacingFiles` the caller replaces the browsing set next, so the view's files are not put back first.
+    private func forgetPicks(replacingFiles: Bool = false) {
+        if picksOnly, !replacingFiles { leavePicksOnly(toast: nil) }
+        // Often the last references to the previous folder's lists: freed off the main thread, since an open's first
+        // decode is submitted next.
+        Retired.release(allFiles, picksListing, picks, picksForgotten)
+        picksOnly = false
+        allFiles = []
+        picks = PickSet()
+        picksListing = []
+        picksForgotten = []
+        picksReadGeneration &+= 1
+        if replacingFiles {
+            // A tag read of the previous folder's photo that lands late is not about this set.
+            tagReadSerials.removeAll()
+        } else {
+            updateHUD()
+        }
+    }
+
+    /// `file.copy_picks`: every pick of the browsing set, in its order, to the target's folder. The copy reads the tags
+    /// again first (another app may have changed them) and hands that read back: the counter and the view follow it.
+    private func copyPicks(_ target: String) {
+        guard config.ratingStorage == .finderTags else {
+            hud.showToast("Picks are off ([rating] storage = \"none\")")
+            return
+        }
+        guard let file = pipeline.currentFile else { return }
+        guard !listingPending, picksKnown else {
+            hud.showToast("Still reading the folder's tags: try again in a moment")
+            return
+        }
+        let context = FileActionContext(file: file, index: pipeline.index, count: pipeline.files.count, window: window)
+        let folder: URL
+        switch fileActions.picksDestination(target, count: picks.count, context: context) {
+        case .folder(let url): folder = url
+        case .none(let result):
+            handle(result)
+            return
+        }
+        // The copy's read is the folder's newest: it replaces a read in flight, and what changes while it runs keeps
+        // its newer state.
+        picksReadGeneration &+= 1
+        let generation = picksReadGeneration
+        picks.beginRead()
+        let started = Trace.now()
+        handle(fileActions.copyPicks(of: browsingSet, count: picks.count, to: folder) { [weak self] read in
+            guard let self, generation == self.picksReadGeneration else {
+                Retired.release(read)
+                return
+            }
+            self.finishReadingPicks(read, ms: Trace.ms(since: started))
+        })
     }
 
     // MARK: Rendering
@@ -1072,6 +1366,15 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             default: return
             }
         }
+        if picksOnly, pipeline.files.count == 1, picksKnown, let current = pipeline.currentFile,
+           !picks.contains(current) {
+            // The picks-only view holds no pick any more (its one photo, on screen, was un-picked): a move goes on
+            // among every photo instead of finding no pick to go to.
+            switch action {
+            case .next, .previous, .first, .last, .jump: leavePicksOnly(toast: "No picks left: all photos")
+            default: break
+            }
+        }
         switch action {
         case .next: navigate(to: pipeline.index + 1, isRepeat: isRepeat)
         case .previous: navigate(to: pipeline.index - 1, isRepeat: isRepeat)
@@ -1098,6 +1401,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         case .playPause: togglePlayback()
         case .frameNext: stepFrame(1)
         case .framePrevious: stepFrame(-1)
+        case .picksOnly: togglePicksOnly()
+        case .copyPicks(let target): copyPicks(target)
         case .background:
             let all = Background.allCases
             let next = all[((all.firstIndex(of: renderer.settings.background) ?? 0) + 1) % all.count]
@@ -1155,48 +1460,113 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
 
     /// Update the browsing set after a file action.
     private func handle(_ result: FileActionResult) {
-        if let toast = result.toast { hud.showToast(toast) }
+        var toast = result.toast
         switch result.outcome {
         case .removed(let file):
-            var files = pipeline.files
-            guard let i = files.firstIndex(of: file) else { return }
-            listingEpoch &+= 1
-            files.remove(at: i)
-            if file == unlistedFile { unlistedFile = nil }
-            tags[file.url] = nil
-            tagSummaries[file.url] = nil
-            if files.isEmpty {
-                showEmpty(currentFolder)
-                return
-            }
-            // The file on screen went: show the one that took its place. Another one (a redo, a background move
-            // that finished late): stay on the image being viewed.
-            let current = pipeline.index
-            if current == i { beginNavigation() }
-            pipeline.setFiles(files, index: current == i ? min(i, files.count - 1) : current > i ? current - 1 : current)
-            presentCurrent()
-            updateHUD()
+            if remove(file), let text = toast { toast = text + " · no picks left" }
         case .restored(let file):
-            // Back where it was, but only into the set it belongs to: an undo after opening another folder (or a
-            // background move failing after the user moved on) must not inject a file of another folder.
-            guard isInBrowsingSet(file) else { return }
-            var files = pipeline.files
-            listingEpoch &+= 1
-            if !files.contains(file) {
-                files.append(file)
-                files = NaturalSort.sort(files, by: \.name)
-            }
-            hud.setMessage(nil)
-            beginNavigation()
-            pipeline.setFiles(files, index: files.firstIndex(of: file) ?? pipeline.index)
-            presentCurrent()
-            updateHUD()
-        case .changed(let file):
+            restore(file)
+        case .changed(let file, let picked):
+            // The undo stack outlives a folder: an undo can reach a photo of the folder browsed before, whose tags are
+            // not this set's.
+            guard isBrowsed(file) else { break }
+            if let picked, config.ratingStorage == .finderTags { setPicked(file.url, picked) }
             loadTags(for: file, force: true)
             updateHUD()
         case .unchanged:
             break
         }
+        guard let toast else { return }
+        switch result.progress {
+        case .start?:
+            progressToast = hud.showToast(toast)
+        case .update?:
+            // Only while the progress toast is still the one on screen: another toast, or a move to another photo, ends
+            // them, so they never cover what the user did meanwhile.
+            guard let shown = progressToast, hud.isShowingToast(shown) else { return }
+            progressToast = hud.showToast(toast)
+        case nil:
+            hud.showToast(toast, seconds: result.toastSeconds ?? 1.2)
+        }
+    }
+
+    /// A file action took `file` out of the browsing set (trash, a move, delete). Returns true when that emptied the
+    /// picks-only view, which then ends on the photo that took the last pick's place.
+    private func remove(_ file: ImageFile) -> Bool {
+        var indexInAll: Int?
+        if picksOnly, let k = allFiles.firstIndex(of: file) {
+            allFiles.remove(at: k)
+            indexInAll = k
+        }
+        var files = pipeline.files
+        let index = files.firstIndex(of: file)
+        guard index != nil || indexInAll != nil else { return false }
+        listingEpoch &+= 1
+        if file == unlistedFile { unlistedFile = nil }
+        tags[file.url] = nil
+        tagSummaries[file.url] = nil
+        // A tag read in flight must not bring its tags, or its pick, back; and if the file comes back (Finder, Put
+        // Back), its tags are read again.
+        tagReadSerials[file.url] = nil
+        picks.set(file.url, picked: false)
+        picksForgotten.insert(file.url)
+        guard let i = index else {
+            updateHUD()  // a photo the picks-only view leaves out: only the counter changes
+            return false
+        }
+        files.remove(at: i)
+        if files.isEmpty {
+            if picksOnly, !allFiles.isEmpty {
+                let all = allFiles
+                picksOnly = false
+                allFiles = []
+                beginNavigation()
+                pipeline.setFiles(all, index: min(indexInAll ?? 0, all.count - 1))
+                presentCurrent()
+                updateHUD()
+                return true
+            }
+            showEmpty(currentFolder)
+            return false
+        }
+        // The file on screen went: show the one that took its place. Another one (a redo, a background move
+        // that finished late): stay on the image being viewed.
+        let current = pipeline.index
+        if current == i { beginNavigation() }
+        pipeline.setFiles(files, index: current == i ? min(i, files.count - 1) : current > i ? current - 1 : current)
+        presentCurrent()
+        updateHUD()
+        return false
+    }
+
+    /// An undo (or a move that failed) brought `file` back: it shows again.
+    private func restore(_ file: ImageFile) {
+        // Back where it was, but only into the set it belongs to: an undo after opening another folder (or a
+        // background move failing after the user moved on) must not inject a file of another folder.
+        guard isInBrowsingSet(file) else { return }
+        if picksOnly { mergeViewIntoAllFiles() }
+        var files = browsingSet
+        listingEpoch &+= 1
+        if !files.contains(file) {
+            files.append(file)
+            files = NaturalSort.sort(files, by: \.name)
+        }
+        hud.setMessage(nil)
+        beginNavigation()
+        if picksOnly {
+            // In the picks-only view it shows as the photo on screen (a pick once its tags are read: they travel with
+            // the file); the photo on screen before is left behind if it was no longer a pick.
+            Retired.release(allFiles)
+            allFiles = files
+            let view = picks.filter(files, keeping: file)
+            pipeline.setFiles(view, index: view.firstIndex(of: file) ?? 0)
+        } else {
+            pipeline.setFiles(files, index: files.firstIndex(of: file) ?? pipeline.index)
+        }
+        presentCurrent()
+        updateHUD()
+        // A folder read in flight began without this file, and would drop what its tag read says: read again with it.
+        if picks.isReading { readPicks() }
     }
 
     private var currentFolder: URL? {
@@ -1214,6 +1584,15 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private func isInBrowsingSet(_ file: ImageFile) -> Bool {
         if case .files = browseSource { return true }
         return isInBrowsedFolder(file.url)
+    }
+
+    /// `file` is one of the files browsed now: a file of the folder browsed (its path says so), or of the set opened.
+    private func isBrowsed(_ file: ImageFile) -> Bool {
+        switch browseSource {
+        case .folder: return isInBrowsedFolder(file.url)
+        case .files: return browsingSet.contains(file)
+        case .none: return false
+        }
     }
 
     // MARK: Animation
@@ -1657,7 +2036,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             }
         }
         let fingerprint = { (list: [ImageFile]) in list.map { $0.url.path + "|" + $0.version } }
-        guard allowed || fingerprint(files) != fingerprint(pipeline.files) else { return }
+        if picksOnly { mergeViewIntoAllFiles() }
+        guard allowed || fingerprint(files) != fingerprint(browsingSet) else { return }
         if files.isEmpty {
             showEmpty(folder)
             return
@@ -1668,13 +2048,37 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             // Renamed (in Finder, by another app): the same file under its new name stays on screen.
             index = files.firstIndex { $0.fileID == current.fileID && $0.byteSize == current.byteSize }
         }
-        pipeline.setFiles(files, index: index ?? min(pipeline.index, files.count - 1))
+        var viewEnded = false
+        if picksOnly {
+            // The view follows the new listing: its picks, and the photo on screen if it is still there.
+            let before = allFiles
+            Retired.release(allFiles)
+            allFiles = files
+            let kept = index.map { files[$0] }
+            let view = picks.filter(files, keeping: kept)
+            if view.isEmpty {
+                // The last pick (and the photo on screen) left the folder: every photo again, at the photo on screen's
+                // place in the folder (the pipeline's index was a place in the view).
+                picksOnly = false
+                allFiles = []
+                let place = current.flatMap { before.firstIndex(of: $0) } ?? 0
+                pipeline.setFiles(files, index: index ?? min(place, files.count - 1))
+                viewEnded = true
+            } else {
+                pipeline.setFiles(view, index: kept.flatMap { view.firstIndex(of: $0) } ?? min(pipeline.index, view.count - 1))
+            }
+        } else {
+            pipeline.setFiles(files, index: index ?? min(pipeline.index, files.count - 1))
+        }
         if pipeline.currentFile != current { beginNavigation() }
         // The message was about the previous state (an empty folder, a removed file's error); `presentCurrent`
         // shows the current file's error again if it still has one.
         hud.setMessage(nil)
         presentCurrent()
         updateHUD()
+        if viewEnded { hud.showToast("No picks left: all photos") }
+        // New files (a rename gives a file a new name) may carry tags: read them.
+        readPicks()
         Trace.log("folder rescanned: \(files.count) files")
     }
 
@@ -1863,5 +2267,21 @@ private final class DeferredRelease: @unchecked Sendable {
             self.images.removeAll()
             pool?.drain()
         }
+    }
+}
+
+/// Frees lists the viewer replaced (a folder's files, the listing its picks were read for) off the main thread: when
+/// the viewer held their last reference, releasing them costs the main thread 0.65 ms for 5,000 files and 18 ms for
+/// 50,000 (every URL is released, cold in the cache), before the first decode of an open or after every rescan.
+private final class Retired: @unchecked Sendable {
+    private var values: [Any]
+
+    private init(_ values: [Any]) { self.values = values }
+
+    /// Keep `values` and free them on a utility queue 100 ms from now. Call it before the main thread drops its own
+    /// references: by then they are gone, and the values' last release happens there.
+    static func release(_ values: Any...) {
+        let retired = Retired(values)
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.1) { retired.values.removeAll() }
     }
 }

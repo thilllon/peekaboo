@@ -16,18 +16,23 @@ final class ActionTests: XCTestCase {
         XCTAssertEqual(Action(id: "pan.edge:top"), .panEdge(.top))
         XCTAssertEqual(Action(id: "file.move:keep"), .move("keep"))
         XCTAssertEqual(Action(id: "file.copy:~/Pictures/Best"), .copy("~/Pictures/Best"))
+        XCTAssertEqual(Action(id: "file.copy_picks:ask"), .copyPicks("ask"))
+        XCTAssertEqual(Action(id: "file.copy_picks:./_selects"), .copyPicks("./_selects"))
+        XCTAssertEqual(Action(id: "view.picks_only"), .picksOnly)
         XCTAssertEqual(Action(id: "file.open_with:com.apple.Preview"), .openWith("com.apple.Preview"))
         XCTAssertEqual(Action(id: "meta.rate:3"), .rate(3))
         XCTAssertEqual(Action(id: "meta.label:red"), .label("red"))
         XCTAssertEqual(Action(id: "meta.flag:pick"), .flag("pick"))
         XCTAssertEqual(Action(id: "exec:open -R {path}"), .exec("open -R {path}"))
-        for action in [Action.jump(10), .jump(-3), .zoomSet(2), .zoomSet(0.5), .move("1"), .rate(0), .exec("x {path}")] {
+        for action in [Action.jump(10), .jump(-3), .zoomSet(2), .zoomSet(0.5), .move("1"), .copyPicks("last"), .rate(0),
+                       .exec("x {path}")] {
             XCTAssertEqual(Action(id: action.id), action, action.id)
         }
     }
 
     func testRejectsInvalidIDs() {
-        for bad in ["bogus", "nav.jump:0", "nav.jump:x", "zoom.set:-1", "zoom.set:0", "file.move:", "meta.rate:6",
+        for bad in ["bogus", "nav.jump:0", "nav.jump:x", "zoom.set:-1", "zoom.set:0", "file.move:", "file.copy_picks:",
+                    "view.picks_only:all", "meta.rate:6",
                     "meta.label:pink", "meta.flag:maybe", "pan.edge:middle", "exec:", "exec:   "] {
             XCTAssertNil(Action(id: bad), bad)
         }

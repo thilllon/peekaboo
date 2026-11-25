@@ -337,6 +337,112 @@ public final class FileOperations {
         }
     }
 
+    /// What `copyAll` did.
+    public struct BatchCopy: Equatable, Sendable {
+        /// Files copied under their own name.
+        public var copied = 0
+        /// Files copied under another name ("name 2.jpg"): a different file had theirs.
+        public var renamed = 0
+        /// The name the first of those got, e.g. "IMG_0042 2.jpg".
+        public var firstRenamed: String?
+        /// Files left alone because the folder holds them already: a copy made earlier (see `holdsCopy`), or the file
+        /// itself.
+        public var alreadyThere = 0
+        /// Why each of the others could not be copied, e.g. `Cannot copy IMG_0042.jpg: Permission denied`.
+        public var failures: [String] = []
+
+        public init() {}
+    }
+
+    /// Copy `urls` into `folder` (created if missing), one after another, with the rules of `transfer`: nothing is ever
+    /// replaced (a taken name becomes "name 2.ext"), and a file the folder already holds (a copy made earlier, see
+    /// `holdsCopy`) is skipped, so copying the same set again adds only what is new. Not recorded for undo. Thread-safe:
+    /// run it off the main thread; `progress` gets the number of files done after each one, on the calling thread.
+    public static func copyAll(_ urls: [URL], toFolder folder: URL, progress: (Int) -> Void = { _ in }) -> BatchCopy {
+        var result = BatchCopy()
+        for (i, url) in urls.enumerated() {
+            defer { progress(i + 1) }
+            if isSameDirectory(folder, url.deletingLastPathComponent()) || holdsCopy(of: url, in: folder) {
+                result.alreadyThere += 1
+                continue
+            }
+            do {
+                switch try transfer(url, toFolder: folder, mode: .copy) {
+                case .copied(_, let to) where to.lastPathComponent != url.lastPathComponent:
+                    result.renamed += 1
+                    if result.firstRenamed == nil { result.firstRenamed = to.lastPathComponent }
+                default: result.copied += 1
+                }
+            } catch {
+                result.failures.append("\(error)")
+            }
+        }
+        return result
+    }
+
+    /// `folder` already holds a copy of `url`, under its name or a numbered one ("name 2.ext", what a copy is called
+    /// when the name was taken): see `copyMatch`. A likely copy (on a volume that keeps file times coarser than the
+    /// source's) counts once its first and last 64 KB are the same (`sameSamples`).
+    static func holdsCopy(of url: URL, in folder: URL) -> Bool {
+        var source = stat()
+        guard lstat(url.path, &source) == 0 else { return false }
+        let name = url.lastPathComponent
+        var n = 1
+        while true {
+            let candidate = numberedURL(name, n, in: folder)
+            var st = stat()
+            guard lstat(candidate.path, &st) == 0 else { return false }
+            switch copyMatch(source: source, candidate: st) {
+            case .same: return true
+            case .likely where sameSamples(url, candidate, size: Int(source.st_size)): return true
+            case .likely, .different: n += 1
+            }
+        }
+    }
+
+    /// How an item of the destination compares with a file that may have been copied there (`holdsCopy`).
+    enum CopyMatch: Equatable {
+        /// The same type, size and modification time, to the nanosecond: a copy.
+        case same
+        /// The same type and size, and a modification time that the destination's volume may have cut from the
+        /// source's: a copy if its contents are the same.
+        case likely
+        case different
+    }
+
+    /// Whether `candidate` can be a copy of `source`, from their status alone. A copy keeps the type, the size and the
+    /// modification time, but only as precisely as the destination's volume stores times: APFS to the nanosecond, SMB
+    /// shares to 100 ns, exFAT to 10 ms, HFS+ to the second and FAT to two seconds. So a regular file of the same size
+    /// whose time is a whole multiple of 100 ns and within 2 s of the source's is `likely` a copy.
+    static func copyMatch(source: stat, candidate: stat) -> CopyMatch {
+        let type = source.st_mode & S_IFMT
+        guard candidate.st_mode & S_IFMT == type, candidate.st_size == source.st_size else { return .different }
+        let s = source.st_mtimespec, c = candidate.st_mtimespec
+        if c.tv_sec == s.tv_sec, c.tv_nsec == s.tv_nsec { return .same }
+        guard type == S_IFREG, c.tv_nsec % 100 == 0 else { return .different }
+        let apart = abs((Int64(c.tv_sec) - Int64(s.tv_sec)) * 1_000_000_000 + Int64(c.tv_nsec) - Int64(s.tv_nsec))
+        return apart <= 2_000_000_000 ? .likely : .different
+    }
+
+    /// The first and the last 64 KB of two files of `size` bytes are the same: what tells a copy from another photo of
+    /// the same name and size, without reading both whole.
+    static func sameSamples(_ a: URL, _ b: URL, size: Int) -> Bool {
+        let fa = open(a.path, O_RDONLY | O_NOFOLLOW), fb = open(b.path, O_RDONLY | O_NOFOLLOW)
+        defer {
+            if fa >= 0 { close(fa) }
+            if fb >= 0 { close(fb) }
+        }
+        guard fa >= 0, fb >= 0, size >= 0 else { return false }
+        let chunk = min(size, 64 << 10)
+        var x = [UInt8](repeating: 0, count: chunk), y = [UInt8](repeating: 0, count: chunk)
+        for offset in size > chunk ? [0, size - chunk] : [0] {
+            guard pread(fa, &x, chunk, off_t(offset)) == chunk, pread(fb, &y, chunk, off_t(offset)) == chunk, x == y else {
+                return false
+            }
+        }
+        return true
+    }
+
     /// Put `url` back at `original` (or "name 2.ext" next to it if that name was taken meanwhile).
     private static func restore(_ url: URL, to original: URL) throws -> URL {
         let folder = original.deletingLastPathComponent()
@@ -699,25 +805,84 @@ public final class FileOperations {
     /// plus the legacy Finder label number.
     public static func tags(of url: URL) -> Tags {
         var tags = Tags()
-        let path = url.path
-        let size = getxattr(path, tagAttribute, nil, 0, 0, 0)
-        if size > 0 {
-            var buffer = [UInt8](repeating: 0, count: size)
-            if getxattr(path, tagAttribute, &buffer, size, 0, 0) == size,
-               let entries = try? PropertyListSerialization.propertyList(from: Data(buffer), format: nil) as? [String] {
-                for entry in entries {
-                    let parts = entry.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
-                    let name = String(parts[0])
-                    guard !name.isEmpty, !tags.names.contains(name) else { continue }
-                    tags.names.append(name)
-                    if parts.count > 1, let color = Int(parts[1]), color > 0 { tags.colors[name] = color }
-                }
-            }
+        for entry in tagEntries(atPath: url.path) ?? [] {
+            let parts = entry.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+            let name = String(parts[0])
+            guard !name.isEmpty, !tags.names.contains(name) else { continue }
+            tags.names.append(name)
+            if parts.count > 1, let color = Int(parts[1]), color > 0 { tags.colors[name] = color }
         }
         var fresh = url
         fresh.removeAllCachedResourceValues() // URLs cache resource values within a run-loop pass
         tags.label = (try? fresh.resourceValues(forKeys: [.labelNumberKey]))?.labelNumber ?? 0
         return tags
+    }
+
+    /// The raw entries of the tag attribute (`"name\n<colour>"`, or a bare name); nil when the file has none. One
+    /// `getxattr` into a stack buffer: an untagged file costs a single failed call.
+    static func tagEntries(atPath path: String) -> [String]? {
+        let data: Data? = withUnsafeTemporaryAllocation(byteCount: 1024, alignment: 8) { buffer in
+            let size = getxattr(path, tagAttribute, buffer.baseAddress, buffer.count, 0, 0)
+            if size >= 0 { return Data(bytes: buffer.baseAddress!, count: size) }
+            guard errno == ERANGE else { return nil }
+            // Larger than the buffer (hundreds of tags): ask for the size, then read it.
+            let needed = getxattr(path, tagAttribute, nil, 0, 0, 0)
+            guard needed > 0 else { return nil }
+            var bytes = [UInt8](repeating: 0, count: needed)
+            guard getxattr(path, tagAttribute, &bytes, needed, 0, 0) == needed else { return nil }
+            return Data(bytes)
+        }
+        guard let data, !data.isEmpty else { return nil }
+        return try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String]
+    }
+
+    /// Whether the item at `url` carries the tag "Pick" (`meta.flag:pick`).
+    public static func isPicked(_ url: URL) -> Bool {
+        tagEntries(atPath: url.path)?.contains { $0 == pickTag || $0.hasPrefix(pickTag + "\n") } ?? false
+    }
+
+    /// The files of `files` that carry the tag "Pick": one attribute read per file, four files at a time (more lanes
+    /// only contend in the file system). Thread-safe; slow on a large folder (≈ 10 µs per file), so never call it on
+    /// the main thread.
+    public static func picked(_ files: [ImageFile]) -> Set<URL> {
+        guard !files.isEmpty else { return [] }
+        let flags = UnsafeMutableBufferPointer<Bool>.allocate(capacity: files.count)
+        flags.initialize(repeating: false)
+        defer { flags.deallocate() }
+        let lanes = min(4, files.count)
+        DispatchQueue.concurrentPerform(iterations: lanes) { lane in
+            for i in files.count * lane / lanes ..< files.count * (lane + 1) / lanes { flags[i] = isPicked(files[i].url) }
+        }
+        var result = Set<URL>()
+        for i in files.indices where flags[i] { result.insert(files[i].url) }
+        return result
+    }
+
+    /// The picks of `listing`. A file of the folder's previous read (`previous`, as listed then; `known`: the picks
+    /// among those files now) keeps what is known of it while its size, modification time and inode are the same
+    /// (writing a tag changes none of them). The others are read (`picked(_:)`): new files, files another app rewrote
+    /// (an editor's save can drop the tags) and the `unknown` ones (a file moved out of the folder may come back), so a
+    /// new listing of the folder reads only what changed. Thread-safe; call it off the main thread.
+    public static func readPicks(of listing: [ImageFile], previous: [ImageFile] = [], known: Set<URL> = [],
+                                 unknown: Set<URL> = []) -> PicksRead {
+        var picks = Set<URL>()
+        var unread: [ImageFile] = []
+        if previous.isEmpty {
+            unread = listing
+        } else {
+            var before = [URL: ImageFile](minimumCapacity: previous.count)
+            for file in previous { before[file.url] = file }
+            for file in listing {
+                if let old = before[file.url], old.byteSize == file.byteSize, old.modified == file.modified,
+                   old.fileID == file.fileID, !unknown.contains(file.url) {
+                    if known.contains(file.url) { picks.insert(file.url) }
+                } else {
+                    unread.append(file)
+                }
+            }
+        }
+        picks.formUnion(picked(unread))
+        return PicksRead(picks: picks, listing: listing, read: unread.count)
     }
 
     /// Write the tag attribute the way Finder does (so colour tags show their colour), then the label number.

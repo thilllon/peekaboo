@@ -359,7 +359,7 @@ final class ShortcutsPane: SettingsForm, SettingsPane, NSTableViewDataSource, NS
             return
         }
         switch action {
-        case .move(let target), .copy(let target):
+        case .move(let target), .copy(let target), .copyPicks(let target):
             guard FileOperations.isPathLike(target) || ["ask", "last"].contains(target) || model.config.slots[target] != nil else {
                 showStatus("There is no destination “\(target)”: add it in Files › Move and copy destinations.")
                 return

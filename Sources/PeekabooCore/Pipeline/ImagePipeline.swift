@@ -403,6 +403,10 @@ public final class ImagePipeline {
     /// Bytes cached per tier.
     public func cachedBytes(for tier: Tier) -> Int { tierBytes[tier.rawValue] }
 
+    /// Position of the file at `url` in `files`, through the pipeline's own lookup by name (O(1)); nil when it is not
+    /// there.
+    public func index(of url: URL) -> Int? { position(of: url, name: url.lastPathComponent) }
+
     /// The user is skimming (fast navigation or key repeat): only previews are decoded for the visible image.
     public var isSkimming: Bool { navigation.isSkimming(now: Trace.now(), tuning: config.tuning) }
 
