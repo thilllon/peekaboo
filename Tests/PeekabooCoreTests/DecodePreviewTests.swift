@@ -294,6 +294,10 @@ final class DecodePreviewTests: XCTestCase {
     /// minus the CPU work that overlaps: measured 3.1–3.6x one decode (1200–6000 px wide; M4 Pro), while the
     /// serialising `ShouldCacheImmediately` path takes ~8x. Asserted: < 4.5x one decode, and faster than
     /// the same 8 decodes through the serialising path.
+    ///
+    /// Each round times one decode, the 8 concurrent ones and the serialising path back to back, so all three see
+    /// the same machine load; the best of 5 rounds counts. A shared CI runner can be busy for one measurement and
+    /// idle for the next (once 5.1x, against 2.1–3.4x otherwise), but a decoder that serialises is ~8x in every round.
     func testConcurrentBaselineDecodesDoNotSerialise() throws {
         var urls: [URL] = []
         for i in 0..<8 {
@@ -315,32 +319,33 @@ final class DecodePreviewTests: XCTestCase {
             }
         }
         func concurrentWall(_ body: @escaping (URL) throws -> Void) -> Double {
-            var walls: [Double] = []
-            for _ in 0..<3 {
-                let lock = NSLock()
-                var failures = 0
-                let t0 = Trace.now()
-                DispatchQueue.concurrentPerform(iterations: urls.count) { i in
-                    do { try body(urls[i]) } catch { lock.lock(); failures += 1; lock.unlock() }
-                }
-                walls.append(Trace.ms(since: t0))
-                XCTAssertEqual(failures, 0)
+            let lock = NSLock()
+            var failures = 0
+            let t0 = Trace.now()
+            DispatchQueue.concurrentPerform(iterations: urls.count) { i in
+                do { try body(urls[i]) } catch { lock.lock(); failures += 1; lock.unlock() }
             }
-            return walls.min() ?? 0
+            XCTAssertEqual(failures, 0)
+            return Trace.ms(since: t0)
         }
         try decode(urls[0])
-        var singles: [Double] = []
-        for url in urls.prefix(5) {
-            let t0 = Trace.now()
-            try decode(url)
-            singles.append(Trace.ms(since: t0))
+        var rounds: [(single: Double, wall: Double, serialised: Double)] = []
+        for round in 0..<5 {
+            var singles: [Double] = []
+            for url in [urls[round % urls.count], urls[(round + 3) % urls.count], urls[(round + 6) % urls.count]] {
+                let t0 = Trace.now()
+                try decode(url)
+                singles.append(Trace.ms(since: t0))
+            }
+            rounds.append((singles.sorted()[1], concurrentWall(decode), concurrentWall(cacheImmediately)))
         }
-        let single = singles.sorted()[singles.count / 2]
-        let wall = concurrentWall(decode)
-        let serialised = concurrentWall(cacheImmediately)
-        print(String(format: "8 concurrent baseline decodes: %.1f ms wall vs %.1f ms single (%.2fx); ShouldCacheImmediately %.1f ms",
-                     wall, single, wall / single, serialised))
-        XCTAssertLessThan(wall, 4.5 * single, "8 concurrent decodes \(wall) ms vs single \(single) ms")
-        XCTAssertLessThan(wall, serialised, "the decoder overlaps decodes that ShouldCacheImmediately serialises")
+        for r in rounds {
+            print(String(format: "8 concurrent baseline decodes: %.1f ms wall vs %.1f ms single (%.2fx); ShouldCacheImmediately %.1f ms",
+                         r.wall, r.single, r.wall / r.single, r.serialised))
+        }
+        let ratio = rounds.map { $0.wall / $0.single }.min() ?? .infinity
+        let overlap = rounds.map { $0.wall / $0.serialised }.min() ?? .infinity
+        XCTAssertLessThan(ratio, 4.5, "8 concurrent decodes vs one, best of \(rounds.count) rounds: \(rounds)")
+        XCTAssertLessThan(overlap, 1, "the decoder overlaps decodes that ShouldCacheImmediately serialises: \(rounds)")
     }
 }
