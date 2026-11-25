@@ -3,6 +3,7 @@
 # mise runs file tasks from the project root.
 set -euo pipefail
 source .mise/lib/signing.sh
+load_release_env  # the notarytool credentials: the release task runs this one as a child and exports nothing
 APP=build/Peekaboo.app
 [[ -d "$APP" ]] || ./.mise/tasks/app
 VERSION="$(plutil -extract CFBundleShortVersionString raw -o - "$APP/Contents/Info.plist")"
