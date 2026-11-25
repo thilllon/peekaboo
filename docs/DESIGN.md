@@ -218,7 +218,9 @@ the user is not skimming past it), an `AnimationPlayer` takes over. Stills never
   NETSCAPE extension plays once), the last frame stays after the last play.
 - **Decoding**: one serial queue, in order, into a page-granular pool of the player's own. When all frames fit
   `min(screen budget / 8, 256 MB)` each is decoded once and kept (later loops decode nothing); otherwise a window of up to
-  8 frames ahead. Corpus: 400×400 GIF 0.8 ms / WebP 11 ms per frame, 44 frames = 27.5 MB kept.
+  8 frames ahead. Corpus: 400×400 GIF 0.8 ms / WebP 11 ms per frame, 44 frames = 27.5 MB kept. Frames are canvas-sized,
+  so an animation one frame of which does not fit that budget stays a still (`AnimationPlayer.fits`: an 11 KB WebP
+  declaring a 12000×12000 canvas kept 1.1 GB of frames, a 2.3 GB footprint, 0.5 s per frame).
 - **Known limit — animated WebP**: ImageIO re-composites a WebP from its first frame for every frame it returns (with any
   caching option, and in its own `CGAnimateImageAtURLWithBlock` too), so frame *i* costs O(*i*): the corpus WebP grows
   from 3 to 31 ms per frame over its 44 frames, a 1920×1080 × 50-frame one from 34 to 309 ms (8.3 s per loop, M4 Pro).

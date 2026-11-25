@@ -91,6 +91,18 @@ final class AnimationTests: XCTestCase {
         }
     }
 
+    /// Frames are composited at canvas size: an animation plays only if one frame fits the budget.
+    func testOnlyFramesThatFitTheBudgetPlay() {
+        func info(_ w: Int, _ h: Int) -> ImageInfo {
+            ImageInfo(pixelWidth: w, pixelHeight: h, orientation: .up, typeIdentifier: "org.webmproject.webp", hasAlpha: false,
+                      hasGainMap: false, frameCount: 2, colorProfileName: nil, exif: [:])
+        }
+        XCTAssertTrue(AnimationPlayer.fits(info(3840, 2160), budgetBytes: 256 << 20))
+        XCTAssertTrue(AnimationPlayer.fits(info(8192, 8192), budgetBytes: 256 << 20))
+        XCTAssertFalse(AnimationPlayer.fits(info(12000, 12000), budgetBytes: 256 << 20), "an 11 KB WebP can declare this canvas")
+        XCTAssertFalse(AnimationPlayer.fits(info(3840, 2160), budgetBytes: 16 << 20), "4K frames on a small-memory Mac")
+    }
+
     // MARK: Composited frames
 
     /// ImageIO composites GIF frames; it declares the last one opaque although "restore to background" left its

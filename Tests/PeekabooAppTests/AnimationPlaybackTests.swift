@@ -10,17 +10,17 @@ import XCTest
 /// (Frames advancing on the display link need an awake display: the headless pacing is in `AnimationTests` and
 /// `peekaboo-bench anim`.)
 final class AnimationPlaybackTests: ViewerTestCase {
-    /// Four 96×64 frames: red, green, blue, white, 100 ms each, looping.
-    private func writeGIF(_ url: URL) throws -> URL {
+    /// Four frames (96×64 by default): red, green, blue, white, 100 ms each, looping.
+    private func writeGIF(_ url: URL, width: Int = 96, height: Int = 64) throws -> URL {
         let colours: [(CGFloat, CGFloat, CGFloat)] = [(1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 1, 1)]
         let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(url as CFURL, "com.compuserve.gif" as CFString, 4, nil))
         CGImageDestinationSetProperties(destination, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
         let space = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))
         for (r, g, b) in colours {
-            let context = try XCTUnwrap(CGContext(data: nil, width: 96, height: 64, bitsPerComponent: 8, bytesPerRow: 0, space: space,
-                                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+            let context = try XCTUnwrap(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                                  space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
             context.setFillColor(CGColor(colorSpace: space, components: [r, g, b, 1])!)
-            context.fill(CGRect(x: 0, y: 0, width: 96, height: 64))
+            context.fill(CGRect(x: 0, y: 0, width: width, height: height))
             CGImageDestinationAddImage(destination, try XCTUnwrap(context.makeImage()),
                                        [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: 0.1]] as CFDictionary)
         }
@@ -102,6 +102,19 @@ final class AnimationPlaybackTests: ViewerTestCase {
         XCTAssertEqual(toastText(viewer), "Playing")
         viewer.perform(.playPause)
         XCTAssertEqual(player(viewer)?.isPlaying, false)
+    }
+
+    /// An animation whose composited frame does not fit the animation budget (a 64 MB cache: ~3.7 MB) shows as a still.
+    func testAnimationsTooLargeForTheBudgetStayStills() throws {
+        let gif = try writeGIF(folder.appendingPathComponent("big.gif"), width: 1200, height: 1200)
+        let viewer = try makeViewer(toml: "[cache]\nmemory_mb = 64\n")
+        openAndWait(viewer, [gif])
+        let info = try XCTUnwrap(viewer.pipeline.info(for: try XCTUnwrap(viewer.pipeline.currentFile)))
+        XCTAssertTrue(info.isAnimated)
+        XCTAssertFalse(AnimationPlayer.fits(info, budgetBytes: min(viewer.pipeline.config.screenBudget / 8, 256 << 20)))
+        viewer.perform(.playPause)
+        XCTAssertNil(player(viewer))
+        XCTAssertEqual(toastText(viewer), "Too large to animate")
     }
 
     func testStillsNeverGetAPlayer() throws {

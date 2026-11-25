@@ -1097,7 +1097,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// `file` shows its first pixels: play it if it is an animation, once a skim past it is over and while the window is
     /// visible (`visibilityChanged` starts it later). `asked`: a play / step action, which starts it in any case.
     private func startAnimationIfNeeded(_ file: ImageFile, asked: Bool = false) {
-        guard player == nil, file == pipeline.currentFile, let info = pipeline.info(for: file), info.isAnimated else { return }
+        guard player == nil, file == pipeline.currentFile, let info = pipeline.info(for: file), info.isAnimated,
+              AnimationPlayer.fits(info, budgetBytes: animationBudget) else { return }
         startAnimationWork?.cancel()
         startAnimationWork = nil
         guard asked || isWindowVisible else { return }
@@ -1189,7 +1190,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         // An animation that has not started yet (a skim just ended on it, the window was hidden) starts playing.
         let wasPlaying = self.player?.isPlaying ?? false
         guard let player = currentPlayer() else {
-            hud.showToast("Not an animation")
+            hud.showToast(noPlayerToast)
             return
         }
         pausedWhileHidden = false
@@ -1205,12 +1206,19 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
 
     private func stepFrame(_ delta: Int) {
         guard let player = currentPlayer() else {
-            hud.showToast("Not an animation")
+            hud.showToast(noPlayerToast)
             return
         }
         pausedWhileHidden = false
         if let frame = player.step(delta) { showFrame(frame, index: player.index, playing: false) }
         animationStateChanged()
+    }
+
+    /// Why a play / step key found no player: the image is a still, or an animation too large to play.
+    private var noPlayerToast: String {
+        guard let file = pipeline.currentFile, let info = pipeline.info(for: file), info.isAnimated,
+              !AnimationPlayer.fits(info, budgetBytes: animationBudget) else { return "Not an animation" }
+        return "Too large to animate"
     }
 
     private var isWindowVisible: Bool {

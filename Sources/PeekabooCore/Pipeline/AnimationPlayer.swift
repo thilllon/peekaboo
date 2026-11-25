@@ -85,6 +85,13 @@ public final class AnimationPlayer {
     /// Whether every frame is kept once decoded (otherwise a window ahead of the shown frame).
     public var keepsAllFrames: Bool { keepAll }
 
+    /// Whether `info` plays within `budgetBytes` at all: one composited frame must fit (the window keeps at least two).
+    /// Frames are composited at canvas size, so a crafted 11 KB WebP with a 12000×12000 canvas kept 1.1 GB of frames
+    /// (2.3 GB footprint, 0.5 s per frame); such files show their first frame like a still.
+    public static func fits(_ info: ImageInfo, budgetBytes: Int) -> Bool {
+        info.pixelWidth * info.pixelHeight * 4 <= budgetBytes
+    }
+
     /// Frame `i` as an image in the file's geometry, if it is decoded.
     public func frame(_ i: Int) -> DecodedImage? {
         guard frames.indices.contains(i), let pixels = frames[i] else { return nil }
