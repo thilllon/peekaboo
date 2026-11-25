@@ -21,6 +21,9 @@ first by launch-to-first-pixel, next/previous latency, time to sharp and zoom/pa
   personal e-mail addresses, absolute home paths (`/Users/<name>/…`), agent scratch paths.
   `gitleaks` (config: `.gitleaks.toml`) runs on every commit and push via lefthook and in CI.
   Never bypass it (`--no-verify`, `LEFTHOOK=0`); remove the offending content instead.
+- **Env files**: real values only in untracked `.env.<name>` files (e.g. `.env.production`, mode 600);
+  the committed `.env.example` lists the same keys with empty values. Signing private keys never go in
+  any env file: they stay in the login keychain and the `AuthKey_*.p8` file (mode 600, outside the repo).
 - Commit messages: imperative subject line.
 - **No AI attribution anywhere**: no `Co-Authored-By` trailers, no "Generated with …" lines, no agent session
   URLs or IDs in commits, PR titles/descriptions, issues, comments or release notes.
