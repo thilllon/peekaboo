@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/thilllon/peekaboo/releases/latest/download/Peekaboo.dmg"><b>Download Peekaboo.dmg</b></a> ·
+  <a href="https://github.com/thilllon/peekaboo/releases/latest"><b>Download Peekaboo</b></a> ·
   <a href="https://thilllon.github.io/projects/peekaboo/">Website</a> ·
   <a href="docs/CONFIG.md">Configuration</a> ·
   <a href="docs/DESIGN.md">Design</a>
@@ -70,11 +70,10 @@ Everything below was measured on a MacBook Pro M4 Pro (see [docs/research.md](do
 
 ## Install
 
-1. Download [Peekaboo.dmg](https://github.com/thilllon/peekaboo/releases/latest/download/Peekaboo.dmg) (the volume is named
-   after the version, e.g. "Peekaboo 20261125-ab2342") and drag Peekaboo to Applications.
-2. Releases are signed with a Developer ID and notarized by Apple, so Peekaboo opens like any other app. (The first release,
-   0.1.0, was not: if macOS refuses to open it, use **System Settings → Privacy & Security → Open Anyway**, or install the
-   current release.)
+1. Download `Peekaboo-<version>.dmg` from the [latest release](https://github.com/thilllon/peekaboo/releases/latest)
+   (the volume is named after the version too, e.g. "Peekaboo 20261125-ab2342") and drag Peekaboo to Applications.
+2. Releases are signed with a Developer ID and notarized by Apple, so Peekaboo opens like any other app, and they update
+   themselves.
 3. Optional: make it the default viewer with Finder → Get Info → Open with → Peekaboo → Change All.
 
 Requires macOS 14 (Sonoma) or later on Apple Silicon.

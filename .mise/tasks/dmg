@@ -16,7 +16,7 @@ NOTARY=0
 IDENTITY="$(sign_identity)"
 [[ "$IDENTITY" == - ]] && IDENTITY=DEVELOPER_ID_APPLICATION  # a dry run without a certificate
 
-rm -f build/Peekaboo-*.zip build/Peekaboo-*.dmg
+rm -f build/Peekaboo-*.zip build/Peekaboo-*.dmg build/Peekaboo.dmg
 # The app: sign (app task) → zip → notarize → staple → zip again, so the zip carries the ticket.
 ditto -c -k --keepParent "$APP" "$ZIP"
 if [[ $NOTARY == 1 ]]; then

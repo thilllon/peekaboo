@@ -4,6 +4,24 @@ pre-commit:
   commands:
     gitleaks:
       run: gitleaks git --config .gitleaks.toml --pre-commit --staged --redact --no-banner -v
+    author-email:
+      # Public commits carry the author's e-mail: only the GitHub noreply address. A clone without this repo's git
+      # config would otherwise use the global, personal one.
+      run: |
+        if ! git var GIT_AUTHOR_IDENT | grep -q '@users\.noreply\.github\.com>'; then
+          echo "The commit author must be the GitHub noreply address: git config user.email <id>+<login>@users.noreply.github.com" >&2
+          exit 1
+        fi
+
+commit-msg:
+  commands:
+    no-ai-attribution:
+      # AGENTS.md: no AI attribution anywhere (Co-Authored-By trailers, "Generated with …" lines, agent session URLs).
+      run: |
+        if grep -qiE '^(co-authored-by|claude-session):|claude\.ai/code|generated with \[?claude' "{1}"; then
+          echo "Remove the AI attribution lines from the commit message (AGENTS.md: no AI attribution)." >&2
+          exit 1
+        fi
 
 pre-push:
   commands:

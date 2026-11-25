@@ -24,7 +24,8 @@ first by launch-to-first-pixel, next/previous latency, time to sharp and zoom/pa
 - **Env files**: real values only in untracked `.env.<name>` files (e.g. `.env.production`, mode 600);
   the committed `.env.example` lists the same keys with empty values. Signing private keys never go in
   any env file: they stay in the login keychain and the `AuthKey_*.p8` file (mode 600, outside the repo).
-- Commit messages: imperative subject line.
+- Commit messages: imperative subject line. The lefthook hooks reject a commit whose author is not the GitHub noreply
+  address or whose message carries AI attribution.
 - **No AI attribution anywhere**: no `Co-Authored-By` trailers, no "Generated with …" lines, no agent session
   URLs or IDs in commits, PR titles/descriptions, issues, comments or release notes.
 - One GitHub issue per workstream; PR descriptions say `Closes #N`. Merge only when
@@ -117,8 +118,10 @@ One-time setup on the maintainer's Mac (never commit any of it):
 3. zips it, notarizes the zip, staples the app and zips it again: `Peekaboo-<v>.zip`, the updater's payload;
 4. builds `Peekaboo-<v>.dmg` (volume `Peekaboo <v>`, the app and an Applications link), signs, notarizes, staples it;
 5. writes `latest.json` (`version`, `build`, `minimumSystemVersion`, `url`, `sha256`, `size`, `dmg`, `notes`, `published`);
-6. tags `v<version>`, pushes the tag and publishes the GitHub Release with `Peekaboo-<v>.dmg`, `Peekaboo.dmg` (same bytes, for the
-   README's `releases/latest/download/Peekaboo.dmg` link), `Peekaboo-<v>.zip` and `latest.json`.
+6. tags the commit it built as `v<version>` (it stops if the checkout changed meanwhile), pushes the tag and publishes the
+   GitHub Release with `Peekaboo-<v>.dmg`, `Peekaboo-<v>.zip` and `latest.json`. Every download carries its version: there is
+   no unversioned `Peekaboo.dmg`. Notes are generated, or taken from `NOTES_FILE=<file>`. The tagger must be the GitHub
+   noreply address (`git config user.email`).
 
 Without a Developer ID it refuses to publish unless `ALLOW_ADHOC=1` (other Macs then need "Open Anyway").
 `DRY_RUN=1 mise run release` builds and packages everything (ad-hoc without a certificate) and prints the
