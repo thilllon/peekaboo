@@ -80,6 +80,8 @@ public struct PipelineStats: Sendable, Equatable {
     public var quickLookPreviews = 0
     /// Files whose decoded tiers were dropped because the file changed on disk after it was decoded.
     public var changedOnDisk = 0
+    /// Early, approximate renditions shown while the image's exact tier was still decoding.
+    public var partials = 0
     public init() {}
 }
 
@@ -105,7 +107,8 @@ public final class ImagePipeline {
     /// Navigation model (cursor, direction, velocity, A/B toggle).
     public private(set) var navigation = NavModel()
 
-    /// A tier of `file` finished decoding (main thread). Fires for prefetched files too.
+    /// A tier of `file` finished decoding (main thread). Fires for prefetched files too, and for early renditions of the
+    /// current image (`DecodedImage.isApproximate`, never cached) while its exact tier decodes.
     public var onDecoded: ((ImageFile, DecodedImage) -> Void)?
     /// Decoding `file` failed (main thread).
     public var onFailed: ((ImageFile, Error) -> Void)?
@@ -461,6 +464,11 @@ public final class ImagePipeline {
         let current = files[index].url
         let visible: Set<JobKey> = isCached(index, .screen) ? []
             : [JobKey(url: current, tier: .preview), JobKey(url: current, tier: .screen)]
+        // Early renditions are worth their extra core only for what the user is waiting for: the current image's screen
+        // tier, and its full resolution once asked for.
+        var partial: Set<JobKey> = []
+        if !isCached(index, .screen) { partial.insert(JobKey(url: current, tier: .screen)) }
+        if fullRequested == current, !isCached(index, .full) { partial.insert(JobKey(url: current, tier: .full)) }
         for planned in plan.jobs {
             let j = planned.index
             let file = files[j]
@@ -475,7 +483,7 @@ public final class ImagePipeline {
                 lane: planned.quickLook ? .general : lane(j, planned.tier), targetLongSide: target,
                 estimateMs: estimate(j, planned.tier), quickLook: planned.quickLook, info: slots[j].info))
         }
-        scheduler.submit(jobs, visible: visible)
+        scheduler.submit(jobs, visible: visible, partial: partial)
         armWake(afterMs: plan.wakeAfterMs)
         if config.readAhead { issueReadAhead(plan, skimming: navigation.isSkimming(now: now, tuning: tuning)) }
         if Trace.enabled {
@@ -535,6 +543,7 @@ public final class ImagePipeline {
     }
 
     private func handle(_ outcome: DecodeOutcome) {
+        if outcome.partial { return handlePartial(outcome) }
         let key = outcome.job.key
         scheduler.acknowledge(key)
         defer { scheduleReplan() }
@@ -605,6 +614,21 @@ public final class ImagePipeline {
             // A failed preview is silent: the screen tier may still succeed.
             if key.tier != .preview { onFailed?(file, error) }
         }
+    }
+
+    /// An early rendition from a decode still running: shown while it is the current image's best, never cached (the
+    /// job delivers the exact tier, which replaces it). Pixels of another version of the file than the listed one are
+    /// dropped. The file the app opens is decoded before its folder is listed (a placeholder without size or date, and
+    /// the listing lands during the decode): what the worker's `stat` saw before decoding is compared instead.
+    private func handlePartial(_ outcome: DecodeOutcome) {
+        let key = outcome.job.key
+        guard case .success(let image) = outcome.result, let i = position(of: key.url, name: outcome.job.file.name),
+              i == index, !isCached(i, key.tier) else { return }
+        if let listed = FileStamp(files[i]), let decoded = outcome.stamp ?? FileStamp(outcome.job.file), decoded != listed {
+            return
+        }
+        stats.partials += 1
+        onDecoded?(files[i], image)
     }
 
     /// Late results are cached only if still useful (research a2 §4 `keep`).

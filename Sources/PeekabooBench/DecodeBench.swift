@@ -108,6 +108,9 @@ func runDecodeBench(_ args: ArraySlice<String>) throws {
             outs.append(out)
         }
         print(row + "  " + outs.joined(separator: " / "))
+        if !skeleton, let early = earlyRendition(url, decoder: decoder, screen: screen, iters: iters, pool: pool) {
+            print(pad("", 46) + "  " + early)
+        }
     }
     print(pad("TOTAL (sum of medians)", 46) + lpad(String(format: "%.1f", totals[0]), 8)
           + totals.dropFirst().map { lpad(String(format: "%.1f", $0), 9) }.joined())
@@ -173,6 +176,64 @@ private func writePNG(_ p: PixelBuffer, to url: URL) {
           let destination = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) else { return }
     CGImageDestinationAddImage(destination, image, nil)
     CGImageDestinationFinalize(destination)
+}
+
+/// The first early rendition a decode hands its sink, and when (ms after the decode began).
+private final class EarlyCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var captured: (DecodedImage, Double)?
+
+    func set(_ image: DecodedImage, ms: Double) {
+        lock.lock(); defer { lock.unlock() }
+        if captured == nil { captured = (image, ms) }
+    }
+
+    var result: (DecodedImage, Double)? {
+        lock.lock(); defer { lock.unlock() }
+        return captured
+    }
+}
+
+/// The screen tier as the image on screen gets it (a sink that always wants an early rendition): when the early
+/// rendition lands, beside the exact decode, and its PSNR against that exact tier. Nil for files without one.
+private func earlyRendition(_ url: URL, decoder: ImageDecoder, screen: Int, iters: Int, pool: PixelBufferPool) -> String? {
+    var times: [Double] = []
+    var exactTimes: [Double] = []
+    var quality = Double.nan
+    for _ in 0..<iters {
+        autoreleasepool {
+            let capture = EarlyCapture()
+            let t0 = Trace.now()
+            let sink = PartialSink(wanted: { true }, deliver: { capture.set($0, ms: Trace.ms(since: t0)) })
+            guard let exact = try? decoder.decode(url, tier: .screen, targetLongSide: screen, pool: pool, partial: sink) else {
+                return
+            }
+            exactTimes.append(Trace.ms(since: t0))
+            guard let (early, ms) = capture.result else { return }
+            times.append(ms)
+            if quality.isNaN { quality = psnr(early.pixels, exact.pixels) }
+        }
+    }
+    guard !times.isEmpty else { return nil }
+    return String(format: "early rendition (first-pass scans) %.1f ms, %.2f dB PSNR vs the exact screen tier (%.1f ms beside it)",
+                  median(times), quality, median(exactTimes))
+}
+
+/// PSNR (dB) of the colour channels of two 8-bit buffers of the same size and layout.
+private func psnr(_ a: PixelBuffer, _ b: PixelBuffer) -> Double {
+    guard a.width == b.width, a.height == b.height, a.layout == b.layout, a.layout.bytesPerPixel == 4 else { return .nan }
+    let alpha = a.layout == .argb8 ? 0 : 3
+    var squared: UInt64 = 0
+    for y in 0..<a.height {
+        let pa = a.baseAddress.advanced(by: y * a.bytesPerRow).assumingMemoryBound(to: UInt8.self)
+        let pb = b.baseAddress.advanced(by: y * b.bytesPerRow).assumingMemoryBound(to: UInt8.self)
+        for i in 0..<(a.width * 4) where i % 4 != alpha {
+            let d = Int(pa[i]) - Int(pb[i])
+            squared += UInt64(d * d)
+        }
+    }
+    let mse = Double(squared) / Double(a.width * a.height * 3)
+    return mse == 0 ? .infinity : 10 * log10(255 * 255 / mse)
 }
 
 private func median(_ values: [Double]) -> Double {
@@ -362,6 +423,16 @@ private func runVariants(_ files: [URL], decoder: ImageDecoder, pool: PixelBuffe
         guard let info = try? decoder.probe(url) else { continue }
         let format = info.exif["format"] ?? ""
         let heif = ["HEIC", "HEIF", "AVIF"].contains(format)
+        if format == "PNG" {
+            print("\(url.lastPathComponent) (PNG, \(info.pixelWidth)x\(info.pixelHeight))")
+            let full = time {
+                guard let image = try? decoder.decode(url, tier: .full, targetLongSide: 0, pool: pool) else { return "error" }
+                return "\(image.pixels.width)x\(image.pixels.height)"
+            }
+            print("  .full (own decoder) \(full)   ImageIO iosurface /1 \(time { surface(url, 1) })")
+            print("  pixels vs ImageIO: \(comparePNG(url, decoder: decoder, pool: pool))")
+            continue
+        }
         guard format.hasPrefix("JPEG progressive") || heif else { continue }
         print("\(url.lastPathComponent) (\(format), \(info.pixelWidth)x\(info.pixelHeight))")
         for factor in heif ? [2, 4, 8] : [1, 2, 4, 8] {
@@ -375,4 +446,35 @@ private func runVariants(_ files: [URL], decoder: ImageDecoder, pool: PixelBuffe
             print("  libjpeg-turbo .screen at half size \(time { tier(url, (long + 1) / 2) })")
         }
     }
+}
+
+/// The decoder's full-resolution PNG against ImageIO's (IOSurface SPI: BGRA 8-bit or 'l64r' RGBA 16-bit, straight
+/// alpha): identical sample values, or how many differ.
+private func comparePNG(_ url: URL, decoder: ImageDecoder, pool: PixelBufferPool) -> String {
+    guard let ours = try? decoder.decode(url, tier: .full, targetLongSide: 0, pool: pool).pixels,
+          let surfaceSPI, let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let theirs = surfaceSPI(source, 0, [kCGImageSourceShouldCache: false] as CFDictionary)?.takeRetainedValue(),
+          IOSurfaceGetWidth(theirs) == ours.width, IOSurfaceGetHeight(theirs) == ours.height else { return "not comparable" }
+    IOSurfaceLock(theirs, .readOnly, nil)
+    defer { IOSurfaceUnlock(theirs, .readOnly, nil) }
+    let wide = ours.layout == .rgba16
+    guard IOSurfaceGetBytesPerElement(theirs) == (wide ? 8 : 4) else { return "ImageIO layout differs" }
+    var differing = 0, worst = 0
+    for y in 0..<ours.height {
+        let a = ours.baseAddress.advanced(by: y * ours.bytesPerRow)
+        let b = IOSurfaceGetBaseAddress(theirs).advanced(by: y * IOSurfaceGetBytesPerRow(theirs))
+        for x in 0..<ours.width {
+            for c in 0..<4 {
+                // Ours: R, G, B, A. ImageIO 8-bit: B, G, R, A; 16-bit: R, G, B, A.
+                let other = wide || c == 1 || c == 3 ? c : 2 - c
+                let d = wide
+                    ? abs(Int(a.load(fromByteOffset: 8 * x + 2 * c, as: UInt16.self))
+                          - Int(b.load(fromByteOffset: 8 * x + 2 * other, as: UInt16.self)))
+                    : abs(Int(a.load(fromByteOffset: 4 * x + c, as: UInt8.self))
+                          - Int(b.load(fromByteOffset: 4 * x + other, as: UInt8.self)))
+                if d > 0 { differing += 1; worst = max(worst, d) }
+            }
+        }
+    }
+    return differing == 0 ? "identical (\(ours.width)x\(ours.height) \(ours.layout))" : "\(differing) samples differ, max \(worst)"
 }

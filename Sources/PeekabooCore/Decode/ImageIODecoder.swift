@@ -1,3 +1,4 @@
+import CPeekabooDecode
 import CoreGraphics
 import Foundation
 import ImageIO
@@ -9,10 +10,11 @@ import IOSurface
 /// | Source | `.preview` | `.screen` | `.full` |
 /// |---|---|---|---|
 /// | baseline JPEG | MPF large thumbnail, else EXIF thumbnail, else IOSurface SPI /≤4 | IOSurface SPI, power-of-two subsample (≤ 4) covering the target | IOSurface SPI |
-/// | progressive JPEG | MPF large thumbnail, else EXIF thumbnail, else ImageIO /8 (DC-only) | libjpeg-turbo, DCT scale covering the target | libjpeg-turbo |
+/// | progressive JPEG | MPF large thumbnail, else EXIF thumbnail, else ImageIO /8 (DC-only) | libjpeg-turbo, DCT scale covering the target; on screen, the first-pass scans first (approximate, beside it) | libjpeg-turbo (same early rendition when zoomed) |
 /// | HEIC / HEIF / AVIF | thumbnail item, else IOSurface SPI /≤4 | IOSurface SPI /≤4 | IOSurface SPI |
 /// | camera RAW | embedded preview (CR3: own ISO-BMFF parse) | embedded preview at the target size if it covers it, else RAW decode /n | RAW decode (16-bit) |
-/// | PNG, WebP, TIFF, … | thumbnail (`Always`) | IOSurface SPI /n | IOSurface SPI |
+/// | PNG (RGB, RGBA, palette; not interlaced) | own decoder (`CPeekabooDecode`), box filter /n | own decoder, box filter /n covering the target | own decoder (16-bit stays 16-bit) |
+/// | other PNG, WebP, TIFF, … | thumbnail (`Always`) | IOSurface SPI /n | IOSurface SPI |
 ///
 /// Every path hands over pixels in their native layout (no CPU colour or format conversion) and
 /// creates its own `CGImageSource`, so concurrent calls are independent. Whenever the private
@@ -82,11 +84,18 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
     }
 
     public func decode(_ url: URL, tier: Tier, targetLongSide: Int, pool: PixelBufferPool) throws -> DecodedImage {
+        try decode(url, tier: tier, targetLongSide: targetLongSide, pool: pool, partial: nil)
+    }
+
+    public func decode(_ url: URL, tier: Tier, targetLongSide: Int, pool: PixelBufferPool, partial: PartialSink?) throws
+        -> DecodedImage {
         let start = Trace.now()
         return try autoreleasepool {
             let probe = try DecodeProbe.make(url: url, cache: probes)
             let target = tier == .full ? 0 : max(16, targetLongSide)
-            let output = try decode(probe, url: url, tier: tier, target: target, pool: pool)
+            let early = tier == .preview ? nil : partial.map { EarlyRendition(sink: $0, url: url, tier: tier, start: start) }
+            defer { early?.finish() }
+            let output = try decode(probe, url: url, tier: tier, target: target, pool: pool, early: early)
             let nanos = Trace.now() - start
             Trace.log("decode \(url.lastPathComponent) \(tier) via \(output.path): \(output.pixels.width)x\(output.pixels.height) "
                       + "\(output.pixels.layout) \(String(format: "%.2f", Double(nanos) / 1e6)) ms")
@@ -128,14 +137,16 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
         let path: String
     }
 
-    private func decode(_ probe: DecodeProbe, url: URL, tier: Tier, target: Int, pool: PixelBufferPool) throws -> Output {
+    private func decode(_ probe: DecodeProbe, url: URL, tier: Tier, target: Int, pool: PixelBufferPool,
+                        early: EarlyRendition?) throws -> Output {
         let info = probe.info
         if Self.decodeHDR, info.hasGainMap, tier != .preview, let hdr = hdrDecode(probe, target: target, pool: pool) {
             return hdr
         }
         switch probe.kind {
         case .jpeg(let scan):
-            return try decodeJPEG(probe, scan: scan, url: url, data: nil, tier: tier, target: target, pool: pool)
+            return try decodeJPEG(probe, scan: scan, url: url, data: nil, tier: tier, target: target, pool: pool,
+                                  early: early)
         case .heif:
             if tier == .preview, probe.hasThumbnailItem, let thumb = embeddedThumbnail(probe, maxPixel: target, pool: pool) {
                 return thumb
@@ -150,11 +161,58 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
         case .raw(let cr3):
             return try decodeRAW(probe, cr3: cr3, url: url, tier: tier, target: target, pool: pool)
         case .other:
+            if info.typeIdentifier == "public.png", let output = try png(probe, url: url, target: target, pool: pool) {
+                return output
+            }
             if tier == .preview {
                 if let thumb = thumbnail(probe, maxPixel: target, always: true, pool: pool, path: "thumbnail") { return thumb }
             }
             return try surfaceOrPublic(probe, subsample: subsample(probe, target), pool: pool)
         }
+    }
+
+    // MARK: PNG
+
+    /// PNG through `CPeekabooDecode`: streaming zlib inflate on a second thread, branchless unfiltering on this one,
+    /// the samples as stored (RGBA 8-bit, or 16-bit at full size), box-filtered by the power of two (≤ 8) covering
+    /// `target`. 24 MP RGB: 143–154 ms vs 303–334 ms through ImageIO (whose subsample factor saves nothing), the same
+    /// sample values. Prefetch takes the second thread too: one-thread decodes (~200 ms) left fewer previews ready while
+    /// skimming a PNG folder (first pixel p90 108–123 vs 24–32 ms). Nil hands the file to ImageIO: grayscale (ImageIO's
+    /// gray colour space and converting draw), Adam7, APNG, anything malformed or out of range.
+    private func png(_ probe: DecodeProbe, url: URL, target: Int, pool: PixelBufferPool) throws -> Output? {
+        guard let bytes = try? Data(contentsOf: url, options: [.alwaysMapped]) else { return nil }
+        return try bytes.withUnsafeBytes { raw -> Output? in
+            guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return nil }
+            var header = pb_png_info()
+            guard pb_png_read_info(base, raw.count, &header) == PB_PNG_OK else { return nil }
+            let factor = Self.coveringSubsample(long: Int(max(header.width, header.height)), target: target)
+            let wide = pb_png_output_bytes_per_pixel(&header, UInt32(factor)) == 8
+            let alpha: AlphaMode = header.has_alpha == 0 ? .opaque : factor == 1 ? .straight : .premultiplied
+            guard let pixels = pool.make(width: Int(pb_png_scaled(header.width, UInt32(factor))),
+                                         height: Int(pb_png_scaled(header.height, UInt32(factor))),
+                                         layout: wide ? .rgba16 : .rgba8, alpha: alpha, colorSpace: pngSpace(probe)) else {
+                throw DecodeError.outOfMemory
+            }
+            let status = pb_png_decode(base, raw.count, UInt32(factor), pixels.baseAddress.assumingMemoryBound(to: UInt8.self),
+                                       pixels.bytesPerRow, 2)
+            guard status == PB_PNG_OK else { return nil }
+            return Output(pixels: pixels, orientation: probe.info.orientation, path: "png /\(factor)")
+        }
+    }
+
+    /// The colour space ImageIO gives the PNG (sRGB when untagged, the iCCP profile, linear sRGB for gAMA 1.0, sRGB for
+    /// gAMA 1/2.2 with or without cHRM; a palette's base space): the fast path changes how samples are decoded, not
+    /// how they are interpreted.
+    private func pngSpace(_ probe: DecodeProbe) -> CGColorSpace {
+        switch probe.info.colorProfileName {
+        case "sRGB IEC61966-2.1": return TurboJPEG.sRGB
+        case "Display P3": return Self.displayP3
+        default: break
+        }
+        guard let space = CGImageSourceCreateImageAtIndex(probe.source, probe.index, DecodeProbe.sourceOptions)?.colorSpace
+        else { return TurboJPEG.sRGB }
+        if space.model == .indexed, let base = space.baseColorSpace, base.model == .rgb { return base }
+        return space.model == .rgb ? space : TurboJPEG.sRGB
     }
 
     private func subsample(_ probe: DecodeProbe, _ target: Int, maxFactor: Int = 8) -> Int {
@@ -164,9 +222,10 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
 
     // MARK: JPEG
 
-    /// `data`: in-memory JPEG (CR3 previews); nil reads `url`.
+    /// `data`: in-memory JPEG (CR3 previews); nil reads `url`. `early`: where the first-pass rendition of a progressive
+    /// JPEG goes while its exact decode runs.
     private func decodeJPEG(_ probe: DecodeProbe, scan: JPEGScan, url: URL, data: Data?, tier: Tier, target: Int,
-                            pool: PixelBufferPool) throws -> Output {
+                            pool: PixelBufferPool, early: EarlyRendition? = nil) throws -> Output {
         let route = Self.jpegRoute(scan)
         if tier == .preview {
             // The largest embedded preview first: an MPF large thumbnail (640–1920 px) beats the 160 px EXIF one.
@@ -195,9 +254,16 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
             // the screen) 255 ms; 101 MP 1/4 616 ms vs 1/2 617 ms. Entropy decoding dominates, so a
             // sub-covering screen tier saves ≤ 7 % yet looks softer, and the renderer then asks for `.full`
             // at fit (it wants a tier ≥ 1.01× the displayed size), which costs the whole decode again.
+            // What does pay off is skipping the refinement scans: the image on screen gets the first-pass rendition
+            // (`EarlyRendition`) from another core in 42–146 ms while this decode runs, unslowed.
             do {
                 let coverage = tier == .screen && scan.coding == .progressive ? Self.progressiveScreenCoverage : 1
-                let pixels = try turbo(url: url, data: data, target: Int((Double(target) * coverage).rounded(.up)), pool: pool)
+                let covering = Int((Double(target) * coverage).rounded(.up))
+                let bytes = try data ?? Data(contentsOf: url, options: [.alwaysMapped])
+                if let early, scan.coding == .progressive, Self.earlyRenditionFits(scan, target: covering) {
+                    early.start(bytes, target: covering, info: probe.info, pool: pool)
+                }
+                let pixels = try bytes.withUnsafeBytes { try TurboJPEG.decode($0, targetLongSide: covering, pool: pool) }
                 return Output(pixels: pixels, orientation: probe.info.orientation, path: "libjpeg-turbo")
             } catch TurboJPEG.Failure.memory {
                 throw DecodeError.outOfMemory
@@ -253,9 +319,17 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
         return n == length ? bytes : nil
     }
 
-    private func turbo(url: URL, data: Data?, target: Int, pool: PixelBufferPool) throws -> PixelBuffer {
-        let bytes = try data ?? Data(contentsOf: url, options: [.alwaysMapped])
-        return try bytes.withUnsafeBytes { try TurboJPEG.decode($0, targetLongSide: target, pool: pool) }
+    /// The early rendition holds a second whole-image coefficient buffer while it decodes (2 bytes per sample, chroma
+    /// planes smaller by their subsampling: 0.6 GB for a 101 MP 4:4:4 file, 71 MB for 24 MP 4:2:0) and its own output
+    /// until the exact tier replaces it (0.4 GB for that 101 MP file's `.full`): only when both together are small
+    /// against physical memory (RAM / 32: 1.5 GB on 48 GB, 256 MB on 8 GB).
+    static func earlyRenditionFits(_ scan: JPEGScan, target: Int,
+                                   physicalMemory: UInt64 = ProcessInfo.processInfo.physicalMemory) -> Bool {
+        let factor = TurboJPEG.coveringScale(width: scan.width, height: scan.height, target: target)
+        let output = Double(TurboJPEG.scaled(scan.width, factor)) * Double(TurboJPEG.scaled(scan.height, factor)) * 4
+        let chroma = Double(max(0, scan.components - 1)) / Double(max(1, scan.lumaH * scan.lumaV))
+        let coefficients = Double(scan.width) * Double(scan.height) * (1 + chroma) * 2
+        return coefficients + output <= Double(physicalMemory) / 32
     }
 
     // MARK: RAW
@@ -410,5 +484,56 @@ public final class ImageIODecoder: ImageDecoder, @unchecked Sendable {
         context.setBlendMode(.copy)
         context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
         return Output(pixels: pixels, orientation: probe.info.orientation, isHDR: true, path: "hdr /\(factor)")
+    }
+}
+
+/// The first-pass rendition of one progressive JPEG decode, made on another core while the exact decode runs and
+/// handed to the sink as an approximate tier. The exact decode is not slowed (screen tier with / without it, medians
+/// of 5 runs: 24 MP 4:4:4 298 / 300 ms, 4:2:0 166 / 164 ms, 101 MP 673 / 682 ms, panorama 932 / 933 ms) and the
+/// rendition lands after 42 ms (24 MP 4:2:0) to 146 ms (22705 px panorama) instead of 164–933 ms.
+final class EarlyRendition: @unchecked Sendable {
+    private let sink: PartialSink
+    private let url: URL
+    private let tier: Tier
+    private let start: UInt64
+    private let lock = NSLock()
+    private var finished = false
+
+    init(sink: PartialSink, url: URL, tier: Tier, start: UInt64) {
+        self.sink = sink
+        self.url = url
+        self.tier = tier
+        self.start = start
+    }
+
+    /// The exact decode is done: a rendition still decoding is dropped.
+    func finish() {
+        lock.lock(); finished = true; lock.unlock()
+    }
+
+    private var isFinished: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return finished
+    }
+
+    /// Decode the first-pass scans of `bytes` at the scale covering `target`, at the caller's QoS, if the sink still
+    /// wants a rendition.
+    func start(_ bytes: Data, target: Int, info: ImageInfo, pool: PixelBufferPool) {
+        guard sink.wanted() else { return }
+        let qos = DispatchQoS.QoSClass(rawValue: qos_class_self()) ?? .userInitiated
+        DispatchQueue.global(qos: qos).async { [self] in
+            // Asked again: on a saturated machine the block may start late, after the user moved on.
+            guard !isFinished, sink.wanted() else { return }
+            let t0 = Trace.now()
+            let decoded = autoreleasepool {
+                try? bytes.withUnsafeBytes { try TurboJPEG.decodeFirstPasses($0, targetLongSide: target, pool: pool) }
+            }
+            guard let pixels = decoded, !isFinished, sink.wanted() else { return }
+            Trace.log("decode \(url.lastPathComponent) \(tier) early first-pass scans: \(pixels.width)x\(pixels.height) "
+                      + String(format: "%.2f ms (%.2f ms after the decode began)", Trace.ms(since: t0), Trace.ms(since: start)))
+            sink.deliver(DecodedImage(pixels: pixels, tier: tier, fullWidth: info.orientedWidth, fullHeight: info.orientedHeight,
+                                      orientation: info.orientation, isHDR: false, decodeNanos: Trace.now() - start,
+                                      isApproximate: true))
+        }
     }
 }

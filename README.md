@@ -33,6 +33,10 @@ Everything below was measured on a MacBook Pro M4 Pro (see [docs/research.md](do
 
 - **Hardware decoding, zero copies.** Baseline JPEGs go through the Apple Silicon JPEG engines (24 MP in 50 ms vs 109 ms for
   libjpeg-turbo), HEIC through the hardware HEVC decoder, and the decoded pixels are handed to the GPU without a single copy.
+- **No slow format left behind.** PNGs go through Peekaboo's own decoder (inflate on one core, unfilter on another),
+  about twice as fast as ImageIO with identical pixels: 24 MP in ~145 ms instead of ~300. Progressive JPEGs, which no
+  hardware decodes, show their first-pass scans while the exact decode finishes on another core: a 101 MP photo looks
+  sharp (52 dB) after 94 ms instead of 680 ms.
 - **The next image is already there.** A predictive prefetcher schedules every decode by *when you will reach that image*,
   scales its look-ahead with how fast you browse, and switches to embedded previews while you hold an arrow key.
   On a 120-photo folder it hits 100 % of steps when browsing steadily and 96 % while holding an arrow key
@@ -111,7 +115,8 @@ mise run install          # build the release app into ~/Applications
 
 | Module | Responsibility |
 |---|---|
-| `PeekabooCore` | decoding routes (ImageIO hardware paths, libjpeg-turbo lane, embedded previews), predictive prefetch scheduler, tiered cache, folder model, config & keymap |
+| `PeekabooCore` | decoding routes (ImageIO hardware paths, libjpeg-turbo lane, own PNG decoder, embedded previews), predictive prefetch scheduler, tiered cache, folder model, config & keymap |
+| `CPeekabooDecode` | C decoders where ImageIO is slow: PNG (system zlib, two-thread pipeline), early renditions of progressive JPEGs |
 | `PeekabooRender` | Metal renderer: zero-copy textures, Lanczos-3 pyramid, residual resampler, colour management, settle-time refinement |
 | `PeekabooApp` | AppKit shell: window, input, HUD, full screen, file actions |
 | `PeekabooBench` | performance regression CLI |

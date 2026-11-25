@@ -68,6 +68,9 @@ brew install jpeg-turbo   # static libturbojpeg linked into PeekabooCore
 
 - `Sources/PeekabooCore` — decoding, tiered cache, prefetch scheduler, folder model,
   config/keymap. No AppKit. Shared contract types live in `Sources/PeekabooCore/Model`.
+- `Sources/CPeekabooDecode` — own C decoders where ImageIO is slow: PNG (system zlib) and the
+  first-pass rendition of progressive JPEGs (libjpeg-turbo). They parse untrusted files: keep
+  every bound checked and the mutation tests (`PNGDecodeTests`, `EarlyRenditionTests`) passing.
 - `Sources/PeekabooRender` — Metal renderer (zero-copy textures, quality pyramid,
   resampling kernels, progressive refinement).
 - `Sources/PeekabooApp` — programmatic AppKit shell (no storyboards, nibs or SwiftUI).

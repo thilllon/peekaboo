@@ -37,7 +37,11 @@ ImageIO facts that drive the routing:
 - Baseline JPEG scale cliffs: `SubsampleFactor 4` is the cheapest reduced decode (24 MP 40 ms, 50–60 MP 90–101 ms);
   `SubsampleFactor 8` and thumbnails ≤ 1024 px are *slower* (they leave the hardware path).
 - JPEG > HW limit (101 MP: 726 ms; 22705 px panorama: 1044 ms) falls back to single-threaded software.
-- PNG (24 MP 268 ms) and WebP (290 ms) have no fast path. HEIC cost is independent of output size (always full decode, HW).
+- PNG (24 MP 300 ms) and WebP (lossy 320 ms, lossless 380 ms) have no fast path, and the subsample factor saves
+  nothing (WebP ignores it; PNG still inflates and unfilters every row). PNG goes to our own decoder (below); WebP stays
+  with ImageIO: libwebp itself, built from source with threads and scaling, is only 16–25 % faster on lossy and not at
+  all on lossless (one token partition: parsing is serial), not worth 35k lines of parser that the OS patches for us.
+  HEIC cost is independent of output size (always full decode, HW).
 - Default outputs are not BGRA (full decode = RGBX, thumbnails = XRGB); converting by drawing costs +62 ms per
   24 MP. **Never convert on the CPU**: `PixelLayout` + texture swizzle cover every native layout.
 - Metadata (`CopyPropertiesAtIndex`) costs 0.07–0.6 ms (RAW 1.3–2.6 ms); creating a source does not read the file.
@@ -45,14 +49,44 @@ ImageIO facts that drive the routing:
 libjpeg-turbo (static, `CTurboJPEG`) on real 24–101 MP photos: 24 MP 109 ms, 60 MP 308 ms, 101 MP 641 ms;
 DCT scaling saves only 10–20% on high-entropy files (Huffman-bound); 10 threads ≈ 40 images/s.
 
+**Progressive JPEG — early rendition.** The refinement scans (successive approximation, Ah > 0) cost most of a
+progressive decode yet only add the low bits of each coefficient: the first-pass scans (23–52 % of the bytes) decode
+in a quarter to a seventh of the time. For the image on screen, the screen-tier decode starts a second libjpeg-turbo
+decode of the file cut after its last first-pass scan (`pb_jpeg_first_pass_end`; block smoothing off) on another core
+and hands it over as an approximate tier (`DecodedImage.isApproximate`) while the exact decode runs, unslowed:
+
+| file (screen tier at 3456 px) | first pixel (DC preview) | early rendition | PSNR vs exact | exact |
+|---|---|---|---|---|
+| 24 MP 4:2:0 (mozjpeg) | 40 ms | 42 ms | 32.1 dB | 164 ms |
+| 24 MP 4:4:4 | 36 ms | 76 ms | 35.5 dB | 300 ms |
+| 101 MP 4:4:4 (1/2) | 0.3 ms (160 px EXIF thumb) | 94 ms | 51.9 dB | 682 ms |
+| 22705 px panorama (1/4) | 0.2 ms (157 px EXIF thumb) | 146 ms | 49.8 dB | 933 ms |
+
+Rejected (measured, docs/research.md): libjpeg buffered-image mode in the same decode (same early time, exact +10 %),
+also skipping only the luma refinements (+1.4–4 dB for 2–4× the time), `TJPARAM_FASTUPSAMPLE`/`FASTDCT` for the
+screen tier (24 MP 4:2:0: −18 % but 38 dB at 100 %, which is that tier), decoding independent scan chains in
+parallel (the luma chain is ≥ 55 % of the work: ≤ 1.4×, needs libjpeg internals).
+
+**PNG — own decoder** (`Sources/CPeekabooDecode/png.c`): truecolour and palette images, 8 and 16 bits, not
+interlaced. The system zlib (as fast as libdeflate here: 127 vs 115 ms for 24 MP, Wuffs 152 ms) inflates on a second
+thread into a ring of rows while the calling thread unfilters (branchless scalar Paeth: 62 ms for 24 MP; libpng-style
+NEON 89 ms, branchy 151 ms) and writes RGBA, box-filtered /2–/8 for reduced tiers (premultiplied when there is alpha).
+24 MP: 143–154 ms at every tier vs ImageIO 303–334 ms (12 MP: 63 vs 118–155 ms), with ImageIO's sample values
+(tests compare every colour type, depth, filter type and tRNS form; the corpus files are identical) and ImageIO's colour
+space. The target builds at `-O3`: SwiftPM's release default `-Os` leaves the unfilter's per-byte loops rolled
+(24 MP 158–167 ms). Grayscale (ImageIO's gray colour space and converting draw), Adam7, APNG and malformed files go to
+ImageIO, and so do values the format leaves undefined, where ImageIO has its own answer: an 8-bit colour key above 255,
+palette indices past the palette.
+
 | Source | `.preview` (≤ 512 px) | `.screen` | `.full` |
 |---|---|---|---|
 | JPEG baseline ≤ HW limit | embedded EXIF/MPF thumb if present (0.2–1 ms); else `Subsample 4` (24 MP 40 ms) — never 8 | `Subsample 2` when W/2 ≥ screen (24 MP 44.6 ms), else full | HW: IOSurface path or lazy decode drawn into own buffer (49.8 ms @ 24 MP) |
-| JPEG progressive | `Subsample 8` (DC-only, 32 ms @ 24 MP, 88 ms @ 101 MP) | libjpeg-turbo 1/2 (253 ms @ 24 MP) | libjpeg-turbo (290 ms @ 24 MP) |
+| JPEG progressive | `Subsample 8` (DC-only, 32 ms @ 24 MP, 88 ms @ 101 MP) | libjpeg-turbo, DCT scale covering the screen (24 MP: full size, 300 ms); on screen the first-pass rendition first (76 ms) | libjpeg-turbo (290 ms @ 24 MP); when zoomed, the same early rendition |
 | JPEG baseline > 102 MP | embedded thumb, else `Subsample 4` | libjpeg-turbo, DCT scale covering the screen | libjpeg-turbo (tiles above 16384 px) |
 | HEIC / HEIF / AVIF | embedded thumbnail item (~2 ms); else thumbnail 1024 (70–76 ms @ 50 MP) | thumbnail at the screen long side (62–73 ms @ 50 MP) | ImageIO full via IOSurface (94–110 ms; 195–227 ms if copied out) |
 | Camera RAW | embedded preview, thumbnail without `Always` (ARW 15, RAF 19, NEF 43 ms); CR3 via own BMFF parse | embedded preview at screen size if it covers the screen (RAF 70, NEF 93 ms), else RAW decode in the background | RAW decode (ProRAW 133 … ARW 61 MP 886 ms), only on zoom |
-| PNG / WebP / TIFF / GIF / JXL / PSD / EXR | thumbnail ≤ 512 (TIFF 23, AVIF 48, PNG 277, WebP 303 ms) | parallel lazy-draw path | parallel lazy-draw path |
+| PNG (RGB, RGBA, palette; not interlaced) | own decoder, box filter /8 (24 MP 143 ms) | own decoder, box filter covering the screen (24 MP 143 ms) | own decoder (16-bit stays 16-bit; 24 MP 145–154 ms) |
+| WebP / TIFF / GIF / JXL / PSD / EXR, other PNG | thumbnail ≤ 512 (TIFF 23, AVIF 48, WebP 350 ms) | IOSurface SPI /n (lazy draw as fallback) | IOSurface SPI (lazy draw as fallback) |
 
 HDR (gain-map HEIC/JPEG): `kCGImageSourceDecodeRequest = DecodeToHDR` (10-bit PQ / half-float) when the screen
 reports EDR headroom > 1, displayed through the EDR path of the renderer. SDR otherwise.
@@ -69,7 +103,14 @@ time-to-sharp equal to no-prefetch.
 - **Windows**: `.screen` ahead `clamp(2 + ⌈250/I_eff⌉, 2, 12)`, behind 2; `.preview` ahead `clamp(4 + ⌈1000/I_eff⌉, 4, 48)`, behind 4.
   Earliest deadline first; a preview runs just before the screen tier of the same image.
 - **Skimming** (`I_eff < 120 ms`): show previews only; the screen tier of the visible image waits for a dwell of
-  `clamp(1.5·EMA, 40, 120) ms`. Skip a screen-tier prefetch that cannot finish before the user passes the image.
+  `clamp(1.5·EMA, 40, 120) ms`. Skip a screen-tier prefetch that cannot finish before the user passes the image, and
+  one of an image already passed unless it is short (≤ 150 ms with every lane busy: hardware JPEG and HEIC decodes):
+  its reversal ETA makes any decode look feasible, but a progressive JPEG or PNG decode started for every image passed
+  fills the lanes and still runs beside the decode of the image the user stops on.
+- **Cost model**: EWMA of measured decode times per (format family by extension, megapixel bucket, tier),
+  normalised by concurrency, seeded from §2. Baseline and progressive JPEGs share a family: told apart, the exact
+  progressive estimate (×1.6 for all lanes busy in the feasibility test) stopped prefetches that do land in time in
+  mixed folders (docs/research.md, "Skimming past progressive JPEGs").
 - **Foreground gate**: while the visible image's decode is queued or running, no new prefetch starts.
 - **Lanes**: 6 decode lanes (one reserved for the visible image), routed by decode path (HW JPEG engine: ≤ 2 in flight;
   CPU/libjpeg-turbo; ImageIO other). 4 background lanes (QoS utility → E-cores) for the folder-wide preview sweep,
@@ -79,7 +120,14 @@ time-to-sharp equal to no-prefetch.
   `.critical` keeps only the current image and nearby previews. `PixelBufferPool` recycles buffers.
 - **Persistent cache**: none of our own (disk is scarce). The QuickLook thumbnail cache (`QLThumbnailGenerator`)
   answers in ~1.2 ms for previously seen files across launches: use it for the preview sweep and race it against the
-  own preview decode.
+  own preview decode. Re-evaluated for the slow formats: with PNG at ~150 ms and the progressive early rendition at
+  40–150 ms, a disk cache of screen renditions (~25 MB each) would only shorten revisits, never a first view.
+- **Early renditions**: a screen or full decode may hand over an approximate version of its tier (progressive JPEG
+  first passes) through a `PartialSink`; the scheduler asks whether it is still wanted (the current image's screen
+  tier until it is sharp, its full tier once requested), the pipeline shows it and never caches it, and the exact tier
+  of the same decode replaces it. Prefetch decodes never make one. A rendition of another version of the file than
+  the listed one is dropped; the file the app opens is decoded before its folder is listed, so the worker's `stat`
+  before the decode is what is compared.
 - **Folder**: `getattrlistbulk` (10k entries with metadata in 8 ms) and a precomputed natural-sort key (7 ms for
   10k names; `localizedStandardCompare` 30 ms). Watch the directory with a `DispatchSource` (0.2–0.6 ms latency).
 - `F_RDADVISE` read-ahead when a file enters a prefetch window.

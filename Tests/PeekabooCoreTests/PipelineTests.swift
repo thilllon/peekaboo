@@ -422,7 +422,7 @@ final class PipelineTests: PipelineTestCase {
             XCTAssertTrue(CGImageDestinationFinalize(destination))
         }
         let files = try FolderScanner.scan(directory)
-        // PNG previews are expensive for our own decoder (≈ 277 ms): only QuickLook may fill them in the background.
+        // PNG previews cost a whole decode (24 MP ≈ 150 ms, inflate-bound): only QuickLook may fill them in the background.
         let decoder = FakeDecoder(latencyMs: [.preview: 300, .screen: 5, .full: 10])
         let pipeline = makePipeline(decoder) { config in
             config.sweepLanes = 2

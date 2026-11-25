@@ -22,6 +22,12 @@ public struct PrefetchTuning: Sendable, Equatable {
     /// Extra ETA of images behind the direction of travel (reversal cost); behind images use I ≥ 300 ms.
     public var reversalMs = 600.0
     public var behindMinIntervalMs = 300.0
+    /// While skimming, the screen tier of an image already passed is prefetched only if its decode takes at most this
+    /// long with every lane busy (estimate × processor-sharing slowdown). Its reversal ETA (≥ 900 ms) makes nearly any
+    /// decode look feasible, but a decode cannot be aborted: a long one (progressive JPEG 160–900 ms, 24 MP PNG
+    /// ~150 ms, both on cores) started for every image passed fills the lanes and is still running beside the decode of
+    /// the image the user stops on. Hardware decodes of baseline JPEG and HEIC (screen tier 25–95 ms) stay.
+    public var skimBehindMaxMs = 150.0
     /// Speculative full resolution for the current image after this dwell, if estimated ≤ `fullMaxCostMs`. While the
     /// user steps at a steady rhythm the dwell is `fullDwellRhythm`·EMA instead (at most `fullDwellMaxMs`): it must
     /// mean "stays longer than usual", or every image's full tier is decoded just before the user leaves it.
@@ -262,7 +268,7 @@ func planPrefetch(_ nav: NavModel, now: UInt64, tuning t: PrefetchTuning, contex
     // Velocity-scaled windows, deadline ordered.
     let k1 = min(max(2 + Int((t.screenLookMs / ie).rounded(.up)), 2), t.screenMaxAhead)
     let k0 = min(max(4 + Int((t.previewLookMs / ie).rounded(.up)), 4), t.previewMaxAhead)
-    var candidates: [(eta: Double, j: Int, tier: Tier)] = []
+    var candidates: [(eta: Double, j: Int, tier: Tier, behind: Bool)] = []
     candidates.reserveCapacity(2 * (k0 + k1))
     let reach = max(k0, k1, t.previewBehind, t.screenBehind)
     if reach >= 1 {
@@ -272,13 +278,13 @@ func planPrefetch(_ nav: NavModel, now: UInt64, tuning t: PrefetchTuning, contex
                 let inScreen = k <= (behind ? t.screenBehind : k1) && e <= t.screenHorizonMs
                 let inPreview = k <= (behind ? t.previewBehind : k0) && e <= t.previewHorizonMs
                 if inScreen { plan.screenWindow.append(j) } else if inPreview { plan.previewWindow.append(j) }
-                if inScreen && !sharp(j) && !c.busy(j, .screen) { candidates.append((e, j, .screen)) }
+                if inScreen && !sharp(j) && !c.busy(j, .screen) { candidates.append((e, j, .screen, behind)) }
                 // Inside the screen window a preview only helps when it is cheap (embedded thumbnail): an expensive
                 // one (a reduced hardware decode) costs as much as the screen tier, lands after it and takes the
                 // engine slot another neighbour's screen tier needed. While skimming the preview is what is shown.
                 let previewWorthIt = !inScreen || skim || !t.screenWindowCheapPreviewsOnly || c.cheapPreview(j)
                 if inPreview && previewWorthIt && !sharp(j) && !c.cached(j, .preview) && !c.busy(j, .preview) {
-                    candidates.append((e - 0.01, j, .preview))
+                    candidates.append((e - 0.01, j, .preview, behind))
                 }
             }
         }
@@ -289,8 +295,12 @@ func planPrefetch(_ nav: NavModel, now: UInt64, tuning t: PrefetchTuning, contex
     let slow = 1 + t.alpha * Double(max(0, c.decodeLanes - 1))
     for candidate in candidates {
         let cost = c.estimate(candidate.j, candidate.tier)
-        // Feasibility: a screen tier that would land after the user has passed the image is waste.
-        if candidate.tier == .screen && skim && work / lanes + cost * slow > candidate.eta + ie { continue }
+        if candidate.tier == .screen && skim {
+            // Feasibility: a screen tier that would land after the user has passed the image is waste.
+            if work / lanes + cost * slow > candidate.eta + ie { continue }
+            // An image already passed: only a short decode (`skimBehindMaxMs`).
+            if candidate.behind && cost * slow > t.skimBehindMaxMs { continue }
+        }
         work += cost
         plan.jobs.append(PlannedJob(index: candidate.j, tier: candidate.tier, prio: candidate.eta, kind: .prefetch))
     }

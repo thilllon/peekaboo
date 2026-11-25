@@ -47,7 +47,8 @@ So the app is Swift/AppKit/Metal/ImageIO, with libjpeg-turbo linked statically f
 - Embedded previews are nearly free: JPEG EXIF thumbnail 0.3–0.5 ms, HEIC thumbnail item ~2 ms, RAW previews
   11 ms (ARW 1616×1080) to 94 ms (NEF full size). CR3 previews are not exposed by ImageIO.
 - Progressive JPEG is never hardware-decoded (24 MP: 310 ms) but `SubsampleFactor 8` takes a DC-only path (32 ms).
-- PNG (24 MP 268 ms) and WebP (290 ms) have no fast path. HEIC always decodes fully (any output size).
+- PNG (24 MP 268 ms) and WebP (290 ms) have no fast path. HEIC always decodes fully (any output size). Both are now
+  measured in detail below ("Slow formats"): PNG has its own decoder, WebP stays with ImageIO.
 - Native outputs are RGBX / XRGB / 16-bit, not BGRA: converting by drawing costs +62 ms per 24 MP, so the renderer
   samples every layout directly via texture swizzles.
 - Metadata is cheap and lazy: 0.07–0.6 ms per file (RAW 1.3–2.6 ms).
@@ -144,3 +145,227 @@ scratch area and are not part of the repo; the decode and render benches are rep
 
 Same decoder, Swift reaches the first frame 11–15 ms sooner; through LaunchServices all variants land at 257–262 ms,
 so staying resident (≈ 65 ms re-open) matters far more than the language.
+
+## Slow formats: progressive JPEG, PNG, WebP (2026-11-25)
+
+Measured on the same Mac while five other workloads shared it (load average 5–11): release builds, medians of ≥ 5
+runs, A/B runs interleaved. Harnesses: `peekaboo-bench decode` (now prints the early rendition and, with `--variants`,
+PNG exactness against ImageIO); the one-off C harnesses lived in a scratch area.
+
+Before / after, `peekaboo-bench decode --iters 5` on the whole corpus, `main` and this change alternating, median of
+5 rounds (ms; preview 512 px, screen 3456 px):
+
+| file | preview | screen | full | early rendition (PSNR) |
+|---|---|---|---|---|
+| PNG 24 MP | 317 → **164** | 281 → **154** | 277 → **153** | |
+| PNG 12 MP | 133 → **66** | 117 → **63** | 118 → **60** | |
+| progressive JPEG 24 MP 4:4:4 | 35 → 36 | 301 → 300 | 299 → 300 | **76** (35.5 dB) |
+| progressive JPEG 24 MP 4:2:0 (mozjpeg) | 39 → 40 | 168 → 164 | 165 → 163 | **42** (32.1 dB) |
+| progressive JPEG 101 MP 4:4:4 | 0.4 → 0.3 | 679 → 682 | 729 → 717 | **94** (51.9 dB) |
+| progressive JPEG 22705 px panorama | 0.2 → 0.2 | 945 → 933 | 1001 → 1015 | **146** (49.8 dB) |
+| WebP 24 MP lossy / lossless | 338 → 335 / 402 → 401 | 309 → 304 / 366 → 367 | 305 → 308 / 364 → 367 | |
+
+Unchanged within noise: baseline JPEG 12–60 MP (e.g. 24 MP screen 39.9 → 40.3, 60 MP 95.4 → 95.2), HEIC and AVIF
+(the shared hardware HEVC engine swung both builds by up to 2× between rounds; the quiet rounds agree), JPEG XL, TIFF,
+GIF, every RAW, and the parallel `.screen` throughput over `nav/` (6 threads 57.4 → 55.8 images/s, pairwise per round
+−0.4…+2.2 except one outlier round). The exact progressive decode beside its early rendition: 298 / 166 / 673 / 932 ms
+for the four files above (alone 300 / 164 / 682 / 933 ms).
+
+### Progressive JPEG
+
+Where a progressive decode spends its time (libjpeg-turbo 3.2.1, 1/8 scale so the IDCT is negligible; 24 MP 4:4:4,
+libjpeg's standard script): DC 47 ms (mostly the whole-image coefficient buffer), Y AC 1–5 + Cr + Cb + Y AC 6–63 first
+passes +23 ms, **Y refinement 2→1 +57 ms, Cr/Cb refinements +81 ms, Y refinement 1→0 +87 ms**. Refinement scans are
+bit-serial per coefficient and dominate; entropy decoding is the floor at every DCT scale (1/1 336 ms, 1/8 303 ms).
+
+Decoding the file cut after its last first-pass scan (every coefficient known at reduced precision), at the screen
+scale, PSNR against the exact decode at that scale:
+
+| file | cut at | first passes, smoothing on / off | PSNR | exact |
+|---|---|---|---|---|
+| 24 MP 4:4:4 (14 MB), 1/1 | 52 % | 87 / 74 ms | 35.5 dB | 304–320 ms |
+| 24 MP 4:4:4, 1/2 | 52 % | 88 / 63 ms | 42.2 dB | 294–308 ms |
+| 24 MP 4:2:0 mozjpeg (6.4 MB), 1/1 | 46 % | 47 / 39 ms | 32.1 dB | 163–170 ms |
+| 101 MP 4:4:4, 1/2 | 23 % | 154 / 93 ms | 51.9 dB | 735–742 ms |
+| 22705 px panorama, 1/4 | 39 % | 205 / 144 ms | 49.8 dB | 973–995 ms |
+
+Block smoothing (libjpeg's default for incomplete scans) only costs time at that point: off. Options compared:
+
+- **Concurrent truncated decode (adopted)**: the cut file decoded on a second core beside the plain decode: early
+  77 / 40 / 104 / 138 ms for the four files, exact 302 / 174 / 723 / 997 ms (alone 320 / 165 / 735 / 990: unslowed
+  within noise, ≤ 5 %). Through the app's decoder: 76 / 41 / 108 / 148 ms beside 299 / 165 / 670 / 935 ms.
+- libjpeg buffered-image mode, one decode with an extra output pass after the cut: early at the same time, the final
+  pass bit-identical to `tj3Decompress8`, but the exact output 7–12 % later (24 MP 4:4:4 326–353 vs 299–318 ms).
+- All scans except the luma AC refinements (chroma and DC refinements kept; legal, the successive-approximation chains
+  are per component): +1.4–4 dB for 1.5–4× the time (24 MP 4:2:0 60 ms 33.5 dB; 101 MP 433 ms 55.4 dB).
+- `JDCT_IFAST` for the early pass: −4 % time, −0.2–0.6 dB. Not worth a second code path.
+- `TJPARAM_FASTUPSAMPLE` / `FASTDCT` for the exact screen tier (24 MP 4:2:0 at 1/1): 163 / 166 vs 198 ms but 38.4 /
+  45.3 dB, and at 3456 px that tier is the full-resolution image (no `.full` decode follows). 4:4:4 gains nothing.
+- Parallel scan chains (DC, Y, Cb, Cr decoded by separate handles): the luma chain alone is ≥ 55 % of the entropy
+  work, so ≤ 1.4×, and merging coefficients needs libjpeg-internal structures. Not built.
+
+### PNG
+
+24 MP RGB photo (5947×3964, Paeth on 84 % of the rows, 16 KB IDATs, iCCP) and 12 MP "screenshot-like" (Avg rows):
+
+| decoder | 24 MP | 12 MP | notes |
+|---|---|---|---|
+| ImageIO (IOSurface SPI, the previous path) | 282–312 ms | 120–123 ms | subsample /2–/8 saves nothing (297–323 ms) |
+| Wuffs 0.4 (NEON filters) | 296 ms (279 without checksums) | 95 ms | |
+| libspng 0.7.4 + system zlib | 244 ms | 90 ms | |
+| libdeflate 1.26 + scalar unfilter | 302 ms (inflate 113) | 106 ms (inflate 51) | non-streaming |
+| **own decoder (`CPeekabooDecode`), one thread** | 195–216 ms | 71–75 ms | system zlib, branchless unfilter |
+| **own decoder, inflate on a second thread** | **137–156 ms** | **59–62 ms** | every tier (box filter /2–/8 included) |
+
+Inflate alone over the same IDAT stream: libdeflate 115 ms, system zlib 127 ms, Wuffs 152 ms (24 MP); 53 / 53 / 67 ms
+(12 MP). Apple's zlib is within 10 % of libdeflate and streams, so the pipeline needs no vendored inflate. Paeth
+unfilter of the 24 MP image: branchy scalar 151 ms, libpng-style NEON 89 ms, **branchless scalar 62 ms** (the left
+neighbour in a register per byte keeps three independent chains in flight), two rows interleaved 58 ms. CRC checks of
+every IDAT cost ≤ 5 ms and are kept (a corrupt file goes to ImageIO). Samples are identical to ImageIO's for RGB/RGBA
+8/16-bit, palette 1/2/4/8-bit with and without tRNS, colour keys and every filter type (`PNGDecodeTests`).
+
+SwiftPM compiles release C at `-Os`, which keeps the unfilter's per-byte loops rolled (the left neighbours go through
+memory): in the app the 24 MP decode took 158–167 ms (one thread, in a C harness: 272 ms); the target now builds at
+`-O3`: 143–154 ms (one thread 202 ms). The inflate-bound 12 MP, RGBA and 16-bit files are unchanged. CRC32 of the
+40 MB file costs 1 ms (hardware CRC), the zlib stream's Adler-32 3.6 ms: raw inflate would save 3 %. Values the format
+leaves undefined go to ImageIO, which answers them its own way: an 8-bit colour key above 255 (ImageIO matches its low
+byte) and palette indices past the palette (ImageIO draws the last entry, or black with tRNS).
+
+Apple's `iDOT` PNGs (screenshots) split the rows in two halves that ImageIO inflates in parallel. The IDAT data is
+still one zlib stream (fully flushed at the split, the split row Sub-filtered), so the decoder reads it as one: a
+system-resource iDOT PNG decodes identically to ImageIO (5.7 vs 6.4 ms), and a 12 MP iDOT re-encode of the corpus
+screenshot-like PNG in 66 ms vs ImageIO's 80–86 ms (117 ms without iDOT). Inflating the halves on two threads would
+roughly halve that again (not done yet). `CgBI` (Xcode's iOS-optimised PNG: a critical chunk) goes to ImageIO.
+
+### WebP
+
+libwebp 1.6.0 built from source (`-O3`, NEON) decoding BGRA into an own buffer vs ImageIO (which renders the same
+pixels, so it is libwebp underneath):
+
+| 24 MP | ImageIO | libwebp | `use_threads` | `use_threads` + scaled to 3456 | to 744 |
+|---|---|---|---|---|---|
+| lossy q90 (6.4 MB) | 331 ms | 289 ms | 279 ms | 268 ms | 261 ms |
+| lossless (30 MB) | 372 ms | 360 ms | 366 ms | 485 ms | 404 ms |
+
+Threads barely help (one token partition: the bool decoder parses serially and dominates at this bitrate); scaling
+happens after the decode. ImageIO's subsample factor is ignored for WebP (always 5947×3964) and its 512 px thumbnail
+costs 357 / 422 ms. Incremental decoding (`WebPIDecoder`) yields rows top to bottom, never a whole low-resolution
+image, so it offers no early tier either (VP8 has no DC-only shortcut: every token must be parsed in order). Not adopted: 16–25 % on lossy, nothing on lossless, for 35k lines of vendored parser that would
+no longer get Apple's security updates (CVE-2023-4863 was a libwebp heap overflow).
+
+### End to end (`peekaboo-bench pipeline --cold`)
+
+Folders of hard links into the corpus: 24 progressive JPEGs (24 MP 4:4:4, 24 MP 4:2:0, 101 MP, repeated) and 16
+PNGs (24 and 12 MP). `main` and this change interleaved, medians of 3–5 rounds. "Early" is the first screen-or-better
+tier (an early rendition included), "sharp" the exact one:
+
+| folder, trace | metric | `main` | this change |
+|---|---|---|---|
+| progressive, random jumps | first pixel p90 | 40 ms | 40 ms |
+| | early p90 / p99 | 304 / 681 ms | **84 / 99 ms** |
+| | sharp p90 / p99 | 304 / 681 ms | 307 / 686 ms |
+| progressive, key repeat then dwell | early / sharp | 798 / 798 ms | **210** / 794 ms |
+| PNG, random jumps | first pixel = sharp, p90 / p99 | 292 / 297 ms | **162 / 171 ms** |
+| PNG, key repeat (30/s) | first pixel p90 | 120 ms | **31 ms** |
+| | sharp after the dwell | 189 ms | **123 ms** |
+| both, steady 1/s and A/B toggling | prefetch hits | 100 % | 100 % |
+
+`navigate()` and the main-thread time per navigation are unchanged (p50 47–86 µs, 0.15–0.45 ms per navigation in
+both). Both builds showed occasional 3–12 ms main-thread iterations while the machine was saturated by other
+workloads; a temporary watchdog that sampled the main thread during them found it descheduled at arbitrary
+instructions (a struct copy, the run loop's port poll), not waiting on a lock, a fault or the decoders. Decoding
+prefetched PNGs on one thread instead of two removed nothing measurable there but left fewer previews ready while
+skimming (first pixel p90 108–123 ms instead of 24–35), so prefetch keeps the second thread.
+
+### Review re-measurement
+
+An independent A/B of `main` against the branch with the review fixes (C at `-O3`, out-of-range PNG values to
+ImageIO), same Mac, still shared (load average 5–12), release builds interleaved:
+
+- `peekaboo-bench decode`, 5 rounds × 5 iterations, ms: PNG 24 MP 321 / 303 / 334 → **143 / 143 / 154**, PNG 12 MP
+  133 / 118 / 155 → **63 / 63 / 63**. Progressive screen tiers unchanged within noise (332 → 337, 170 → 177,
+  789 → 790, 1060 → 1075; every pair overlaps round by round), early renditions 78 / 40 / 101 / 166 ms with the exact
+  decode beside them at 335 / 172 / 792 / 1096 ms. Baseline JPEG 39.3 → 39.4, HEIC 35.8 → 35.1 ms.
+- `peekaboo-bench pipeline --cold`, 3 rounds: progressive random jumps early p90 / p99 323 / 713 → **103 / 360 ms**,
+  sharp 323 / 713 → 235 / 417 ms; PNG random jumps 282 / 296 → **147 / 147 ms**; PNG key repeat first pixel p90
+  129 → **25 ms**, sharp after the dwell 186 → **120 ms**; steady and A/B 100 % hits in both.
+- Key repeat then a dwell on the 101 MP file: early 856 → **195 ms**, sharp 856 → 849 ms (6 interleaved runs of that
+  trace alone; in the 3 runs of the whole bench 836 → 1085, the noisiest number here). At the dwell 4–5 screen-tier
+  prefetches of images already passed are still running in both builds (170–885 ms each); fixed below ("Skimming
+  past progressive JPEGs").
+- The rendition costs the exact decode nothing while a core is free: a visible 101 MP screen decode beside 5 busy
+  decode threads 808 ms alone, 795 ms with it (early at 114 ms). With 12 busy threads (no free core) its own CPU
+  time shows: 990 → 1031 ms (+4 %) for 101 MP, 427 → 455 ms (+7 %) for 24 MP 4:4:4, early at 103–114 ms.
+- Fuzzing under ASan/UBSan (mutations of 16 PNG and 5 JPEG seeds, output buffers ending at a guard page): 1.25 M PNG
+  and 2.2 M JPEG cases (0.7 M with a first-pass cut), no report.
+
+### Skimming past progressive JPEGs
+
+A traced key repeat (`PEEKABOO_TRACE=1`, burst over 24 progressive JPEGs) showed where the decodes still running at
+the stop came from: every screen-tier decode started during the skim was for the image just passed (behind 1, a few
+behind 2). The cost model had learned the progressive costs (it skipped the 101 MP files), but an image behind has a
+reversal ETA of ≥ 300 + 600 ms, which admits any decode under ~550 ms: each image passed got a 170–400 ms libjpeg-turbo
+decode that cannot be aborted. While skimming, an image already passed now gets a screen-tier prefetch only if it takes
+≤ 150 ms with every lane busy (`PrefetchTuning.skimBehindMaxMs`): hardware decodes of baseline JPEG and HEIC
+(25–95 ms) stay; progressive JPEG and 24 MP PNG decodes on cores do not.
+
+Measured and not adopted: telling baseline and progressive JPEGs apart in the cost model. In mixed folders the shared
+EWMA is mostly baseline, so progressive files are started 3–9 images ahead while skimming (300–840 ms each). With two
+families, and a JPEG not probed yet costed as a progressive one once the session had decoded any, a skim over 121
+files, half progressive, started 3 progressive screen tiers instead of 23 (16 s of decoding). But the standard warm
+bench (`pipeline --quick`, nav corpus) regressed: its second stop is the last file, a 24 MP progressive JPEG, which
+`main` prefetches 10 images ahead on the underestimate and has sharp on arrival. At its real cost (~300 ms, × 1.6 for
+all lanes busy) the feasibility test rejects that prefetch although it lands in time: sharp after the stop 0–35 →
+372–419 ms, hits 92–96 → 88–91 %. Telling the two apart needs a feasibility test that charges the contention actually
+running, not the worst case.
+
+`peekaboo-bench pipeline --cold --trace burst` (key repeat at 30/s, then a stop; with two stops per run the slower one
+counts), release builds, `main` / PR head / this change interleaved, medians of 5 rounds, machine shared (load
+average 9–12):
+
+| folder (stop on) | metric | `main` | PR head | this change |
+|---|---|---|---|---|
+| 24 progressive (101 MP) | early / sharp after the stop | 824 / 824 ms | 193 / 804 ms | 193 / 791 ms |
+| | decodes | 37 | 37 | **29** |
+| 121 progressive (24 MP 4:4:4) | early / sharp after the stop | 388 / 388 ms | 159 / 428 ms | 151 / 402 ms |
+| | decodes | 188 | 185 | **138** |
+| 121 mixed, half progressive (baseline) | hits / decodes / wasted | 51 % / 210 / 7 | 51 % / 211 / 7 | 52 % / 202 / 6 |
+| nav corpus (24 MP progressive) | early / sharp after the stop | 362 / 362 ms | 152 / 359 ms | 129 / 351 ms |
+| 121 PNG, 24 and 12 MP (24 MP) | first pixel p90 / sharp after the stop | 277 / 347 ms | 13 / 198 ms | 17 / 195 ms |
+| 16 PNG (12 MP) | first pixel p90 / sharp after the stop | 118 / 169 ms | 21 / 119 ms | 18 / 116 ms |
+
+Sharp after a stop is within noise of the PR head. The warm standard bench is unchanged: steady and A/B toggling 100 %
+hits in all three builds, key repeat 93 / 94 / 92 % hits (89–95 % run to run in each) with its stops sharp on arrival
+or within 9 ms, random jumps sharp p50 76 / 74 / 77 ms. Random jumps over the 24 progressive files (`--cold --trace
+random`): early p90 / p99 311 / 693 → 84 / 137 → 83 / 133 ms, sharp 311 / 693 → 315 / 698 → 311 / 690 ms.
+`peekaboo-bench decode` (`main` → this change, 5 rounds × 5 iterations): PNG 24 MP 340 / 315 / 295 → 143 / 144 /
+142 ms, 12 MP 134 / 119 / 129 → 63 / 63 / 63 ms; progressive screen tiers 309 → 320, 174 → 168, 762 → 755,
+1022 → 1017 ms (the same code, noise), early renditions 75 / 39 / 96 / 141 ms; baseline JPEG 39.9 → 39.9 ms, HEIC
+34.6 → 34.6 ms.
+
+### Early rendition of the file being opened
+
+The app decodes the file it opens before its folder is listed, as a placeholder without size or date. The listing
+lands ~80 ms after the open, during that decode, and the early rendition was dropped: the stamp check compared the
+listing with the placeholder. The partial outcome now carries the worker's `stat` before the decode, compared with the
+listing only when both are known. Traced launches (`PEEKABOO_TRACE=1`, unbundled release binaries, ms after the exec,
+`main` → this change, medians of 5; the screen was locked, so these are frames rendered, not seen on glass):
+
+| file | first tier | sharp-looking | exact |
+|---|---|---|---|
+| progressive JPEG 24 MP 4:4:4 | 132 → 134 | 400 → **205** | 400 → 400 |
+| progressive JPEG 101 MP | 96 → 97 | 820 → **223** | 820 → 820 |
+| PNG 24 MP | 96 → 97 | 367 → **225** | 367 → 225 |
+| PNG 12 MP | 97 → 96 | 200 → **169** | 200 → 169 |
+| baseline JPEG 24 MP | 139 → 136 | 139 → 201; second run of 6: 168 → 177 | |
+| HEIC 12 MP | 192 → 194 | 254 → 257 | |
+
+The first tiers of the PNGs are QuickLook's cached thumbnails. A baseline JPEG's preview and screen tier decode side by
+side on the two hardware engines (~44 ms each): when the preview wins by a millisecond, the screen tier waits ~65 ms
+for AppKit's next main-queue turn. `main` loses that race as often (5 of 6 launches in the second run).
+
+### Persistent cache
+
+Not built: after these changes the slowest first views are ~150–165 ms (PNG 24 MP, progressive panorama early
+rendition); a disk cache of ~25 MB screen renditions would only shorten revisits, which QuickLook's thumbnail cache and
+the in-memory tiers already cover, at gigabytes of disk.

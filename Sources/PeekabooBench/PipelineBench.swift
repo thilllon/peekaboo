@@ -11,7 +11,8 @@ import PeekabooCore
 /// screen-tier window (A/B against the default).
 ///
 /// Replays navigation traces against the real decoder and reports, per trace, the share of navigations that found
-/// the sharp tier cached (hit rate), time-to-first-pixel and time-to-sharp percentiles, decode/waste counts, the
+/// the sharp tier cached (hit rate), time-to-first-pixel, time-to-early (the first screen-or-better tier, an early
+/// rendition of a progressive JPEG included) and time-to-sharp (exact) percentiles, decode/waste counts, the
 /// main-thread cost of `navigate`, and the pipeline's whole main-thread time per navigation with the longest run-loop
 /// iteration (deliveries, evictions, releases, replans: what a key press can queue behind). The corpus defaults to
 /// `$PEEKABOO_CORPUS` (its `nav` subfolder when present).
@@ -58,8 +59,8 @@ func runPipelineBench(_ args: ArraySlice<String>) throws {
 
     let traces = makeTraces(count: files.count, quick: quick).filter { traceName == "all" || $0.name == traceName }
     guard !traces.isEmpty else { throw BenchError.usage("unknown trace \(traceName)") }
-    print("trace    events  hit%  px@0%  first-pixel p50/p90/p99 ms  sharp p50/p90/p99 ms   decodes wasted  nav() p50/p99 µs"
-          + "  main ms/nav max")
+    print("trace    events  hit%  px@0%  first-pixel p50/p90/p99 ms  early p50/p90/p99 ms   sharp p50/p90/p99 ms   decodes"
+          + " wasted  nav() p50/p99 µs  main ms/nav max")
     for trace in traces {
         let result = replay(trace, files: files, device: device, screen: screen, options: options)
         print(result.line(trace.name))
@@ -127,6 +128,8 @@ private struct ReplayResult {
     var hits = 0
     var pixelAtArrival = 0
     var firstPixel: [Double] = []
+    /// First screen-or-better tier, an early (approximate) rendition included.
+    var early: [Double] = []
     var sharp: [Double] = []
     var censoredSharp = 0
     var decodes = 0
@@ -145,6 +148,7 @@ private struct ReplayResult {
         return name.padding(toLength: 9, withPad: " ", startingAt: 0)
             + String(format: "%6d %5.0f %6.0f  ", events, hitRate, pixelRate)
             + pct(firstPixel).padding(toLength: 26, withPad: " ", startingAt: 0)
+            + pct(early).padding(toLength: 23, withPad: " ", startingAt: 0)
             + (pct(sharp) + censored).padding(toLength: 23, withPad: " ", startingAt: 0)
             + String(format: "%7d %6d  ", decodes, wasted)
             + "\(fmt(percentile(navigateMicros, 0.5)))/\(fmt(percentile(navigateMicros, 0.99)))".padding(toLength: 16, withPad: " ", startingAt: 0)
@@ -173,18 +177,21 @@ private func replay(_ trace: NavTrace, files: [ImageFile], device: MTLDevice, sc
     var target: ImageFile?
     var navigatedAt: UInt64 = 0
     var firstPixelAt: UInt64?
+    var earlyAt: UInt64?
     var sharpAt: UInt64?
     var measureSharp = false
     pipeline.onDecoded = { file, image in
         guard file == target else { return }
         let now = Trace.now()
         if firstPixelAt == nil { firstPixelAt = now }
-        if image.tier >= .screen && sharpAt == nil { sharpAt = now }
+        if image.tier >= .screen && earlyAt == nil { earlyAt = now }
+        if image.tier >= .screen && !image.isApproximate && sharpAt == nil { sharpAt = now }
     }
     func finish() {
         guard target != nil else { return }
         if let firstPixelAt { result.firstPixel.append(Double(firstPixelAt &- navigatedAt) / 1e6) }
         if measureSharp {
+            if let earlyAt { result.early.append(Double(earlyAt &- navigatedAt) / 1e6) }
             if let sharpAt { result.sharp.append(Double(sharpAt &- navigatedAt) / 1e6) } else { result.censoredSharp += 1 }
         }
     }
@@ -222,11 +229,13 @@ private func replay(_ trace: NavTrace, files: [ImageFile], device: MTLDevice, sc
         navigatedAt = start
         measureSharp = event.dwell
         firstPixelAt = nil
+        earlyAt = nil
         sharpAt = nil
         if let best = pipeline.best(for: file) {
             firstPixelAt = start
             result.pixelAtArrival += 1
             if best.tier >= .screen {
+                earlyAt = start
                 sharpAt = start
                 result.hits += 1
             }

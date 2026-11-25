@@ -123,6 +123,31 @@ final class SchedulerTests: XCTestCase {
         XCTAssertGreaterThan(offsets(plan, .preview, cursor: 100).filter { $0 > 0 }.count, 20)
     }
 
+    /// While skimming, the screen tier of an image just passed looks feasible (its reversal ETA is ≥ 900 ms), but its
+    /// decode cannot be aborted: a long one (progressive JPEG) started for every image passed was still running beside
+    /// the decode of the image the user stopped on. Short (hardware) decodes of the images passed stay planned.
+    func testSkimmingSkipsLongDecodesOfImagesPassed() {
+        let (nav, now) = steady(100, steps: 20, intervalMs: 33, isRepeat: true)
+        let tuning = PrefetchTuning()
+        XCTAssertTrue(nav.isSkimming(now: now + 5 * ms, tuning: tuning))
+        let hardware: [Tier: Double] = [.preview: 4, .screen: 45, .full: 50]
+        let progressive: [Tier: Double] = [.preview: 32, .screen: 250, .full: 290]
+        let cheap = planPrefetch(nav, now: now + 5 * ms, tuning: tuning, context: context(costs: hardware))
+        XCTAssertEqual(Set(offsets(cheap, .screen, cursor: 100).filter { $0 < 0 }), [-1, -2])
+        let costly = planPrefetch(nav, now: now + 5 * ms, tuning: tuning, context: context(costs: progressive))
+        XCTAssertEqual(offsets(costly, .screen, cursor: 100).filter { $0 < 0 }, [], "long decodes of images passed")
+        XCTAssertTrue(offsets(costly, .preview, cursor: 100).contains(-1), "the images passed keep their previews")
+        // The bound is the decode with every lane busy, against `skimBehindMaxMs`.
+        var loose = tuning
+        loose.skimBehindMaxMs = 250 * (1 + tuning.alpha * 5)
+        let allowed = planPrefetch(nav, now: now + 5 * ms, tuning: loose, context: context(costs: progressive))
+        XCTAssertEqual(Set(offsets(allowed, .screen, cursor: 100).filter { $0 < 0 }), [-1, -2])
+        // Once the user stops, the image passed is prefetched whatever it costs.
+        let (stopped, stoppedAt) = steady(100, intervalMs: 1000)
+        let settled = planPrefetch(stopped, now: stoppedAt + ms, tuning: tuning, context: context(costs: progressive))
+        XCTAssertTrue(offsets(settled, .screen, cursor: 100).contains(-1))
+    }
+
     func testABToggleDetectionAndPartnerETA() {
         var nav = NavModel()
         var now: UInt64 = 1000 * ms

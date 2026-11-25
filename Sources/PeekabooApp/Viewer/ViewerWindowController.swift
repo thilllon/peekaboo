@@ -81,6 +81,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// File currently on screen and the tier shown for it (nil with a file: its error is shown).
     private var shownFile: ImageFile?
     private var shownTier: Tier?
+    /// The shown tier is an early rendition (`DecodedImage.isApproximate`): its exact decode replaces it.
+    private var shownApproximate = false
     /// Version of the shown file's contents (nil = not known: opened before its folder was listed).
     private var shownVersion: String?
     /// Bumped when the shown file's contents change on disk, so the renderer treats the new version as another image.
@@ -411,6 +413,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         replaceFiles([], index: 0)
         shownFile = nil
         shownTier = nil
+        shownApproximate = false
         shownVersion = nil
         renderer.setImage(nil, key: nil)
         setLoading(false)
@@ -442,11 +445,16 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             return
         }
         if hadFailed { hud.setMessage(nil) }
-        if isShowing(file), let shownTier, shownTier >= image.tier {
+        if isShowing(file), let shownTier, !Self.improves(image, on: shownTier, approximate: shownApproximate) {
             updateHUD()
             return
         }
         show(image, for: file)
+    }
+
+    /// Whether `image` is better than the shown tier: a higher tier, or the exact decode of an early rendition.
+    static func improves(_ image: DecodedImage, on tier: Tier, approximate: Bool) -> Bool {
+        image.tier > tier || (image.tier == tier && approximate && !image.isApproximate)
     }
 
     /// Version of `file`'s contents; nil when not known (a file opened before its folder was listed).
@@ -470,6 +478,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         renderer.setImage(image, key: RenderKey(url: file.url, revision: contentRevision))
         shownFile = file
         shownTier = image?.tier
+        shownApproximate = image?.isApproximate ?? false
         shownVersion = Self.knownVersion(file)
     }
 
@@ -491,7 +500,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// holds the current preview, which it draws while the screen tier's pyramid builds.
     private var currentIsSharp: Bool {
         guard let file = pipeline.currentFile, isShowing(file), let tier = shownTier else { return false }
-        return tier >= .screen
+        return tier >= .screen && !shownApproximate
     }
 
     private func prepareIfNeighbour(_ image: DecodedImage, for file: ImageFile) {
@@ -608,7 +617,9 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private func presentCurrent() {
         guard let file = pipeline.currentFile else { return }
         if let best = pipeline.best(for: file) {
-            if !isShowing(file) || (shownTier ?? .preview) < best.tier || shownTier == nil { show(best, for: file) }
+            if !isShowing(file) || shownTier.map({ Self.improves(best, on: $0, approximate: shownApproximate) }) ?? true {
+                show(best, for: file)
+            }
         } else if let reason = failureReason(for: file) {
             showFailure(file, reason: reason)
         } else if !isShowing(file) {
@@ -726,7 +737,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         }
         if file.byteSize > 0 { add("Size", ByteCountFormatter.string(fromByteCount: file.byteSize, countStyle: .file)) }
         if let image, let tier = shownTier {
-            add("Shown", "\(tier) \(image.pixels.width)×\(image.pixels.height)\(image.isHDR ? " HDR" : "")")
+            add("Shown", "\(tier) \(image.pixels.width)×\(image.pixels.height)\(image.isHDR ? " HDR" : "")"
+                + (image.isApproximate ? " (first scans)" : ""))
         }
         return rows
     }
