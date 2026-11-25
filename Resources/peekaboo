@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # CLI launcher: `peekaboo <image-or-folder> ...` — hands paths to the (possibly
 # already running) app as open-document events, so a resident instance opens instantly.
+# `peekaboo --version` reads the version of the bundle this script ships in, without launching the app.
 set -euo pipefail
+if [[ "${1:-}" == --version || "${1:-}" == -V ]]; then
+  plist="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/../Info.plist"
+  version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")"
+  commit="$(/usr/libexec/PlistBuddy -c 'Print :PeekabooCommit' "$plist" 2>/dev/null || true)"
+  echo "Peekaboo $version${commit:+ ($commit)}"
+  exit 0
+fi
 if [[ $# -eq 0 ]]; then exec open -a Peekaboo; fi
 exec open -a Peekaboo "$@"

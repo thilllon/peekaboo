@@ -34,6 +34,22 @@ public struct AppConfig: Sendable, Equatable {
     public var ratingStorage: RatingStorage = .finderTags
     /// `rating.star`: a rating of 3 is the Finder tag of three of these.
     public var starCharacter = "★"
+    /// `[updates]`.
+    public var updates = Updates()
+
+    /// `[updates]`: new releases.
+    public struct Updates: Sendable, Equatable {
+        /// `check`: look for a new release when online (10 s after launch at the earliest, then every 6 h and when
+        /// the network comes back, at most hourly). "Check for Updates…" works either way.
+        public var check = true
+        /// `auto_install`: download a new release in the background and install it when Peekaboo quits.
+        public var autoInstall = true
+
+        public init(check: Bool = true, autoInstall: Bool = true) {
+            self.check = check
+            self.autoInstall = autoInstall
+        }
+    }
 
     public init() {}
     public static let `default` = AppConfig()

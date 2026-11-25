@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-#MISE description="Build the app bundle build/Peekaboo.app (release by default; CONFIG=debug for a debug build)"
+#MISE description="Build build/Peekaboo.app (release; CONFIG=debug for debug), version VERSION (default: today, YYYYMMDD), signed with the keychain's Developer ID (hardened runtime), else ad-hoc"
 # mise runs file tasks from the project root.
 set -euo pipefail
+source .mise/lib/signing.sh
 CONFIG="${CONFIG:-release}"
-VERSION="${VERSION:-$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)}"
-VERSION="${VERSION:-0.1.0}"
-BUILD_NUMBER="${BUILD_NUMBER:-$(git rev-list --count HEAD 2>/dev/null || echo 1)}"
+# Versions are dates: YYYYMMDD, and YYYYMMDD.N for a further release the same day (`mise run release` picks it).
+VERSION="${VERSION:-$(date +%Y%m%d)}"
+[[ "$VERSION" =~ ^[0-9]{8}(\.[1-9][0-9]*)?$ ]] || { echo "VERSION must be YYYYMMDD or YYYYMMDD.N, not $VERSION" >&2; exit 1; }
+COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+[[ -z "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]] || COMMIT="$COMMIT-dirty"
+IDENTITY="$(sign_identity)"
 
 swift build -c "$CONFIG" --product Peekaboo
 BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
@@ -14,13 +18,25 @@ APP="$PWD/build/Peekaboo.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_DIR/Peekaboo" "$APP/Contents/MacOS/Peekaboo"
-cp Resources/Info.plist "$APP/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$APP/Contents/Info.plist"
+PLIST="$APP/Contents/Info.plist"
+cp Resources/Info.plist "$PLIST"
+plutil -replace CFBundleShortVersionString -string "$VERSION" "$PLIST"
+# The build number is the version too: dates and same-day suffixes only grow (20261125 < 20261125.1 < 20261126).
+plutil -replace CFBundleVersion -string "$VERSION" "$PLIST"
+plutil -replace PeekabooCommit -string "$COMMIT" "$PLIST"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 # CLI launcher ships inside the bundle; `mise run install` links it onto PATH.
 cp Resources/peekaboo "$APP/Contents/Resources/peekaboo"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
-# Ad-hoc signature: no signing identity is required to run locally.
-codesign --force --sign - --timestamp=none "$APP"
+
+# Hardened runtime in every build, so what runs here is what ships. No entitlements: the app needs none
+# (the IOSurface SPI is a dlsym into ImageIO, Metal compiles shaders out of process).
+if [[ "$IDENTITY" == - ]]; then
+  # Ad-hoc: opens on this Mac only; other Macs' Gatekeeper blocks it (releases need a Developer ID).
+  codesign --force --sign - --options runtime --timestamp=none "$APP"
+else
+  codesign --force --sign "$IDENTITY" --options runtime --timestamp "$APP"
+fi
+codesign --verify --strict "$APP"
+echo "Peekaboo $VERSION ($COMMIT), $(is_developer_id "$APP" && echo "Developer ID signed" || echo "ad-hoc signed")"
 echo "$APP"

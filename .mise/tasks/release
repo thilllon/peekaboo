@@ -1,15 +1,82 @@
 #!/usr/bin/env bash
-#MISE description="Release: tag v<version> on main, build the DMG and publish it as a GitHub Release (mise run release 0.1.0)"
+#MISE description="Release: date version (today YYYYMMDD, a further release the same day YYYYMMDD.1, …), Developer ID signed + notarized app and DMG, tag and GitHub Release with Peekaboo-<v>.dmg, Peekaboo.dmg, Peekaboo-<v>.zip and latest.json. DRY_RUN=1 prints the notarization and publishing commands; ALLOW_ADHOC=1 publishes without a Developer ID"
 # mise runs file tasks from the project root.
 set -euo pipefail
-VERSION="${1:?usage: mise run release <version>, e.g. 0.1.0}"
-[[ "$(git rev-parse --abbrev-ref HEAD)" == main ]] || { echo "release from main" >&2; exit 1; }
-git diff --quiet && git diff --cached --quiet || { echo "working tree is not clean" >&2; exit 1; }
-git fetch -q origin main
-[[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || { echo "main is not in sync with origin/main" >&2; exit 1; }
+source .mise/lib/signing.sh
+REPO=thilllon/peekaboo
+# A failed precondition stops a release; a dry run reports it and goes on, to show the rest.
+fail() {
+  if dry; then echo "DRY_RUN: a release would stop here: $*" >&2; else echo "$*" >&2; exit 1; fi
+}
+
+# 1. A clean main, in sync with origin.
+[[ "$(git rev-parse --abbrev-ref HEAD)" == main ]] || fail "release from main"
+git diff --quiet && git diff --cached --quiet || fail "the working tree is not clean"
+git fetch -q --tags origin main
+[[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || fail "main is not in sync with origin/main"
+dry || gh auth status >/dev/null 2>&1 || fail "gh is not logged in (gh auth login)"
+
+# 2. The version: today, or the next free YYYYMMDD.N; never older than the latest date tag.
+TAGS="$({ git tag -l; git ls-remote --tags --refs origin | sed 's|.*refs/tags/||'; } | sort -u)"
+if [[ -n "${1:-}" ]]; then
+  VERSION="$1"
+  [[ "$VERSION" =~ ^[0-9]{8}(\.[1-9][0-9]*)?$ ]] || { echo "the version is YYYYMMDD or YYYYMMDD.N, not $VERSION" >&2; exit 1; }
+else
+  DAY="$(date +%Y%m%d)"
+  VERSION="$DAY"
+  N=0
+  while grep -qxF "$VERSION" <<<"$TAGS"; do
+    N=$((N + 1))
+    VERSION="$DAY.$N"
+  done
+fi
+if grep -qxF "$VERSION" <<<"$TAGS"; then echo "tag $VERSION exists" >&2; exit 1; fi
+LATEST="$(grep -E '^[0-9]{8}(\.[0-9]+)?$' <<<"$TAGS" | sort -t. -k1,1n -k2,2n | tail -n 1 || true)"
+if [[ -n "$LATEST" && "$(printf '%s\n%s\n' "$LATEST" "$VERSION" | sort -t. -k1,1n -k2,2n | tail -n 1)" != "$VERSION" ]]; then
+  echo "$VERSION is not newer than the latest release $LATEST" >&2
+  exit 1
+fi
+echo "releasing Peekaboo $VERSION"
+
+# 3. A Developer ID, or an explicit ad-hoc release (it will not open on other Macs without "Open Anyway").
+if [[ "$(sign_identity)" == - && "${ALLOW_ADHOC:-0}" != 1 ]]; then
+  fail "no Developer ID Application identity in the keychain (see AGENTS.md, Releases); ALLOW_ADHOC=1 publishes an ad-hoc build"
+fi
+
+# 4. Build, sign, notarize, staple: build/Peekaboo.app, build/Peekaboo-$VERSION.zip and .dmg.
 VERSION="$VERSION" ./.mise/tasks/app
-./.mise/tasks/dmg
-git tag -a "v$VERSION" -m "Peekaboo $VERSION"
-git push -q origin "v$VERSION"
-gh release create "v$VERSION" build/Peekaboo.dmg --title "Peekaboo $VERSION" --generate-notes
-echo "released v$VERSION"
+NOTARIZE=1 ./.mise/tasks/dmg
+APP=build/Peekaboo.app
+ZIP="build/Peekaboo-$VERSION.zip"
+DMG="build/Peekaboo-$VERSION.dmg"
+if is_developer_id "$APP"; then
+  dry || { xcrun stapler validate -q "$APP" && xcrun stapler validate -q "$DMG"; } || fail "the app or the DMG is not notarized"
+elif [[ "${ALLOW_ADHOC:-0}" != 1 ]]; then
+  fail "the app is not Developer ID signed"
+fi
+# Same bytes under a stable name: https://github.com/$REPO/releases/latest/download/Peekaboo.dmg
+cp "$DMG" build/Peekaboo.dmg
+
+# 5. latest.json: what the in-app updater reads (Sources/PeekabooCore/Update/UpdateManifest.swift).
+BASE="https://github.com/$REPO/releases/download/$VERSION"
+cat > build/latest.json <<JSON
+{
+  "version": "$VERSION",
+  "minimumSystemVersion": "$(plutil -extract LSMinimumSystemVersion raw -o - "$APP/Contents/Info.plist")",
+  "url": "$BASE/Peekaboo-$VERSION.zip",
+  "sha256": "$(shasum -a 256 "$ZIP" | awk '{ print $1 }')",
+  "size": $(stat -f %z "$ZIP"),
+  "dmg": "$BASE/Peekaboo-$VERSION.dmg",
+  "notes": "https://github.com/$REPO/releases/tag/$VERSION",
+  "published": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+JSON
+plutil -convert xml1 -o /dev/null build/latest.json
+cat build/latest.json
+
+# 6. Tag, push the tag, publish.
+run git tag -a "$VERSION" -m "Peekaboo $VERSION"
+run git push -q origin "refs/tags/$VERSION"
+run gh release create "$VERSION" "$DMG" build/Peekaboo.dmg "$ZIP" build/latest.json --repo "$REPO" \
+  --title "Peekaboo $VERSION" --generate-notes --latest --verify-tag
+if dry; then echo "DRY_RUN: nothing was tagged or published"; else echo "released $VERSION"; fi

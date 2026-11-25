@@ -43,10 +43,10 @@ brew install jpeg-turbo   # static libturbojpeg linked into PeekabooCore
 |---|---|
 | Debug build | `swift build` (`mise run build`) |
 | Unit tests | `swift test` (`mise run test`) |
-| Release app bundle | `mise run app` → `build/Peekaboo.app` |
+| Release app bundle | `mise run app` → `build/Peekaboo.app` (version: today, `VERSION=` overrides) |
 | Install locally | `mise run install` → `~/Applications/Peekaboo.app` + `peekaboo` CLI in `~/.local/bin` |
-| DMG (drag-to-Applications) | `mise run dmg` → `build/Peekaboo.dmg` |
-| Release | `mise run release <version>`: tag on `main`, build the DMG, publish a GitHub Release |
+| DMG + updater zip | `mise run dmg` → `build/Peekaboo-<version>.dmg`, `build/Peekaboo-<version>.zip` |
+| Release | `mise run release`: date version, notarized DMG, tag, GitHub Release (see [Releases](#releases)) |
 | Secret scan (history + tree) | `mise run secrets` |
 | Latency trace | `PEEKABOO_TRACE=1 build/Peekaboo.app/Contents/MacOS/Peekaboo <image>` |
 | Benchmark corpus | `mise run corpus` → `~/Library/Caches/peekaboo-corpus` (override with `PEEKABOO_CORPUS`) |
@@ -62,13 +62,15 @@ brew install jpeg-turbo   # static libturbojpeg linked into PeekabooCore
 | `PEEKABOO_NO_IOSURFACE_SPI=1` | force the public ImageIO path instead of the private IOSurface fast path |
 | `PEEKABOO_HDR=1` | decode gain-map and PQ / HLG photos to HDR (off by default: 13× the SDR cost) |
 | `PEEKABOO_CONFIG=<file>` | use another config file |
+| `PEEKABOO_UPDATE_URL=<url>` | read the update manifest from here (a `file://` or `http://` test manifest; nothing is remembered) |
 | `peekaboo-bench decode / pipeline [--cold] / render [--png DIR]` | regression benches (corpus from `PEEKABOO_CORPUS`, built by `mise run corpus`) |
 | `peekaboo-bench anim [file …]` | headless animation playback: on-screen duration vs declared delay, late frames, decode per frame, memory |
 
 ## Layout
 
 - `Sources/PeekabooCore` — decoding, tiered cache, prefetch scheduler, folder model,
-  config/keymap. No AppKit. Shared contract types live in `Sources/PeekabooCore/Model`.
+  config/keymap, update verification and install (`Update/`). No AppKit. Shared contract types live in
+  `Sources/PeekabooCore/Model`.
 - `Sources/CPeekabooDecode` — own C decoders where ImageIO is slow: PNG (system zlib) and the
   first-pass rendition of progressive JPEGs (libjpeg-turbo). They parse untrusted files: keep
   every bound checked and the mutation tests (`PNGDecodeTests`, `EarlyRenditionTests`) passing.
@@ -76,7 +78,43 @@ brew install jpeg-turbo   # static libturbojpeg linked into PeekabooCore
   resampling kernels, progressive refinement).
 - `Sources/PeekabooApp` — programmatic AppKit shell (no storyboards, nibs or SwiftUI).
 - `Sources/PeekabooBench` — `peekaboo-bench` performance regression CLI.
-- `Resources/Info.plist` — bundle metadata and document types; `Resources/peekaboo` — CLI launcher shipped in the bundle; `.mise/tasks/` — app bundle and install tasks.
+- `Resources/Info.plist` — bundle metadata and document types; `Resources/peekaboo` — CLI launcher shipped in the bundle; `.mise/tasks/` — app bundle, DMG, install and release tasks (`.mise/lib/signing.sh`: signing and notarization helpers).
+
+## Releases
+
+Versions are dates: `YYYYMMDD`, and `YYYYMMDD.N` for a further release the same day. The git tag is the bare
+version (`20261125`, no `v`), the release title `Peekaboo 20261125`; the legacy `v0.1.0` is older than every date.
+`CFBundleShortVersionString` and `CFBundleVersion` both hold the version, `PeekabooCommit` the short commit (About
+panel, `peekaboo --version`).
+
+One-time setup on the maintainer's Mac (never commit any of it):
+
+1. A **Developer ID Application** certificate in the login keychain: Xcode › Settings › Accounts › the team ›
+   Manage Certificates… › + › Developer ID Application (the Account Holder can create it). Check with
+   `security find-identity -v -p codesigning`.
+2. A **notarytool keychain profile** named `peekaboo-notary` (`NOTARY_PROFILE=` picks another):
+   `xcrun notarytool store-credentials peekaboo-notary --apple-id <Apple ID> --team-id <TEAMID>` with an
+   app-specific password from account.apple.com (or `--key/--key-id/--issuer` for an App Store Connect API key).
+
+`mise run release`, from a clean `main` in sync with `origin/main`:
+
+1. picks the version: today, or the next free `.N` (`mise run release 20261125.2` names one; it must be newer);
+2. builds `build/Peekaboo.app`, signed with the Developer ID (hardened runtime, no entitlements, secure timestamp);
+3. zips it, notarizes the zip, staples the app and zips it again: `Peekaboo-<v>.zip`, the updater's payload;
+4. builds `Peekaboo-<v>.dmg` (volume `Peekaboo <v>`, the app and an Applications link), signs, notarizes, staples it;
+5. writes `latest.json` (`version`, `minimumSystemVersion`, `url`, `sha256`, `size`, `dmg`, `notes`, `published`);
+6. tags, pushes the tag and publishes the GitHub Release with `Peekaboo-<v>.dmg`, `Peekaboo.dmg` (same bytes, for the
+   README's `releases/latest/download/Peekaboo.dmg` link), `Peekaboo-<v>.zip` and `latest.json`.
+
+Without a Developer ID it refuses to publish unless `ALLOW_ADHOC=1` (other Macs then need "Open Anyway").
+`DRY_RUN=1 mise run release` builds and packages everything (ad-hoc without a certificate) and prints the
+notarization, tag and publish commands instead of running them. `mise run app` and `mise run dmg` sign with the
+Developer ID when the keychain has one and fall back to ad-hoc for local builds (`SIGN_IDENTITY=-` forces ad-hoc).
+
+Installed apps read `https://github.com/thilllon/peekaboo/releases/latest/download/latest.json`
+(`Sources/PeekabooApp/Update`, `Sources/PeekabooCore/Update`): keep its fields and the zip layout stable, since every
+installed version parses them. The updater never runs before launch + 10 s, never on the main thread, and installs
+only a download whose SHA-256 matches and whose signature carries the running app's identifier and team.
 
 ## Performance rules
 

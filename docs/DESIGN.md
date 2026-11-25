@@ -206,6 +206,11 @@ viewers score 21–26 dB and alias 10–25× more.
   stars/labels/flags as Finder tags.
 - HUD as `CATextLayer`s above the Metal layer (no blur views), updated only on state changes; toasts.
 - Full screen: instant borderless (notch-aware) by default; native as an option.
+- Updates (no Sparkle): `latest.json` of the latest GitHub release, read 10 s after launch, every 6 h and when the
+  network returns (≥ 1 h apart), on a utility queue with an ephemeral `URLSession`. A newer zip is verified (SHA-256,
+  code signature with Peekaboo's identifier and the running app's Developer ID team), staged on the app's volume and
+  swapped in with one `renamex_np(RENAME_SWAP)` by the app's own executable (`--install-update`) once the app has quit.
+  Nothing of it runs before the first frame; launch → first frame is unchanged.
 
 ### Animation
 

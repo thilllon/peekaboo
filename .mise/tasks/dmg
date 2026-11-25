@@ -1,13 +1,45 @@
 #!/usr/bin/env bash
-#MISE description="Package build/Peekaboo.app into build/Peekaboo.dmg (drag-to-Applications layout)"
+#MISE description="Package build/Peekaboo.app as build/Peekaboo-<version>.dmg (volume \"Peekaboo <version>\", drag to Applications) and build/Peekaboo-<version>.zip (the updater's payload); Developer ID builds are notarized and stapled (NOTARIZE=0 skips it, DRY_RUN=1 prints it)"
 # mise runs file tasks from the project root.
 set -euo pipefail
+source .mise/lib/signing.sh
 APP=build/Peekaboo.app
 [[ -d "$APP" ]] || ./.mise/tasks/app
+VERSION="$(plutil -extract CFBundleShortVersionString raw -o - "$APP/Contents/Info.plist")"
+ZIP="build/Peekaboo-$VERSION.zip"
+DMG="build/Peekaboo-$VERSION.dmg"
+SIGNED=0
+is_developer_id "$APP" && SIGNED=1
+# Notarize Developer ID builds; a dry run shows the commands for any build.
+NOTARY=0
+[[ "${NOTARIZE:-1}" == 1 ]] && { [[ $SIGNED == 1 ]] || dry; } && NOTARY=1
+IDENTITY="$(sign_identity)"
+[[ "$IDENTITY" == - ]] && IDENTITY="Developer ID Application: …"
+
+rm -f build/Peekaboo-*.zip build/Peekaboo-*.dmg
+# The app: sign (app task) → zip → notarize → staple → zip again, so the zip carries the ticket.
+ditto -c -k --keepParent "$APP" "$ZIP"
+if [[ $NOTARY == 1 ]]; then
+  notarize "$ZIP"
+  staple "$APP"
+  run spctl --assess --type execute -vv "$APP"
+  rm -f "$ZIP"
+  ditto -c -k --keepParent "$APP" "$ZIP"
+fi
+
+# The disk image: the app next to a link to /Applications → sign → notarize → staple.
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 ditto "$APP" "$STAGE/Peekaboo.app"
 ln -s /Applications "$STAGE/Applications"
-rm -f build/Peekaboo.dmg
-hdiutil create -quiet -volname Peekaboo -srcfolder "$STAGE" -format UDZO -ov build/Peekaboo.dmg
-echo build/Peekaboo.dmg
+hdiutil create -quiet -volname "Peekaboo $VERSION" -srcfolder "$STAGE" -format UDZO -ov "$DMG"
+if [[ $SIGNED == 1 ]] || dry; then
+  run codesign --force --sign "$IDENTITY" --timestamp "$DMG"
+fi
+if [[ $NOTARY == 1 ]]; then
+  notarize "$DMG"
+  staple "$DMG"
+  run spctl --assess --type open --context context:primary-signature -vv "$DMG"
+fi
+echo "$DMG"
+echo "$ZIP"
