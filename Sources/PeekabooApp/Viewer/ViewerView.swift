@@ -7,6 +7,8 @@ protocol ViewerViewDelegate: AnyObject {
     func viewer(_: ViewerView, magnifyBy factor: Double, at point: CGPoint, phase: NSEvent.Phase)
     func viewer(_: ViewerView, scrollBy delta: CGVector, at point: CGPoint, precise: Bool, modifiers: NSEvent.ModifierFlags, phase: NSEvent.Phase)
     func viewer(_: ViewerView, dragBy delta: CGVector, phase: NSEvent.Phase)
+    /// Whether a drag that starts at `point` moves the window instead of panning the image.
+    func viewer(_: ViewerView, dragMovesWindowAt point: CGPoint) -> Bool
     func viewer(_: ViewerView, doubleClickAt point: CGPoint)
     func viewerSmartMagnify(_: ViewerView, at point: CGPoint)
     /// Files or folders were dropped on the window. Return false to reject the drop.
@@ -201,6 +203,12 @@ final class ViewerView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         if event.clickCount == 2 { delegate?.viewer(self, doubleClickAt: point(event)); return }
+        // The view fills the window, title-bar strip included: a drag with nothing to pan moves the window, as on any
+        // Mac window (AppKit tracks the move until the mouse goes up).
+        if delegate?.viewer(self, dragMovesWindowAt: point(event)) == true, let window {
+            window.performDrag(with: event)
+            return
+        }
         delegate?.viewer(self, dragBy: .zero, phase: .began)
     }
 

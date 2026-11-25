@@ -104,7 +104,7 @@ enum KeyLabels {
         case .zoomOut: return "Zoom Out"
         case .zoomToggle: return "Toggle Fit / 100 %"
         case .zoomKeep: return "Keep Zoom Across Images"
-        case .zoomSet(let f): return "Zoom \(percent(f)) %"
+        case .zoomSet(let f): return "Zoom \(percent(f))%"
         case .pan(let d): return "Pan \(d.rawValue.capitalized)"
         case .panEdge(let e): return "Pan to \(e.rawValue.capitalized) Edge"
         case .panCenter: return "Center Image"

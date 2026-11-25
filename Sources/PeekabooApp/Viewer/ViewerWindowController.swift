@@ -755,7 +755,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         } else if let onScreen {
             parts.append("\(onScreen.fullWidth)×\(onScreen.fullHeight)")
         }
-        if onScreen != nil { parts.append("\(KeyLabels.percent(renderer.effectiveScale)) %") }
+        if onScreen != nil { parts.append("Zoom \(KeyLabels.percent(renderer.effectiveScale))%") }
         if let summary = tagSummaries[file.url], !summary.isEmpty { parts.append(summary) }
         if failureReason(for: file) != nil { parts.append("cannot open") }
         var content = HUDContent(line: parts.joined(separator: "  ·  "))
@@ -1691,6 +1691,15 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             renderer.pan(by: delta)
             renderFrame()
         }
+    }
+
+    /// Windowed only: the title-bar strip always moves the window; elsewhere a drag moves it when there is nothing to
+    /// pan (no image, or the image fits).
+    func viewer(_: ViewerView, dragMovesWindowAt point: CGPoint) -> Bool {
+        guard !isFullscreen, let window else { return false }
+        let titleBar = window.frame.height - window.contentLayoutRect.height
+        if point.y < titleBar { return true }
+        return renderer.image == nil || !renderer.isZoomedBeyondFit
     }
 
     func viewer(_: ViewerView, doubleClickAt point: CGPoint) {
