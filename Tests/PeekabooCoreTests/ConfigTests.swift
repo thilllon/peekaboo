@@ -74,6 +74,25 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(try AppConfig(toml: "[cache]\nmemory_mb = \"auto\"\n").cacheBudgetMB, nil)
     }
 
+    func testDecodeAndDebugSwitches() throws {
+        XCTAssertFalse(AppConfig.default.decodeHDR)
+        XCTAssertTrue(AppConfig.default.fastPath)
+        XCTAssertFalse(AppConfig.default.trace)
+        let config = try AppConfig(toml: "[decode]\nhdr = true\nfast_path = false\n[debug]\ntrace = true\n")
+        XCTAssertTrue(config.decodeHDR)
+        XCTAssertFalse(config.fastPath)
+        XCTAssertTrue(config.trace)
+        XCTAssertEqual(errors("[decode]\nhdr = \"yes\"\n"), ["config.toml:2: decode.hdr must be true or false, got string"])
+        XCTAssertEqual(errors("[view]\nhdr = true\n"), ["config.toml:2: unknown key \"view.hdr\" (it belongs under [decode])"])
+        XCTAssertEqual(errors("[decode]\ntrace = true\n"), ["config.toml:2: unknown key \"decode.trace\" (it belongs under [debug])"])
+        // The keymap layers are kept as set, next to the keymap built from them.
+        let layers = try AppConfig(toml: "[keymap]\ndefaults = false\nvim = true\n[rating]\nauto_advance = true\n")
+        XCTAssertFalse(layers.keymapDefaults)
+        XCTAssertTrue(layers.vimKeys)
+        XCTAssertTrue(layers.autoAdvance)
+        XCTAssertEqual(layers.keymap, Keymap.build(defaults: false, vim: true, autoAdvance: true))
+    }
+
     func testSampleTemplateIsAValidConfig() throws {
         let config = try AppConfig(toml: ConfigStore.sampleTemplate)
         XCTAssertEqual(config.slots.count, 4)

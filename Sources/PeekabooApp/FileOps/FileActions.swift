@@ -28,7 +28,7 @@ struct FileActionContext {
 }
 
 /// Executes the actions that touch the file system or other apps (`file.*`, `meta.*`,
-/// `exec:`, `app.undo/redo/config/reload_config/make_default`) and owns their undo stack.
+/// `exec:`, `app.undo/redo/config_file/reload_config/make_default`) and owns their undo stack.
 ///
 /// The file-system work (trash/move/copy/tags, undo, destinations, `exec:` templates) lives in
 /// `PeekabooCore.FileOperations`; this class adds the pasteboard, Finder, other apps and pickers.
@@ -52,7 +52,7 @@ final class FileActions {
     func handles(_ action: Action) -> Bool {
         switch action {
         case .trash, .delete, .reveal, .copyPath, .copyName, .copyImage, .openWithChooser, .move, .copy, .openWith,
-             .rate, .label, .flag, .undo, .redo, .config, .reloadConfig, .makeDefault, .exec:
+             .rate, .label, .flag, .undo, .redo, .configFile, .reloadConfig, .makeDefault, .exec:
             return true
         default:
             return false
@@ -188,7 +188,7 @@ final class FileActions {
             let done = ["pick": "Pick", "reject": "Reject"][flag] ?? "Flag cleared"
             return tag(context, done: done) { FileOperations.flag(flag, in: $0) }
         case .exec(let template): return exec(template, context: context)
-        case .config: return openConfig()
+        case .configFile: return Self.openConfigFile()
         case .reloadConfig: return reloadConfig()
         case .makeDefault: return makeDefault()
         default: return FileActionResult()
@@ -486,7 +486,9 @@ final class FileActions {
 
     // MARK: App
 
-    private func openConfig() -> FileActionResult {
+    /// `app.config_file`: create the commented starter file if needed and open it in the editor for `.toml` files
+    /// (TextEdit when there is none).
+    static func openConfigFile() -> FileActionResult {
         let store = ConfigStore.current ?? ConfigStore()
         do {
             let url = try store.createDefaultFileIfMissing()
@@ -511,19 +513,14 @@ final class FileActions {
 
     /// Register Peekaboo as the default viewer for the image types of its Info.plist (explicit action only).
     private func makeDefault() -> FileActionResult {
-        let bundle = Bundle.main
-        guard bundle.bundleURL.pathExtension == "app", let bundleID = bundle.bundleIdentifier else {
+        guard DefaultViewer.bundleID != nil else {
             return FileActionResult(toast: "Run Peekaboo.app to make it the default viewer")
         }
-        let documentTypes = bundle.infoDictionary?["CFBundleDocumentTypes"] as? [[String: Any]] ?? []
-        let types = documentTypes.flatMap { $0["LSItemContentTypes"] as? [String] ?? [] }
-            .filter { $0 != "public.folder" && $0 != "public.image" }
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let setter: DefaultHandlerSetter = LaunchServicesDefaults()
-            let failed = types.filter { setter.setViewer(bundleID, for: $0) != noErr }
+        let types = DefaultViewer.contentTypes
+        DefaultViewer.make(types) { [weak self] failed in
             let toast = failed.isEmpty ? "Peekaboo is now the default viewer for \(types.count) image types"
                 : "Default viewer set for \(types.count - failed.count) of \(types.count) types (failed: \(failed.joined(separator: ", ")))"
-            DispatchQueue.main.async { self?.onLateResult?(FileActionResult(toast: toast)) }
+            self?.onLateResult?(FileActionResult(toast: toast))
         }
         return FileActionResult(toast: "Making Peekaboo the default image viewer…")
     }
@@ -587,18 +584,5 @@ private final class ImageDataProvider: NSObject, NSPasteboardItemDataProvider {
         guard let destination = CGImageDestinationCreateWithData(data, uti, 1, nil) else { return }
         CGImageDestinationAddImage(destination, image, nil)
         if CGImageDestinationFinalize(destination) { item.setData(data as Data, forType: type) }
-    }
-}
-
-/// `LSSetDefaultRoleHandlerForContentType` is deprecated but is the only synchronous, consent-free call;
-/// calling it through a protocol keeps the build free of deprecation warnings.
-private protocol DefaultHandlerSetter {
-    func setViewer(_ bundleID: String, for contentType: String) -> OSStatus
-}
-
-private struct LaunchServicesDefaults: DefaultHandlerSetter {
-    @available(macOS, deprecated: 12.0)
-    func setViewer(_ bundleID: String, for contentType: String) -> OSStatus {
-        LSSetDefaultRoleHandlerForContentType(contentType as CFString, .viewer, bundleID as CFString)
     }
 }

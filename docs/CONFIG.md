@@ -1,11 +1,14 @@
 # Configuring Peekaboo
 
 Peekaboo reads one TOML file. Every setting is optional: a missing key keeps its built-in default, and
-an empty or missing file means "all defaults". Press **⌘,** (`app.config`) to create a starter file
-with every setting commented out and open it in your default editor.
+an empty or missing file means "all defaults". Press **⌘,** (`app.config`) for the
+[Settings window](#the-settings-window), which changes every setting below and writes this file for you.
+Peekaboo › Open config.toml (`app.config_file`) creates a starter file with every setting commented
+out and opens it in your default editor.
 
 - [Where the file lives](#where-the-file-lives)
 - [Reloading and errors](#reloading-and-errors)
+- [The Settings window](#the-settings-window)
 - [Settings](#settings)
 - [Key bindings](#key-bindings)
 - [Chord syntax](#chord-syntax)
@@ -22,8 +25,9 @@ The first of these that is set wins:
 2. `$XDG_CONFIG_HOME/peekaboo/config.toml`
 3. `~/.config/peekaboo/config.toml`
 
-Peekaboo never writes the file on its own. Only `app.config` (⌘,) creates it, and only when it does not
-exist yet.
+Peekaboo never writes the file on its own. It writes it when you change something in the Settings
+window, and `app.config_file` creates it when it does not exist yet. A symbolic link stays a link (the
+file it points to is written, with its permissions).
 
 ## Reloading and errors
 
@@ -61,6 +65,31 @@ Multi-line strings, inline tables, arrays of tables and dates are not supported 
 errors. A key made of anything other than letters, digits, `_` and `-` must be quoted:
 `"cmd+," = "app.config"`, `"?" = "view.help"`, `"g g" = "nav.first"`.
 
+## The Settings window
+
+⌘, opens it; it is built the first time you open it, so it costs nothing at launch. Its panes cover every
+key of this page: General (default viewer per image type, the config file, the version), Viewer, Keyboard,
+Files (move/copy slots, open-with apps, ratings), Performance (memory, HDR decoding, the fast decode path,
+trace logging) and Updates (`[updates]`, **Check Now** and the updater's status line, the version).
+
+The file stays the single source of truth. A change in the window is written at once as a minimal edit:
+only the changed line moves, your comments, order and spacing stay, and in the starter file the
+commented-out line of the setting is uncommented in place (`# background = "black"` becomes
+`background = "gray"`, its comment kept). A change that would leave the file with an error is not
+written, and while the file has an error (from an edit in your editor) the window shows it and waits
+until it is fixed; a file that is not UTF-8 text is never rewritten. Saving the file in an editor
+updates the window.
+
+**Keyboard.** Every action is listed with its keys, for the normal and the zoomed-in context. Click **+**
+and press the new keys (Esc cancels); recording matches the physical key like the viewer, so it works
+under any input method. A key another action uses is named (`F is used by “Full Screen”`); press it again
+(or click Move) to move it, which writes `"f" = "file.copy_name"`. A key that starts a sequence, or a
+sequence it starts, is freed the same way. A key's menu changes or removes it: removing a built-in key
+writes `"tab" = "none"`, removing your own deletes its entry. ↺ resets an action to its built-in keys and
+Reset All removes every entry of `[keys]` and `[keys.zoomed]`. Actions with an argument
+(`file.move:keep`, `meta.rate:4`, `nav.jump:+5`, `exec:…`) are added by typing their id. Sequences
+(`"g g"`) are shown and can be removed, but are written in the file.
+
 ## Settings
 
 | Key | Default | Values |
@@ -78,6 +107,9 @@ errors. A key made of anything other than letters, digits, `_` and `-` must be q
 | `[rating]` `auto_advance` | `false` | `true`: plain `0`–`9`, `p`, `x`, `u` also go to the next image (`shift+` always does) |
 | `[keymap]` `defaults` | `true` | `false` starts from an empty keymap: only your `[keys]` (and the vim layer, if on) apply |
 | `[keymap]` `vim` | `false` | add the [vim layer](#vim-layer) on top of the defaults |
+| `[decode]` `hdr` | `false` | decode gain-map photos (iPhone HDR, Apple gain-map JPEG/HEIC) and PQ / HLG images (10-bit HDR HEIF from cameras, HDR AVIF and PNG) to HDR for EDR displays; 10–15× the decode time of the SDR picture. Off, PQ / HLG images show ImageIO's tone-mapped SDR rendition. Turning it on or off decodes the image on screen again. `PEEKABOO_HDR=1` turns it on regardless |
+| `[decode]` `fast_path` | `true` | decode through ImageIO's private IOSurface entry point (zero-copy, both hardware JPEG engines, native YCbCr for HEIF / AVIF); `false` uses the public path only, to compare or work around a decoding problem. `PEEKABOO_NO_IOSURFACE_SPI=1` turns it off regardless |
+| `[debug]` `trace` | `false` | timestamped trace lines on stderr (decode paths and times, scheduling, frames). `PEEKABOO_TRACE=1` turns it on regardless, from the first line of the launch |
 | `[updates]` `check` | `true` | look for a new release when online: 10 s after launch at the earliest, then every 6 h and when the network comes back, at most once an hour (see [updates](#updates)) |
 | `[updates]` `auto_install` | `true` | download a new release in the background, verify it and install it when Peekaboo quits; `false` only tells you about it |
 | `[slots]` *name* | none | a folder for `file.move:<name>` / `file.copy:<name>` (see [destinations](#move-and-copy)) |
@@ -100,13 +132,14 @@ offer it:
 - With `auto_install = false` the banner says that a release is available; **Update** downloads and checks it
   the same way.
 
-Peekaboo › **Check for Updates…** looks at once, whatever `check` says. The new bundle replaces the old one
+Peekaboo › **Check for Updates…** looks at once, whatever `check` says; so does **Check Now** in Settings ›
+Updates, which shows the outcome in its status line (`Up to date (20261125)`). The new bundle replaces the old one
 in one atomic rename. When Peekaboo cannot replace itself (it runs from the disk image or from a quarantined
 copy, or its folder is not writable), it offers the release page instead. If an install fails when Peekaboo
 quits, the next launch says why once, and that release is then offered as a download from the release page
 instead of being fetched again; **Check for Updates…** (or a newer release) tries the install again. Each release is named after its
-day: `20261125`, and `20261125.1` for a second release that day. The About panel and `peekaboo --version`
-show the version and the commit it was built from.
+day: `20261125`, and `20261125.1` for a second release that day. The About panel, Settings (General and
+Updates) and `peekaboo --version` show the version and the commit it was built from.
 
 ## Key bindings
 
@@ -227,7 +260,8 @@ Ids are `namespace.verb`, optionally followed by `:argument`.
 | Id | Does |
 |---|---|
 | `app.undo`, `app.redo` | undo / redo the last file action (trash, move, copy, rating, label, flag) |
-| `app.config` | create the config file if needed and open it in your editor |
+| `app.config` | open the [Settings window](#the-settings-window) |
+| `app.config_file` | create the config file if needed and open it in your editor |
 | `app.reload_config` | re-read the config file now |
 | `app.escape` | close an overlay, else leave full screen, else close the window |
 | `app.close` | close the window (Peekaboo stays running, so the next open is instant) |
@@ -422,8 +456,9 @@ can open the file.
 ### Default viewer
 
 Peekaboo registers for image types as an alternate viewer, so it appears in Finder's Open With menu
-without taking over. Run `app.make_default` (bind it to a key, or use Finder › Get Info › Open with ›
-Change All…) to make it the default app for its image types.
+without taking over. Settings › General shows which app opens each image type and makes Peekaboo the
+default for one type or all of them; `app.make_default` (Peekaboo menu, or bind it to a key) does all
+of them, and so does Finder › Get Info › Open with › Change All….
 
 ## Examples
 

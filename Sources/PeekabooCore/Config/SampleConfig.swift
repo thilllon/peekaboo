@@ -46,6 +46,13 @@ auto_advance = false          # true: plain 0-9 / p / x / u also go to the next 
 defaults = true               # false: start from an empty keymap
 vim = false                   # add the vim layer (h j k l, g g, G, d d, y y, y p ...)
 
+[decode]
+hdr = false                   # gain-map and PQ / HLG photos in HDR (10-15x the SDR decode time; PEEKABOO_HDR=1 forces it)
+fast_path = true              # ImageIO's private IOSurface path (false: public path only; PEEKABOO_NO_IOSURFACE_SPI=1)
+
+[debug]
+trace = false                 # timestamped trace lines on stderr (PEEKABOO_TRACE=1 forces it)
+
 [updates]
 check = true                  # look for a new release when online (never during launch, at most hourly)
 auto_install = true           # download it in the background and install it when Peekaboo quits

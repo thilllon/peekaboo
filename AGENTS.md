@@ -59,11 +59,11 @@ brew install jpeg-turbo   # static libturbojpeg linked into PeekabooCore
 
 | Switch | Effect |
 |---|---|
-| `PEEKABOO_TRACE=1` | timestamped stderr trace: decode paths and ms, scheduling, present mode, HUD, toasts |
+| `PEEKABOO_TRACE=1` | timestamped stderr trace: decode paths and ms, scheduling, present mode, HUD, toasts (also `[debug] trace`, from the config apply on) |
 | `PEEKABOO_ACTIONS="nav.next,zoom.toggle,…"` | run action ids 1 s after launch, 400 ms apart (smoke runs, screenshots) |
 | `Peekaboo --selftest <folder>` | open the folder, measure launch → first frame and action → frame latency, print one JSON line, exit |
-| `PEEKABOO_NO_IOSURFACE_SPI=1` | force the public ImageIO path instead of the private IOSurface fast path |
-| `PEEKABOO_HDR=1` | decode gain-map and PQ / HLG photos to HDR (off by default: 13× the SDR cost) |
+| `PEEKABOO_NO_IOSURFACE_SPI=1` | force the public ImageIO path instead of the private IOSurface fast path (`[decode] fast_path = false` in Settings/config) |
+| `PEEKABOO_HDR=1` | force gain-map and PQ / HLG photos to HDR (users switch it with `[decode] hdr` in Settings; off by default: 13× the SDR cost) |
 | `PEEKABOO_CONFIG=<file>` | use another config file |
 | `PEEKABOO_UPDATE_URL=<url>` | read the update manifest from here (a `file://` or `http://` test manifest; nothing is remembered) |
 | `peekaboo-bench decode / pipeline [--cold] / render [--png DIR]` | regression benches (corpus from `PEEKABOO_CORPUS`, built by `mise run corpus`) |
@@ -79,7 +79,8 @@ brew install jpeg-turbo   # static libturbojpeg linked into PeekabooCore
   every bound checked and the mutation tests (`PNGDecodeTests`, `EarlyRenditionTests`) passing.
 - `Sources/PeekabooRender` — Metal renderer (zero-copy textures, quality pyramid,
   resampling kernels, progressive refinement).
-- `Sources/PeekabooApp` — programmatic AppKit shell (no storyboards, nibs or SwiftUI).
+- `Sources/PeekabooApp` — programmatic AppKit shell (no storyboards, nibs or SwiftUI); `Settings/` is the Settings
+  window, which writes config.toml through `ConfigEditor` (minimal text edits) and is built on first use only.
 - `Sources/PeekabooBench` — `peekaboo-bench` performance regression CLI.
 - `Resources/Info.plist` — bundle metadata and document types; `Resources/peekaboo` — CLI launcher shipped in the bundle; `.mise/tasks/` — app bundle, DMG, install and release tasks (`.mise/lib/signing.sh`: signing and notarization helpers).
 
@@ -88,7 +89,7 @@ brew install jpeg-turbo   # static libturbojpeg linked into PeekabooCore
 Versions are dates: `YYYYMMDD`, and `YYYYMMDD.N` for a further release the same day. The git tag is the bare
 version (`20261125`, no `v`), the release title `Peekaboo 20261125`; the legacy `v0.1.0` is older than every date.
 `CFBundleShortVersionString` and `CFBundleVersion` both hold the version, `PeekabooCommit` the short commit (About
-panel, `peekaboo --version`).
+panel, `peekaboo --version`, and the Settings window through `BuildInfo.versionLine`).
 
 One-time setup on the maintainer's Mac (never commit any of it):
 
@@ -127,6 +128,8 @@ signature carries the running app's identifier and team.
 ## Performance rules
 
 - Nothing slow on the main thread: no decoding, colour conversion, file I/O or large allocations.
+- Optional UI (the Settings window, its panes) is built when first used, never at launch. AppKit buttons and pop-ups
+  cost ~1 ms each to create: draw repeated controls (the shortcut editor's key caps) instead of building them per row.
 - Never assign a large `CGImage` to `CALayer.contents` (Core Animation converts it on the main
   thread, 58–323 ms per 24 MP image). Everything on screen goes through the Metal renderer.
 - Decode into `PixelBuffer` (shared `MTLBuffer`) and wrap it as a texture without copying.

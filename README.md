@@ -59,8 +59,9 @@ Everything below was measured on a MacBook Pro M4 Pro (see [docs/research.md](do
 - Plays animated GIF, APNG, animated WebP and HEIC / AVIF sequences with their frame timing and loop counts: `k` pauses,
   `,` and `.` step a frame. Stills pay nothing for it. (Large animated WebPs play below their frame rate: ImageIO
   re-composites every WebP frame from the first one.)
-- Keyboard-first, fully remappable in a TOML file that reloads as you save it; shortcuts keep working with non-Latin input
-  methods (Korean, Japanese, …).
+- Keyboard-first and fully remappable: record new keys in Settings (⌘,) — a key that is taken names its action, and
+  pressing it again moves it — or edit the TOML file, which reloads as you save it. Shortcuts keep working with
+  non-Latin input methods (Korean, Japanese, …).
 - Culling keys borrowed from Lightroom: 0–5 stars, 6–9 colour labels, P / X / U flags, Shift to act and advance — stored as
   Finder tags.
 - Trash with undo, move/copy to configurable slots, reveal, copy path or image, open with your editor, shell templates.
@@ -78,13 +79,14 @@ Everything below was measured on a MacBook Pro M4 Pro (see [docs/research.md](do
 
 Requires macOS 26 (Tahoe) on Apple Silicon.
 
-**Versions are dates**: `20261125`, and `20261125.1` for a second release that day. Peekaboo › About Peekaboo and
-`peekaboo --version` show the version and the commit it was built from.
+**Versions are dates**: `20261125`, and `20261125.1` for a second release that day. Peekaboo › About Peekaboo, Settings
+and `peekaboo --version` show the version and the commit it was built from.
 
 **Updates**: when it is online, Peekaboo looks for a newer release (10 s after launch at the earliest, then every 6 hours and
 when the network comes back; never while it launches or on the main thread). A new release is downloaded in the background,
 verified (SHA-256 and code signature) and installed when you quit, or at once with **Restart to Update**. Peekaboo › Check
-for Updates… looks now. Turn either part off under [`[updates]`](docs/CONFIG.md#updates).
+for Updates… (or Check Now in Settings › Updates, which shows the status) looks now. Turn either part off in
+Settings › Updates or under [`[updates]`](docs/CONFIG.md#updates).
 
 ## Usage
 
@@ -112,8 +114,11 @@ Command line: `peekaboo <image-or-folder> …`, `peekaboo --version` (installed 
 
 ## Configuration
 
-`~/.config/peekaboo/config.toml` — every key is optional, saving applies it live. Press ⌘, to open it.
-See [docs/CONFIG.md](docs/CONFIG.md) for every option and action.
+Press ⌘, for Settings: every option (viewer, keyboard shortcuts, move/copy slots, apps, ratings, memory, HDR decoding,
+updates) and the default-viewer switch per image type. Settings writes `~/.config/peekaboo/config.toml`, changing only
+the lines it must and keeping your comments; the file is the single source of truth, so edits in your editor apply
+live and show in Settings too (Peekaboo › Open config.toml). See [docs/CONFIG.md](docs/CONFIG.md) for every option
+and action.
 
 ## Build from source
 

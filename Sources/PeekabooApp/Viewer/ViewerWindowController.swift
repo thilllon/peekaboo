@@ -87,6 +87,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// Open requests from the window (drag & drop) and the `app.open` action.
     var onOpenURLs: (([URL]) -> Void)?
     var onOpenPanel: (() -> Void)?
+    /// `app.config` (⌘,): the app's Settings window. Without it, the config file opens in an editor.
+    var onOpenSettings: (() -> Void)?
 
     private var pendingChords: [KeyChord] = []
     private var keyMonitor: Any?
@@ -230,6 +232,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
 
     /// Apply a (re)loaded configuration.
     func apply(_ config: AppConfig) {
+        applySwitches(config)
         // Only a changed value overrides what the user picked at run time (`zoom.keep`, `view.background`, `view.hud`).
         if lastAppliedKeepZoom != config.keepZoom {
             lastAppliedKeepZoom = config.keepZoom
@@ -253,6 +256,26 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
 
     /// Show a toast (e.g. a config error).
     func toast(_ text: String) { hud.showToast(text) }
+
+    /// `[decode]` and `[debug]`: process-wide flags the decode lanes and the trace read, set here once per apply (the
+    /// environment variables force them). A change of `hdr` decodes the gain-map and PQ / HLG photos again; the one on
+    /// screen keeps its pixels until its new sharp tier lands, which swaps in place (same geometry).
+    private func applySwitches(_ config: AppConfig) {
+        if ImageIODecoder.usesFastPath != config.fastPath { ImageIODecoder.usesFastPath = config.fastPath }
+        let trace = config.trace || Trace.forcedByEnvironment
+        if Trace.enabled != trace {
+            Trace.enabled = trace
+            tracksFrames = trace || onFramePresented != nil
+        }
+        let hdr = config.decodeHDR || ImageIODecoder.hdrForcedByEnvironment
+        guard ImageIODecoder.decodeHDR != hdr else { return }
+        ImageIODecoder.decodeHDR = hdr
+        pipeline.redecode { info, tier in info.hasHDRRendition && tier != .preview }
+        if let file = shownFile, let tier = shownTier, tier > .preview, pipeline.info(for: file)?.hasHDRRendition == true {
+            shownTier = .preview  // so that the new sharp tier replaces what is on screen
+        }
+        Trace.log("HDR decoding \(hdr ? "on" : "off"): gain-map and PQ / HLG images decode again")
+    }
 
     /// The pipeline configuration for `config` and the window state.
     private func applyPipelineConfig(_ config: AppConfig) {
@@ -915,11 +938,16 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
 
     // MARK: Actions
 
-    /// Whether a menu item for `action` should be enabled.
-    func canPerform(_ action: Action, plainKeyEquivalent: Bool) -> Bool {
+    /// Whether a menu item for `action` should be enabled (`keyWindow`: the app's key window).
+    func canPerform(_ action: Action, plainKeyEquivalent: Bool, keyWindow: NSWindow? = NSApp.keyWindow) -> Bool {
         if plainKeyEquivalent, window?.isKeyWindow != true { return false }
+        // Typing in another window (a Settings text field): the text gets the keys the menu shares with text editing,
+        // such as ⌘⌫ (delete to the start of the line, not Move to Trash) and ⌘↑ / ⌘↓ (not First / Last Image).
+        if let keyWindow, keyWindow !== window, keyWindow.firstResponder is NSText, !Self.appMenuActions.contains(action) {
+            return false
+        }
         switch action {
-        case .open, .quit, .config, .reloadConfig, .makeDefault, .help, .hud, .hudHide, .undo, .redo, .background:
+        case .open, .quit, .config, .configFile, .reloadConfig, .makeDefault, .help, .hud, .hudHide, .undo, .redo, .background:
             return true
         case .fullscreen, .fullscreenNative, .close, .escape:
             return window?.isVisible == true
@@ -927,6 +955,9 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             return pipeline.currentFile != nil
         }
     }
+
+    /// Menu items about the app, not the image: enabled whichever window is in front.
+    private static let appMenuActions: Set<Action> = [.open, .quit, .config, .configFile, .reloadConfig, .makeDefault, .close]
 
     func perform(_ action: Action, isRepeat: Bool = false) {
         if fileActions.handles(action) {
@@ -938,7 +969,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             switch action {
             case .undo: handle(fileActions.undo()); return
             case .redo: handle(fileActions.redo()); return
-            case .config, .reloadConfig, .makeDefault: break  // app-level fallbacks below
+            case .configFile, .reloadConfig, .makeDefault: break  // app-level fallbacks below
             default: return
             }
         }
@@ -1001,7 +1032,9 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         case .open: onOpenPanel?()
         case .undo: handle(fileActions.undo())
         case .redo: handle(fileActions.redo())
-        case .config: openConfigFile()
+        case .config:
+            if let onOpenSettings { onOpenSettings() } else { openConfigFile() }
+        case .configFile: openConfigFile()
         case .reloadConfig:
             // With no file open (FileActions reports it otherwise): the error, or the skipped keys, not a success.
             configStore.load()
@@ -1014,12 +1047,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     }
 
     private func openConfigFile() {
-        do {
-            let url = try configStore.createDefaultFileIfMissing()
-            NSWorkspace.shared.open(url)
-        } catch {
-            hud.showToast("Cannot create config: \(error.localizedDescription)")
-        }
+        if let toast = FileActions.openConfigFile().toast { hud.showToast(toast) }
     }
 
     private func toggleHelp() {

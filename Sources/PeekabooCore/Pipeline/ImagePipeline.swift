@@ -181,6 +181,8 @@ public final class ImagePipeline {
     private let releaser = Releaser()
     /// When the browsing set was last replaced (`Trace.now()`): its stamps are at least that recent.
     private var listedAt: UInt64 = 0
+    /// The last `redecode(where:)`: when it ran, and which tiers it made stale.
+    private var staleRendition: (since: UInt64, matches: (ImageInfo, Tier) -> Bool)?
     /// Files to `stat` again and when (`Trace.now()` nanos): recently written ones, and the image navigated to.
     private var rechecks: [URL: UInt64] = [:]
     private var recheckTimer: DispatchSourceTimer?
@@ -337,6 +339,31 @@ public final class ImagePipeline {
         enforceBudgets()
         flushReleases()
         scheduleReplan()
+    }
+
+    /// A decoder setting changed what some tiers look like (`[decode] hdr`): drop every cached tier for which
+    /// `stale(info, tier)` holds and decode it again, the visible image first. Decodes of such tiers that began
+    /// before this call deliver the old rendition: their results are dropped when they land.
+    public func redecode(where stale: @escaping (ImageInfo, Tier) -> Bool) {
+        staleRendition = (Trace.now(), stale)
+        for j in Array(cachedIndices) {
+            guard let info = slots[j].info else { continue }
+            for tier in Tier.allCases {
+                guard let image = slots[j][tier], stale(info, tier) else { continue }
+                tierBytes[tier.rawValue] -= image.pixels.allocatedBytes
+                releaser.add(image)
+                slots[j][tier] = nil
+            }
+            if !slots[j].hasPixels { cachedIndices.remove(j) }
+        }
+        recountBytes()
+        // The view asks again once the new sharp tier is on screen. A full tier the change leaves alone stays requested
+        // (a queued decode of it would otherwise be dropped, and nothing would ask again).
+        if fullRequested != nil, slots.indices.contains(index), let info = slots[index].info, stale(info, .full) {
+            fullRequested = nil
+        }
+        flushReleases()
+        replan()
     }
 
     /// Trim the cache. `.warning`: drop full resolution of other images, keep screen tiers within ±4 and previews
@@ -586,6 +613,11 @@ public final class ImagePipeline {
             slots[i].megapixels = CostModel.megapixels(info)
             slots[i].lanes = [nil, nil, nil]  // lanes may depend on the metadata
         }
+        // Begun before a decoder setting changed this tier: the replan decodes it again.
+        if isStale(outcome, at: i) {
+            stats.wasted += 1
+            return
+        }
         switch outcome.result {
         case .success(let image):
             stats.decodes += 1
@@ -623,12 +655,20 @@ public final class ImagePipeline {
     private func handlePartial(_ outcome: DecodeOutcome) {
         let key = outcome.job.key
         guard case .success(let image) = outcome.result, let i = position(of: key.url, name: outcome.job.file.name),
-              i == index, !isCached(i, key.tier) else { return }
+              i == index, !isCached(i, key.tier), !isStale(outcome, at: i) else { return }
         if let listed = FileStamp(files[i]), let decoded = outcome.stamp ?? FileStamp(outcome.job.file), decoded != listed {
             return
         }
         stats.partials += 1
         onDecoded?(files[i], image)
+    }
+
+    /// The decode began before `redecode(where:)` made its tier stale: it shows the old rendition.
+    private func isStale(_ outcome: DecodeOutcome, at i: Int) -> Bool {
+        guard let stale = staleRendition, outcome.started < stale.since, let info = slots[i].info ?? outcome.info else {
+            return false
+        }
+        return stale.matches(info, outcome.job.key.tier)
     }
 
     /// Late results are cached only if still useful (research a2 §4 `keep`).

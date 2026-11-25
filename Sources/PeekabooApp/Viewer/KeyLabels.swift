@@ -136,7 +136,8 @@ enum KeyLabels {
         case .flag(let f): return f == "none" ? "Clear Flag" : f.capitalized
         case .undo: return "Undo"
         case .redo: return "Redo"
-        case .config: return "Edit Config…"
+        case .config: return "Settings…"
+        case .configFile: return "Open config.toml"
         case .reloadConfig: return "Reload Config"
         case .escape: return "Close Overlay / Leave Full Screen / Close"
         case .close: return "Close Window"

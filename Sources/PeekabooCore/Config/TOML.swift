@@ -1,7 +1,7 @@
 import Foundation
 
 /// A value of the TOML subset the config uses: strings, integers, floats, booleans and arrays.
-enum TOMLValue: Equatable, Sendable {
+public enum TOMLValue: Equatable, Sendable {
     case string(String)
     case integer(Int)
     case float(Double)
@@ -41,12 +41,19 @@ struct TOMLEntry: Equatable, Sendable {
     let value: TOMLValue
     let line: Int
     let column: Int
+    /// UTF-8 offsets in the text: the key's first byte, the value's first byte and the byte after the value
+    /// (`TOMLEditor` rewrites exactly that span).
+    let keyStart: Int
+    let valueStart: Int
+    let valueEnd: Int
 }
 
 /// A `[table]` header and where it was written.
 struct TOMLTable: Equatable, Sendable {
     let path: [String]
     let line: Int
+    /// UTF-8 offset of its `[`.
+    let start: Int
 }
 
 /// Parsed document: entries in file order.
@@ -176,7 +183,7 @@ private struct TOMLParser {
         }
         defined[path] = .table
         currentTable = path
-        tables.append(TOMLTable(path: path, line: headerLine))
+        tables.append(TOMLTable(path: path, line: headerLine, start: start))
     }
 
     private mutating func parseKeyValue() throws {
@@ -203,9 +210,11 @@ private struct TOMLParser {
         if defined[path] != nil {
             throw TOMLError(line: keyLine, column: column, message: "duplicate key \"\(path.joined(separator: "."))\"")
         }
+        let valueStart = i
         let value = try parseValue()
         defined[path] = .value
-        entries.append(TOMLEntry(path: path, value: value, line: keyLine, column: column))
+        entries.append(TOMLEntry(path: path, value: value, line: keyLine, column: column, keyStart: start,
+                                 valueStart: valueStart, valueEnd: i))
     }
 
     // MARK: Keys

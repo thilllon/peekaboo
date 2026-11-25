@@ -68,8 +68,8 @@ private struct ConfigReader {
     var config = AppConfig()
 
     private static let tables: Set<[String]> = [
-        ["view"], ["fullscreen"], ["hud"], ["cache"], ["rating"], ["keymap"], ["slots"], ["apps"], ["updates"],
-        ["keys"], ["keys", "normal"], ["keys", "zoomed"],
+        ["view"], ["fullscreen"], ["hud"], ["cache"], ["rating"], ["keymap"], ["decode"], ["debug"], ["slots"], ["apps"],
+        ["updates"], ["keys"], ["keys", "normal"], ["keys", "zoomed"],
     ]
 
     mutating func fail(_ entry: TOMLEntry, _ message: String) {
@@ -87,7 +87,6 @@ private struct ConfigReader {
                                      message: "unknown table [\(table.path.joined(separator: "."))]"))
         }
         var keyEntries: [(entry: TOMLEntry, context: KeyContext, chord: String)] = []
-        var keymapDefaults = true, vim = false, autoAdvance = false
         for entry in document.entries {
             let path = entry.path
             let name = path.joined(separator: ".")
@@ -134,16 +133,20 @@ private struct ConfigReader {
                 if case .string(let s) = entry.value, s.count == 1 { config.starCharacter = s } else {
                     fail(entry, "rating.star must be a single character, e.g. \"★\"")
                 }
-            case "rating.auto_advance": if let v = bool(entry) { autoAdvance = v }
-            case "keymap.defaults": if let v = bool(entry) { keymapDefaults = v }
-            case "keymap.vim": if let v = bool(entry) { vim = v }
+            case "rating.auto_advance": if let v = bool(entry) { config.autoAdvance = v }
+            case "keymap.defaults": if let v = bool(entry) { config.keymapDefaults = v }
+            case "keymap.vim": if let v = bool(entry) { config.vimKeys = v }
+            case "decode.hdr": if let v = bool(entry) { config.decodeHDR = v }
+            case "decode.fast_path": if let v = bool(entry) { config.fastPath = v }
+            case "debug.trace": if let v = bool(entry) { config.trace = v }
             case "updates.check": if let v = bool(entry) { config.updates.check = v }
             case "updates.auto_install": if let v = bool(entry) { config.updates.autoInstall = v }
             default:
                 skip(entry, "unknown key \"\(name)\"\(Self.keyHint(path))")
             }
         }
-        config.keymap = buildKeymap(keyEntries, defaults: keymapDefaults, vim: vim, autoAdvance: autoAdvance)
+        config.keymap = buildKeymap(keyEntries, defaults: config.keymapDefaults, vim: config.vimKeys,
+                                    autoAdvance: config.autoAdvance)
         return config
     }
 
@@ -151,7 +154,8 @@ private struct ConfigReader {
     private static let settingKeys = [
         "view.background", "view.keep_zoom", "view.zoom_step", "view.refine_delay_ms", "fullscreen.mode",
         "fullscreen.avoid_notch", "hud.mode", "cache.memory_mb", "rating.storage", "rating.star",
-        "rating.auto_advance", "keymap.defaults", "keymap.vim", "updates.check", "updates.auto_install",
+        "rating.auto_advance", "keymap.defaults", "keymap.vim", "decode.hdr", "decode.fast_path", "debug.trace",
+        "updates.check", "updates.auto_install",
     ]
 
     /// ` (it belongs under [view])` for a known key in the wrong table, ` (key bindings go under [keys])`

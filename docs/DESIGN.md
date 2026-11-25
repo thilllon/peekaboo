@@ -110,8 +110,10 @@ take ImageIO's tone-mapped SDR rendition like PQ / HLG HEIF: the decoder would h
 | PNG (RGB, RGBA, palette; not interlaced) | own decoder, box filter /8 (24 MP 143 ms) | own decoder, box filter covering the screen (24 MP 143 ms) | own decoder (16-bit stays 16-bit; 24 MP 145–154 ms) |
 | WebP / TIFF / GIF / JXL / PSD / EXR, other PNG (grayscale, Adam7, APNG, PQ / HLG) | thumbnail ≤ 512 (TIFF 23, AVIF 48, WebP 350 ms) | IOSurface SPI /n (lazy draw as fallback) | IOSurface SPI (lazy draw as fallback) |
 
-HDR (gain-map HEIC/JPEG, PQ / HLG HEIF and PNG): `kCGImageSourceDecodeRequest = DecodeToHDR` (10-bit PQ / half-float) when the screen
-reports EDR headroom > 1, displayed through the EDR path of the renderer. SDR otherwise (PQ / HLG: ImageIO's SDR rendition).
+HDR (gain-map HEIC/JPEG, PQ / HLG HEIF and PNG) with `[decode] hdr` on (Settings › Performance; `PEEKABOO_HDR=1` forces it;
+off by default, 10–15× the SDR decode): `kCGImageSourceDecodeRequest = DecodeToHDR` (half-float, extended-linear Display P3),
+displayed through the EDR path of the renderer. SDR otherwise (PQ / HLG: ImageIO's SDR rendition). Switching it decodes those
+images again (`ImagePipeline.redecode(where:)`, `ImageInfo.hasHDRRendition`); the one on screen swaps in place.
 
 `main()` decodes a 16 px HEIC (`HEVCWarmUp`) while AppKit starts, at utility QoS, queued by the userInitiated thread
 that builds `FolderScanner.supportedExtensions` once that is done (ImageIO's one-time setup has run at userInitiated by
@@ -201,7 +203,10 @@ viewers score 21–26 dB and alias 10–25× more.
   previous image stays until the target's first tier is ready; swaps are instant and geometry-identical.
 - Config: TOML at `~/.config/peekaboo/config.toml` (`$XDG_CONFIG_HOME`, `$PEEKABOO_CONFIG`), hot reload, errors
   as a toast; actions `namespace.verb[:arg]` (see `Sources/PeekabooCore/Model/Action.swift`), move/copy and
-  open-with slots.
+  open-with slots. The Settings window (⌘,, built on first use) writes the same file through minimal text edits
+  (`TOMLEditor`: comments and layout kept, each edit verified by parsing it back); the file stays the single source
+  of truth and its reload is what applies a change. Decoder and trace switches are process-wide flags set once per
+  config apply, never looked up per decode.
 - File actions: trash with ⌘Z undo, move/copy to slots with undo, reveal, copy path/name/image, open with;
   stars/labels/flags as Finder tags.
 - HUD as `CATextLayer`s above the Metal layer (no blur views), updated only on state changes; toasts.

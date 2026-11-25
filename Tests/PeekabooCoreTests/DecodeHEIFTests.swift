@@ -170,6 +170,31 @@ final class DecodeHEIFTests: XCTestCase {
         }
     }
 
+    /// HDR decoding (`[decode] hdr`, `PEEKABOO_HDR=1`) covers PQ / HLG images like gain-map photos: their sharp tiers
+    /// decode to HDR, the preview stays the SDR rendition, and `ImageInfo` says so (the Settings switch decodes exactly
+    /// those images again).
+    func testPQAndHLGDecodeToHDRWhenHDRDecodingIsOn() throws {
+        let saved = ImageIODecoder.decodeHDR
+        defer { ImageIODecoder.decodeHDR = saved }
+        for (name, space) in [("pq", CGColorSpace.itur_2100_PQ), ("hlg", CGColorSpace.itur_2100_HLG)] {
+            let url = try write([try quadrants(800, 600, space: try XCTUnwrap(CGColorSpace(name: space)), bits: 16, level: 0.7)],
+                                "\(name).heic")
+            let info = try decoder.probe(url)
+            XCTAssertTrue(info.hdrTransfer && info.hasHDRRendition, name)
+            XCTAssertFalse(info.hasGainMap, name)
+            ImageIODecoder.decodeHDR = true
+            for (tier, target) in [(Tier.screen, 800), (.full, 0)] {
+                let image = try decoder.decode(url, tier: tier, targetLongSide: target, pool: pool)
+                XCTAssertTrue(image.isHDR, "\(name) \(tier)")
+                XCTAssertEqual(image.pixels.layout, .rgba16f, "\(name) \(tier)")
+            }
+            XCTAssertFalse(try decoder.decode(url, tier: .preview, targetLongSide: 200, pool: pool).isHDR, "\(name) preview")
+            ImageIODecoder.decodeHDR = false
+            XCTAssertFalse(try decoder.decode(url, tier: .screen, targetLongSide: 800, pool: pool).isHDR, name)
+        }
+        XCTAssertFalse(try decoder.probe(try write([try quadrants(64, 48)], "sdr.heic")).hasHDRRendition)
+    }
+
     /// PQ / HLG images (camera HIF, HDR AVIF) are shown through ImageIO's tone-mapped SDR rendition in Display P3. The
     /// default decode used to keep PQ code values in a PQ space, which the renderer showed at a sixth of the brightness.
     func testPQAndHLGShowTheirSDRRendition() throws {
