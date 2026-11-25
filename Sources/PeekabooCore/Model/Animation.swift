@@ -21,8 +21,6 @@ public struct AnimationTiming: Sendable, Equatable {
     }
 
     public var frameCount: Int { delays.count }
-    /// One play, in seconds.
-    public var duration: Double { delays.reduce(0, +) }
 
     /// Type identifiers whose multi-image files are animations.
     public static let animatedTypes: Set<String> = [
