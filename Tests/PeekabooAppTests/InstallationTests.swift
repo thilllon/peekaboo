@@ -298,6 +298,18 @@ final class InstallationTests: ViewerTestCase {
         XCTAssertEqual(calls, [quitCopies] + Array(repeating: look, count: 4))
     }
 
+    func testQuittingAsksTheSystemWhichProcessesRunTheBundle() throws {
+        // `quit`'s default process list, the system's (the copies to quit stay faked): sleep(1) runs from /bin, at its own
+        // path (never a copy: issue #87). Shells run from /bin too, so only "it still runs" can be checked there.
+        let sleep = Process()
+        sleep.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        sleep.arguments = ["30"]
+        try sleep.run()
+        defer { if sleep.isRunning { sleep.terminate() } }
+        XCTAssertFalse(Installation.quit(URL(fileURLWithPath: "/bin", isDirectory: true), timeout: 0.2, quitCopies: { _ in }),
+                       "sleep runs from /bin")
+    }
+
     // MARK: Ejecting the disk images
 
     func testAHeadlessLaunchNeverEjects() throws {

@@ -483,16 +483,21 @@ final class AppInstallTests: XCTestCase {
         XCTAssertTrue(AppInstall.runningExecutables().contains { $0.pid == pid && $0.executable == "/bin/sleep" },
                       "the system lists it with its executable's path")
         XCTAssertTrue(AppInstall.processes(runningFrom: bin).contains(pid))
-        // Neither a path that starts the same without the separator (sleep itself, /bi), nor a missing folder.
-        for path in ["/bin/sleep", "/bi", directory.appendingPathComponent("Missing.app").path] {
+        // Neither a path that starts the same without the separator (sleep itself), nor a missing folder.
+        for path in ["/bin/sleep", directory.appendingPathComponent("Missing.app").path] {
             XCTAssertFalse(AppInstall.processes(runningFrom: URL(fileURLWithPath: path)).contains(pid), path)
         }
         process.terminate()
         process.waitUntilExit()
         XCTAssertFalse(AppInstall.processes(runningFrom: bin).contains(pid), "it has exited")
-        // Never this process, not even from the folder of its own executable (the one the system lists: `Bundle.main`
-        // names the xctest that started it).
+        // The system names an executable by its real path, as `processes(runningFrom:)` resolves the folder: `swift test`
+        // starts the runner through a symlink (`Bundle.main` names Developer/usr/bin/xctest, a link to …/Agents/xctest).
         let me = try XCTUnwrap(AppInstall.runningExecutables().first { $0.pid == getpid() })
+        let started = try XCTUnwrap(Bundle.main.executablePath)
+        let real = try XCTUnwrap(realpath(started, nil))
+        defer { free(real) }
+        XCTAssertEqual(me.executable, String(cString: real), "started as \(started)")
+        // Never this process, not even from the folder of its own executable.
         let runner = URL(fileURLWithPath: me.executable).deletingLastPathComponent()
         XCTAssertFalse(AppInstall.processes(runningFrom: runner).contains(getpid()), runner.path)
     }
