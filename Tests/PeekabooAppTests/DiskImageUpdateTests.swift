@@ -16,8 +16,11 @@ final class DiskImageUpdateTests: ViewerTestCase {
         private var stageCalls: [AppVersion] = []
         private var failingVersions: Set<AppVersion> = []
         private var stageGate: DispatchSemaphore?
+        private var volumesGate: DispatchSemaphore?
         // Main thread.
         var jobs: [UpdateInstaller.Job] = []
+        /// When each of `jobs` was started.
+        var started: [Date] = []
         var terminations = 0
         var active = false
         var spawnError: Error?
@@ -43,9 +46,19 @@ final class DiskImageUpdateTests: ViewerTestCase {
             get { lock.withLock { stageGate } }
             set { lock.withLock { stageGate = newValue } }
         }
+        /// Listing the volumes waits for it when set: a scan that has not got as far as a copy yet (an unresponsive
+        /// network share, a busy disk image).
+        var listGate: DispatchSemaphore? {
+            get { lock.withLock { volumesGate } }
+            set { lock.withLock { volumesGate = newValue } }
+        }
 
         func hooks() -> DiskImageUpdate.Hooks {
-            DiskImageUpdate.Hooks(volumes: { [unowned self] in volumes }, isDiskImage: { [unowned self] url in
+            DiskImageUpdate.Hooks(volumes: { [unowned self] in
+                XCTAssertFalse(Thread.isMainThread, "the volumes are listed off the main thread")
+                listGate?.wait()
+                return volumes
+            }, isDiskImage: { [unowned self] url in
                 XCTAssertFalse(Thread.isMainThread)
                 return !notDiskImages.contains(url.standardizedFileURL.path)
             }, stage: { [unowned self] app, version, root in
@@ -63,8 +76,13 @@ final class DiskImageUpdateTests: ViewerTestCase {
                 XCTAssertTrue(Thread.isMainThread)
                 if let spawnError { throw spawnError }
                 jobs.append(job)
+                started.append(Date())
             }, terminate: { [unowned self] in terminations += 1 }, isActive: { [unowned self] in active },
-               notifications: { [unowned self] in center })
+               notifications: { [unowned self] in
+                // Registering the workspace observers costs ~1 ms on the main thread.
+                XCTAssertFalse(Thread.isMainThread, "the workspace observers are registered on the utility queue")
+                return center
+            })
         }
     }
 
@@ -135,21 +153,28 @@ final class DiskImageUpdateTests: ViewerTestCase {
     }
 
     /// A volume of the test's with a Peekaboo.app of `version` at its top (nil: none; another bundle identifier with
-    /// `identifier`), mounted in `system` from now on: a disk image unless `diskImage` is false; `post` sends the mount
-    /// notification.
+    /// `identifier`, the macOS it needs with `minimumSystemVersion`; with `linked`, the Peekaboo.app on the volume is a
+    /// symbolic link to that bundle, kept outside the volume), mounted in `system` from now on: a disk image unless
+    /// `diskImage` is false; `post` sends the mount notification.
     @discardableResult
     private func mount(_ name: String, _ version: AppVersion?, identifier: String = CodeSignature.bundleIdentifier,
-                       readOnly: Bool = true, local: Bool = true, diskImage: Bool = true, under parent: String = "Volumes",
-                       in system: System? = nil, post: Bool = true) throws -> AppInstall.Volume {
+                       minimumSystemVersion: String? = nil, linked: Bool = false, readOnly: Bool = true, local: Bool = true,
+                       diskImage: Bool = true, under parent: String = "Volumes", in system: System? = nil,
+                       post: Bool = true) throws -> AppInstall.Volume {
         let system = system ?? self.system!
         let url = root.appendingPathComponent("\(parent)/\(name)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         if let version {
-            let app = try fakePeekabooApp(in: url, version: version).bundleURL
-            let info: [String: Any] = ["CFBundleIdentifier": identifier, "CFBundleShortVersionString": version.name,
+            let folder = linked ? root.appendingPathComponent("elsewhere/\(name)", isDirectory: true) : url
+            let app = try fakePeekabooApp(in: folder, version: version).bundleURL
+            var info: [String: Any] = ["CFBundleIdentifier": identifier, "CFBundleShortVersionString": version.name,
                                        "CFBundleVersion": String(version.build), "CFBundleExecutable": "Peekaboo"]
+            if let minimumSystemVersion { info["LSMinimumSystemVersion"] = minimumSystemVersion }
             try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
                 .write(to: app.appendingPathComponent("Contents/Info.plist"))
+            if linked {
+                try FileManager.default.createSymbolicLink(at: url.appendingPathComponent("Peekaboo.app"), withDestinationURL: app)
+            }
         }
         if !diskImage { system.notDiskImages.insert(url.standardizedFileURL.path) }
         let volume = AppInstall.Volume(url: url, isReadOnly: readOnly, isLocal: local)
@@ -173,13 +198,13 @@ final class DiskImageUpdateTests: ViewerTestCase {
         XCTAssertTrue(spin(5) { update.isWatching }, "not watching the mounts", line: line)
     }
 
-    /// A component that has staged `version` from a volume of the test's.
+    /// A component that has staged `version` from a volume of the test's, and is done looking at the mount.
     private func stagedUpdate(_ version: AppVersion = releaseVersion(26), system: System? = nil,
                               updater: FakeUpdater? = nil) throws -> DiskImageUpdate {
         let update = makeUpdate(system: system, updater: updater)
         watch(update)
         try mount("Peekaboo \(version.build)", version, in: system)
-        XCTAssertTrue(spin(5) { update.pending?.version == version }, "\(version) was not staged")
+        XCTAssertTrue(spin(5) { update.pending?.version == version && update.looking == 0 }, "\(version) was not staged")
         return update
     }
 
@@ -235,7 +260,11 @@ final class DiskImageUpdateTests: ViewerTestCase {
         try mount("Share", releaseVersion(27), local: false, post: false)
         try mount("Elsewhere", releaseVersion(27), under: "mnt", post: false)  // not under /Volumes
         try mount("Photos", nil, post: false)
-        try mount("Peekaboo 26", releaseVersion(26))
+        // A Peekaboo.app that is a symbolic link could point anywhere: to a folder of the user's, whose quarantine
+        // flags staging would clear, or to a copy someone else may change once it is installed.
+        try mount("Link", releaseVersion(27), linked: true, post: false)
+        try mount("Later", releaseVersion(27), minimumSystemVersion: "99.0", post: false)  // would not start on this macOS
+        try mount("Peekaboo 26", releaseVersion(26), minimumSystemVersion: "14.0")
         XCTAssertTrue(spin(5) { update.pending?.version == releaseVersion(26) })
         XCTAssertEqual(system.staged, [releaseVersion(26)], "only the newer Peekaboo is copied")
         XCTAssertEqual(update.pending, DiskImageUpdate.Copy(version: releaseVersion(26), app: staged(releaseVersion(26))))
@@ -252,13 +281,16 @@ final class DiskImageUpdateTests: ViewerTestCase {
                       "the copy it supersedes goes")
         XCTAssertTrue(FileManager.default.fileExists(atPath: staged(releaseVersion(27)).path))
 
-        // Unmounted, the staged copy stays pending; mounted again it is looked at again, but is not newer than itself.
+        // Unmounted, the staged copy stays pending; mounted again, the same copy is not newer than itself.
         unmount(newest)
-        try mount("Peekaboo 27", releaseVersion(27))
-        spin(0.3)
+        let again = try mount("Peekaboo 27", releaseVersion(27))
+        XCTAssertTrue(spin(5) { update.looking == 0 })
         XCTAssertEqual(update.pending?.version, releaseVersion(27))
-        try mount("Peekaboo 29", releaseVersion(29))
-        XCTAssertTrue(spin(5) { update.pending?.version == releaseVersion(29) })
+        XCTAssertEqual(system.staged.count, 3)
+        // An unmount makes the volume new again: another image mounted at the same place is looked at.
+        unmount(again)
+        try mount("Peekaboo 27", releaseVersion(29))
+        XCTAssertTrue(spin(5) { update.pending?.version == releaseVersion(29) }, "the volume mounted there again was not read")
         XCTAssertEqual(system.staged, [releaseVersion(26), releaseVersion(28), releaseVersion(27), releaseVersion(29)])
     }
 
@@ -369,6 +401,24 @@ final class DiskImageUpdateTests: ViewerTestCase {
         XCTAssertEqual(system.jobs.first?.reopen?.lastPathComponent, "b.jpg")
     }
 
+    func testAHandOverNeverComesSoonerThanTheActivationDelay() throws {
+        // A copy staged (and its mount looked at) a moment after the activation: the photo opened from Finder with that
+        // activation may still be on its way, so the hand-over waits the whole delay all the same.
+        let update = makeUpdate(activationDelay: 0.4)
+        watch(update)
+        let gate = DispatchSemaphore(value: 0)
+        system.gate = gate
+        try mount("Peekaboo 26", releaseVersion(26))
+        XCTAssertTrue(spin(5) { update.staging == 1 })
+        system.active = true
+        let activation = Date()
+        update.activated()
+        gate.signal()
+        XCTAssertTrue(spin(5) { self.system.jobs.count == 1 })
+        let waited = try XCTUnwrap(system.started.first).timeIntervalSince(activation)
+        XCTAssertGreaterThan(waited, 0.39, "handed over \(waited) s after the activation")
+    }
+
     func testAHandOverWaitsForAFileOperationAndFollowsWhenItEnds() throws {
         let update = try stagedUpdate()
         var busy = true
@@ -396,6 +446,36 @@ final class DiskImageUpdateTests: ViewerTestCase {
         later.active = true
         second.activated()
         XCTAssertTrue(spin(5) { later.jobs.count == 1 })
+    }
+
+    func testTheAppDelegateConnectsTheUpdateToTheViewersFileOperations() throws {
+        // What `AppDelegate.connect` wires, through the viewer's real file actions: a copy running in the viewer holds
+        // the hand-over back, and the end of one lets a held-back hand-over follow.
+        let a = writeImage(folder.appendingPathComponent("a.jpg"), width: 64, height: 48, gray: 0.3)
+        let delegate = launchDelegate(opening: [a])
+        let viewer: ViewerWindowController = try XCTUnwrap(property(delegate, "viewer"))
+        XCTAssertTrue(spin(5) { viewer.displayedFile?.name == "a.jpg" })
+        let update = try stagedUpdate()
+        delegate.diskImageUpdate = update
+        let first = root.appendingPathComponent("first", isDirectory: true)
+        viewer.perform(.copy(first.path))
+        XCTAssertTrue(update.isRunningFileOperation(), "the viewer's copy runs in the background")
+        XCTAssertTrue(spin(5) { !update.isRunningFileOperation() })
+        XCTAssertTrue(FileManager.default.fileExists(atPath: first.appendingPathComponent("a.jpg").path))
+
+        // Held back (by a stand-in, so that nothing but the end of the next copy can let it follow), then released by
+        // the end of a real copy.
+        var busy = true
+        update.isRunningFileOperation = { busy }
+        system.active = true
+        delegate.applicationDidBecomeActive(Self.activation)
+        spin(0.2)
+        XCTAssertEqual(system.jobs, [], "held back")
+        busy = false
+        viewer.perform(.copy(root.appendingPathComponent("second", isDirectory: true).path))
+        XCTAssertTrue(spin(5) { self.system.jobs.count == 1 }, "the end of the viewer's copy never reached the update")
+        XCTAssertEqual(system.jobs.first?.reopen?.lastPathComponent, "a.jpg")
+        XCTAssertEqual(system.terminations, 1)
     }
 
     func testFileActionsSayWhileTheyRunInTheBackgroundAndWhenTheyEnd() throws {
@@ -451,6 +531,41 @@ final class DiskImageUpdateTests: ViewerTestCase {
         XCTAssertEqual(later.jobs.first?.version, releaseVersion(27))
     }
 
+    func testAnActivationBeforeTheMountIsLookedAtWaitsForIt() throws {
+        // The double-click on the copy can bring the app forward before the scan of its mount has got as far as the
+        // copy (a napped app, a sleeping network share among the volumes listed): that activation is the one that
+        // counts.
+        let update = makeUpdate()
+        watch(update)
+        let gate = DispatchSemaphore(value: 0)
+        system.listGate = gate
+        try mount("Peekaboo 26", releaseVersion(26))
+        XCTAssertEqual(update.looking, 1, "counted as it is posted, on the main thread")
+        XCTAssertEqual(update.staging, 0)
+        system.active = true
+        XCTAssertFalse(update.activated())
+        spin(0.2)
+        XCTAssertEqual(system.jobs, [], "nothing is staged yet")
+        gate.signal()
+        XCTAssertTrue(spin(5) { self.system.jobs.count == 1 }, "the hand-over follows once the copy is staged")
+        XCTAssertEqual(system.jobs.first?.version, releaseVersion(26))
+        XCTAssertEqual(update.looking, 0)
+
+        // A mount with no newer Peekaboo on it: the activation that waited for it changes nothing.
+        let later = System()
+        later.listGate = gate
+        let other = makeUpdate(system: later)
+        watch(other)
+        try mount("Photos", nil, in: later)
+        later.active = true
+        XCTAssertFalse(other.activated())
+        gate.signal()
+        XCTAssertTrue(spin(5) { other.looking == 0 })
+        spin(0.1)
+        XCTAssertEqual(later.jobs, [])
+        XCTAssertEqual(later.terminations, 0)
+    }
+
     func testTheUpdatersDownloadInstallsInsteadWhenItIsAsNewOrNewer() throws {
         let photo = URL(fileURLWithPath: "/Photos/a.jpg")
         for (ready, viaUpdater) in [(26, true), (27, true), (25, false)] {
@@ -494,13 +609,21 @@ final class DiskImageUpdateTests: ViewerTestCase {
         XCTAssertEqual(system.terminations, 0)
         XCTAssertNil(update.pending)
         XCTAssertTrue(spin(5) { !FileManager.default.fileExists(atPath: self.staged(releaseVersion(26)).path) })
-        // One attempt per version and run.
+
+        // One attempt per version and run: the same image opened again is staged again, but neither the next
+        // activation nor the quit starts its installer (or says so) a second time.
         system.spawnError = nil
+        let image = try XCTUnwrap(system.volumes.first)
+        unmount(image)
+        try mount("Peekaboo 26", releaseVersion(26))
+        XCTAssertTrue(spin(5) { update.pending?.version == releaseVersion(26) && update.looking == 0 }, "staged again")
         update.activated()
         spin(0.1)
         update.willTerminate()
         XCTAssertEqual(system.jobs, [])
-        XCTAssertEqual(updater.quitInstalls, 1)
+        XCTAssertEqual(system.terminations, 0)
+        XCTAssertEqual(toasts.count, 1)
+        XCTAssertEqual(updater.quitInstalls, 1, "the updater's quit as before")
     }
 
     func testNoHandOverWhenTheStagedCopyIsGoneOrNoLongerNewer() throws {

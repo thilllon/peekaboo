@@ -6,16 +6,18 @@ import XCTest
 func releaseVersion(_ n: Int) -> AppVersion { AppVersion(name: String(format: "202611%02d-0000%02d", n, n), build: n)! }
 
 /// A minimal app bundle: Info.plist, an executable (a copy of `/usr/bin/true`, which no test may run: issue #87) and a
-/// resource, ad-hoc signed with `identifier`; `shortVersion` replaces the version's name (an old `0.1.0`).
+/// resource, ad-hoc signed with `identifier`; `shortVersion` replaces the version's name (an old `0.1.0`),
+/// `minimumSystemVersion` is its `LSMinimumSystemVersion` (none by default).
 @discardableResult
 func makeApp(_ url: URL, version: AppVersion, identifier: String = "com.thilllon.Peekaboo", shortVersion: String? = nil,
-             sign: Bool = true) throws -> URL {
+             minimumSystemVersion: String? = nil, sign: Bool = true) throws -> URL {
     let fm = FileManager.default
     try fm.createDirectory(at: url.appendingPathComponent("Contents/MacOS"), withIntermediateDirectories: true)
     try fm.createDirectory(at: url.appendingPathComponent("Contents/Resources"), withIntermediateDirectories: true)
-    let info: [String: Any] = ["CFBundleIdentifier": identifier, "CFBundleShortVersionString": shortVersion ?? version.name,
+    var info: [String: Any] = ["CFBundleIdentifier": identifier, "CFBundleShortVersionString": shortVersion ?? version.name,
                                "CFBundleVersion": String(version.build), "CFBundleExecutable": "Peekaboo",
                                "CFBundlePackageType": "APPL"]
+    if let minimumSystemVersion { info["LSMinimumSystemVersion"] = minimumSystemVersion }
     try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
         .write(to: url.appendingPathComponent("Contents/Info.plist"))
     try fm.copyItem(at: URL(fileURLWithPath: "/usr/bin/true"), to: url.appendingPathComponent("Contents/MacOS/Peekaboo"))
@@ -162,6 +164,11 @@ final class UpdateTests: XCTestCase {
         XCTAssertFalse(try runs("26.1", 26, 0, 9))
         XCTAssertFalse(try runs("27.0", 26, 6))
         XCTAssertTrue(try runs("26.0.1", 26, 0, 1))
+        // The same comparison for a bundle's LSMinimumSystemVersion, which nothing validated before.
+        let tahoe = OperatingSystemVersion(majorVersion: 26, minorVersion: 1, patchVersion: 0)
+        XCTAssertTrue(UpdateManifest.runs("14.0", on: tahoe))
+        XCTAssertFalse(UpdateManifest.runs("26.2", on: tahoe))
+        XCTAssertFalse(UpdateManifest.runs("tahoe", on: tahoe), "not a version: never installed")
     }
 
     // MARK: Schedule
@@ -235,6 +242,42 @@ final class UpdateTests: XCTestCase {
         }
         let unsigned = try makeApp(directory.appendingPathComponent("Unsigned.app"), version: releaseVersion(26), sign: false)
         XCTAssertThrowsError(try UpdateInstaller.verify(unsigned, version: releaseVersion(26), requirement: adHoc))
+    }
+
+    func testVerificationRefusesALinkAndAnAppForANewerMacOS() throws {
+        // The signature check would follow a link to the bundle it points to, which anyone may change later.
+        let app = try makeApp(directory.appendingPathComponent("Shared/Peekaboo.app"), version: releaseVersion(26))
+        let link = directory.appendingPathComponent("Volume/Peekaboo.app")
+        try FileManager.default.createDirectory(at: link.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: app)
+        XCTAssertNoThrow(try CodeSignature.check(link, requirement: adHoc), "what the link points to is signed")
+        XCTAssertThrowsError(try UpdateInstaller.verify(link, version: releaseVersion(26), requirement: adHoc)) { error in
+            XCTAssertEqual(error as? UpdateError, .verification("Peekaboo.app is a symbolic link"))
+        }
+
+        // LSMinimumSystemVersion: an app that would not start here is refused, one for this macOS or older is not.
+        let later = try makeApp(directory.appendingPathComponent("Later/Peekaboo.app"), version: releaseVersion(26),
+                                minimumSystemVersion: "99.0")
+        XCTAssertThrowsError(try UpdateInstaller.verify(later, version: releaseVersion(26), requirement: adHoc)) { error in
+            XCTAssertEqual(error as? UpdateError, .verification("it needs macOS 99.0"))
+        }
+        let older = try makeApp(directory.appendingPathComponent("Older/Peekaboo.app"), version: releaseVersion(26),
+                                minimumSystemVersion: "14.0")
+        XCTAssertNoThrow(try UpdateInstaller.verify(older, version: releaseVersion(26), requirement: adHoc))
+        XCTAssertEqual(AppInstall.peekabooRelease(later)?.minimumSystemVersion, "99.0")
+        XCTAssertEqual(AppInstall.peekabooRelease(later)?.version, releaseVersion(26))
+        XCTAssertNil(AppInstall.peekabooRelease(app)?.minimumSystemVersion)
+
+        // The helper installs neither over the app: a link would take the app's place, pointing elsewhere.
+        let target = try makeApp(directory.appendingPathComponent("Applications/Peekaboo.app"), version: releaseVersion(25))
+        for staged in [link, later] {
+            XCTAssertThrowsError(try UpdateInstaller.install(staged, over: target, version: releaseVersion(26), requirement: adHoc))
+            XCTAssertFalse(AppInstall.isSymbolicLink(target))
+            XCTAssertEqual(try version(of: target), releaseVersion(25))
+        }
+        XCTAssertTrue(AppInstall.isSymbolicLink(link))
+        XCTAssertFalse(AppInstall.isSymbolicLink(app))
+        XCTAssertFalse(AppInstall.isSymbolicLink(directory.appendingPathComponent("missing")))
     }
 
     // MARK: Install
@@ -421,11 +464,16 @@ final class UpdateTests: XCTestCase {
     /// recorded, never run.
     func testHelperRelaunchesWithTheEjectOptionOnlyAfterAnInstall() throws {
         let target = try makeApp(directory.appendingPathComponent("Applications/Peekaboo.app"), version: releaseVersion(25))
-        let photo = URL(fileURLWithPath: "/Photos/a b.jpg")
+        let photo = directory.appendingPathComponent("Photos/a b.jpg")
+        try FileManager.default.createDirectory(at: photo.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("jpeg".utf8).write(to: photo)
         let cache = directory.appendingPathComponent("cache")
         var relaunches: [[String]] = []
         func run(_ job: UpdateInstaller.Job) -> Int32 {
-            UpdateInstaller.runHelper(job.arguments, requirement: adHoc, cache: cache) { relaunches.append($0) }
+            UpdateInstaller.runHelper(job.arguments, requirement: adHoc, cache: cache) {
+                relaunches.append($0)
+                return true
+            }
         }
         func stagedApp(_ version: AppVersion) throws -> URL {
             try makeApp(directory.appendingPathComponent("Updates/\(version.token)/Peekaboo.app"), version: version)
@@ -457,6 +505,37 @@ final class UpdateTests: XCTestCase {
         XCTAssertEqual(try version(of: target), releaseVersion(29))
         XCTAssertEqual(UpdateInstaller.relaunchArguments(target, reopening: nil, ejectingAfter: 77),
                        ["-a", target.path, "--args", "--eject-disk-images=77"])
+    }
+
+    /// `open` refuses a file that no longer exists before it starts the app (the photo shown was deleted, or was on a
+    /// card ejected meanwhile): the app is relaunched without it, and without a file whenever `open` fails on one.
+    func testHelperRelaunchesWithoutAPhotoThatIsGone() throws {
+        let target = try makeApp(directory.appendingPathComponent("Applications/Peekaboo.app"), version: releaseVersion(25))
+        let cache = directory.appendingPathComponent("cache")
+        let eject = "--eject-disk-images=\(getpid())"
+        var relaunches: [[String]] = []
+        func run(_ build: Int, reopening photo: URL, openSucceeds: @escaping ([String]) -> Bool) throws -> Int32 {
+            let staged = try makeApp(directory.appendingPathComponent("Updates/\(releaseVersion(build).token)/Peekaboo.app"),
+                                     version: releaseVersion(build))
+            let job = UpdateInstaller.Job(pid: try exitedProcess(), staged: staged, target: target, version: releaseVersion(build),
+                                          relaunch: true, reopen: photo, ejectDiskImages: true)
+            return UpdateInstaller.runHelper(job.arguments, requirement: adHoc, cache: cache) {
+                relaunches.append($0)
+                return openSucceeds($0)
+            }
+        }
+
+        let gone = directory.appendingPathComponent("CARD/DCIM/100CANON/IMG_0042.JPG")  // the card was ejected
+        XCTAssertEqual(try run(26, reopening: gone) { _ in true }, 0)
+        XCTAssertEqual(relaunches, [["-a", target.path, "--args", eject]], "never a file open would refuse")
+
+        relaunches = []
+        let photo = directory.appendingPathComponent("IMG_0043.JPG")
+        try Data("jpeg".utf8).write(to: photo)
+        XCTAssertEqual(try run(27, reopening: photo) { !$0.contains(photo.path) }, 0)
+        XCTAssertEqual(relaunches, [["-a", target.path, photo.path, "--args", eject], ["-a", target.path, "--args", eject]],
+                       "open failed on the photo: the app starts without it")
+        XCTAssertEqual(try version(of: target), releaseVersion(27))
     }
 
     func testWhereTheAppCannotReplaceItself() throws {

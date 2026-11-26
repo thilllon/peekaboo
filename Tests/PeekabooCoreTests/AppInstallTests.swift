@@ -371,13 +371,63 @@ final class AppInstallTests: XCTestCase {
         let tampered = try makeApp(directory.appendingPathComponent("Volumes/Tampered/Peekaboo.app"), version: releaseVersion(26))
         try Data("tampered".utf8).write(to: tampered.appendingPathComponent("Contents/Resources/data.txt"))
         let team = CodeSignature.updateRequirement(teamIdentifier: "ABCDE12345")!
+        // One that needs a newer macOS would not start once installed, and the app it replaced would be gone.
+        let later = try makeApp(directory.appendingPathComponent("Volumes/Later/Peekaboo.app"), version: releaseVersion(26),
+                                minimumSystemVersion: "99.0")
         for (copy, version, requirement) in [(tampered, releaseVersion(26), adHoc), (app, releaseVersion(27), adHoc),
-                                             (app, releaseVersion(26), team)] {
+                                             (app, releaseVersion(26), team), (later, releaseVersion(26), adHoc)] {
             XCTAssertThrowsError(try AppInstall.stage(copy, version: version, in: root, requirement: requirement)) { error in
                 XCTAssertTrue(AppInstall.failureReason(error).hasPrefix("The copy failed verification: "), "\(error)")
             }
             XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), [], "\(copy.path) \(version)")
         }
+    }
+
+    /// A disk image whose Peekaboo.app is a symbolic link: to a quarantined folder of the user's (its flags must stay),
+    /// or to a signed Peekaboo someone else may change later (it must not become the staged copy, and so the app).
+    func testNeverStagesASymbolicLink() throws {
+        let root = directory.appendingPathComponent("cache/Updates", isDirectory: true)
+        func link(_ name: String, to destination: URL) throws -> URL {
+            let link = directory.appendingPathComponent("Volumes/\(name)/Peekaboo.app")
+            try FileManager.default.createDirectory(at: link.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: destination)
+            return link
+        }
+        /// Every file and folder of `bundle`, with the quarantine flag.
+        func flag(_ bundle: URL) throws -> [String] {
+            let paths = try XCTUnwrap(FileManager.default.subpaths(atPath: bundle.path)).map { bundle.path + "/" + $0 } + [bundle.path]
+            for path in paths { try setQuarantine(path, noFollow: true) }
+            return paths
+        }
+        let downloads = try makeApp(directory.appendingPathComponent("Downloads/x"), version: releaseVersion(26), sign: false)
+        let shared = try makeApp(directory.appendingPathComponent("Shared/Peekaboo.app"), version: releaseVersion(27))
+        let flagged = try flag(downloads) + flag(shared)
+        for (copy, version) in [(try link("Crafted", to: downloads), releaseVersion(26)),
+                                (try link("Pointer", to: shared), releaseVersion(27))] {
+            XCTAssertThrowsError(try AppInstall.stage(copy, version: version, in: root, requirement: adHoc)) { error in
+                XCTAssertEqual(AppInstall.failureReason(error), "The copy failed verification: Peekaboo.app is a symbolic link")
+            }
+            XCTAssertEqual((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? [], [], copy.path)
+        }
+        for path in flagged { XCTAssertTrue(hasQuarantine(path), "what the link points to keeps its flag: \(path)") }
+
+        // A link staged there before (by whatever) is neither used nor followed: a real copy replaces it.
+        let app = try source(releaseVersion(27))
+        let staged = root.appendingPathComponent("\(releaseVersion(27).token)/Peekaboo.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: staged.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: staged, withDestinationURL: shared)
+        XCTAssertEqual(try AppInstall.stage(app, version: releaseVersion(27), in: root, requirement: adHoc), staged)
+        XCTAssertFalse(AppInstall.isSymbolicLink(staged))
+        XCTAssertNoThrow(try CodeSignature.check(staged, requirement: adHoc))
+        XCTAssertNoThrow(try CodeSignature.check(shared, requirement: adHoc), "what it pointed to is left as it was")
+        for path in flagged { XCTAssertTrue(hasQuarantine(path), path) }
+
+        // Clearing the flag through a link is refused outright, and so is installing one (#81's copy from a disk
+        // image).
+        XCTAssertThrowsError(try AppInstall.removeQuarantine(in: try link("Again", to: downloads)))
+        XCTAssertThrowsError(try install(try link("Install", to: shared), releaseVersion(27)))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+        for path in flagged { XCTAssertTrue(hasQuarantine(path), path) }
     }
 
     private func setQuarantine(_ path: String, noFollow: Bool = false) throws {
@@ -468,7 +518,11 @@ final class AppInstallTests: XCTestCase {
         let shown = [photos.url.appendingPathComponent("IMG_0001.HEIC"), URL(fileURLWithPath: "/home/someone/b.jpg")]
         XCTAssertEqual(AppInstall.diskImages(in: volumes, under: root.path + "/", keeping: shown, isDiskImage: isDiskImage),
                        [current.url, older.url, first.url])
-        XCTAssertEqual(asked, [current, older, first, drive].map(\.url.lastPathComponent), "only Peekaboo images are asked about")
+        // DiskArbitration first, before anything on the volume is read (those without a Peekaboo are asked about too):
+        // the first read of a card or a drive (`drive`) may have macOS ask the user for the Removable Volumes
+        // permission.
+        XCTAssertEqual(asked, [current, older, first, drive].map(\.url.lastPathComponent) + ["Other", "Photos"],
+                       "every read-only local volume is asked about before it is read")
         XCTAssertEqual(AppInstall.diskImages(in: volumes, under: root.path + "/", isDiskImage: isDiskImage),
                        [current.url, older.url, first.url, photos.url], "once its photos are not shown")
         // By default only volumes under /Volumes count: never the system volume, nor one mounted elsewhere.

@@ -102,18 +102,23 @@ final class DiskImageUpdate {
 
     // Main thread.
     /// The copy that installs the next time the app comes to the front.
-    private(set) var pending: Copy? { didSet { armed = pending != nil || staging > 0 } }
+    private(set) var pending: Copy? { didSet { arm() } }
     /// Copies being staged: an activation meanwhile waits for them (one may be newer than `pending`).
-    private(set) var staging = 0 { didSet { armed = pending != nil || staging > 0 } }
-    /// A copy is pending or being staged: all an activation looks at. One stored flag, because a `Copy?` holds a URL, a
-    /// type whose size Foundation only knows at run time: testing it for nil goes through its metadata (42 ns a call in a
-    /// release build, against 1 ns for the flag).
+    private(set) var staging = 0 { didSet { arm() } }
+    /// Mounts whose volumes are still being looked at: the double-click on a copy there may bring the app forward
+    /// before the copy counts in `staging`, and that activation waits for the look as well.
+    private(set) var looking = 0 { didSet { arm() } }
+    /// A copy is pending, being staged or maybe on a volume just mounted: all an activation looks at. One stored flag,
+    /// because a `Copy?` holds a URL, a type whose size Foundation only knows at run time: testing it for nil goes
+    /// through its metadata (42 ns a call in a release build, against 1 ns for the flag).
     private var armed = false
     /// The workspace observers are registered (they are, on the utility queue, shortly after `start`).
     private(set) var isWatching = false
-    /// The app came to the front with a copy pending or being staged: the hand-over follows once nothing holds it back
-    /// (a copy being staged, a file operation, a menu or a modal panel) and the app is still in front.
+    /// The app came to the front while `armed`: the hand-over follows once nothing holds it back (a volume just
+    /// mounted, a copy being staged, a file operation, a menu or a modal panel) and the app is still in front.
     private var handOverWanted = false
+    /// Activations less than `activationDelay` old: the hand-over waits for the last of them.
+    private var settling = 0
     /// Versions whose install was tried in this run: one attempt each.
     private var attempted: Set<AppVersion> = []
     /// An installer has started (this one's or the updater's) and the app quits.
@@ -173,7 +178,8 @@ final class DiskImageUpdate {
             self.center = center
             observers = [
                 center.addObserver(forName: NSWorkspace.didMountNotification, object: nil, queue: nil) { [weak self] _ in
-                    self?.queue.async { [weak self] in self?.scan() }
+                    // AppKit posts it on the main thread, so the mount counts before any activation that follows it.
+                    if Thread.isMainThread { self?.mounted() } else { DispatchQueue.main.async { self?.mounted() } }
                 },
                 center.addObserver(forName: NSWorkspace.didUnmountNotification, object: nil, queue: nil) { [weak self] note in
                     guard let volume = note.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL else { return }
@@ -184,6 +190,16 @@ final class DiskImageUpdate {
             DispatchQueue.main.async { [weak self] in self?.isWatching = true }
         }
         queue.asyncAfter(deadline: .now() + scanDelay) { [weak self] in self?.scan() }
+    }
+
+    /// A volume was mounted (main thread): look at it on the queue; until that is done, an activation waits for it
+    /// (`looking`).
+    private func mounted() {
+        looking += 1
+        queue.async { [weak self] in
+            self?.scan()
+            DispatchQueue.main.async { [weak self] in self?.looked() }
+        }
     }
 
     // MARK: Staging (on `queue`)
@@ -241,9 +257,10 @@ final class DiskImageUpdate {
     }
 
     /// The Peekaboo.app at the top of each disk image (a read-only local volume under `volumesRoot`) not looked at yet,
-    /// if it is newer than this build and than the one staged: newest first. Only a disk image is read (one
-    /// `Info.plist`): never a locked card, a read-only drive or a network share, whose first read may have macOS ask the
-    /// user for the Removable or Network Volumes permission.
+    /// if it is newer than this build and than the one staged, and runs on this macOS: newest first. Only a disk image
+    /// is read (one `Info.plist`): never a locked card, a read-only drive or a network share, whose first read may have
+    /// macOS ask the user for the Removable or Network Volumes permission. A Peekaboo.app that is a symbolic link is
+    /// left: it could point anywhere, a folder of the user's or a copy someone else may change later.
     private func newerCopies() -> [(app: URL, version: AppVersion)] {
         hooks.volumes().compactMap { volume -> (app: URL, version: AppVersion)? in
             let path = volume.url.standardizedFileURL.path
@@ -251,9 +268,18 @@ final class DiskImageUpdate {
                   hooks.isDiskImage(volume.url)
             else { return nil }
             let copy = volume.url.appendingPathComponent("Peekaboo.app", isDirectory: true)
-            guard let version = AppInstall.peekabooVersion(copy) else { return nil }
+            guard !AppInstall.isSymbolicLink(copy) else {
+                Trace.log("disk image: \(copy.path) is a symbolic link: left")
+                return nil
+            }
+            guard let (version, minimum) = AppInstall.peekabooRelease(copy) else { return nil }
             guard version.build > max(current.build, newest?.build ?? 0) else {
                 Trace.log("disk image: \(copy.path) is \(version) (build \(version.build)): not newer")
+                return nil
+            }
+            // Installed, it would not start, and the copy it replaced would be gone.
+            if let minimum, !UpdateManifest.runs(minimum, on: ProcessInfo.processInfo.operatingSystemVersion) {
+                Trace.log("disk image: \(copy.path) is \(version), which needs macOS \(minimum): left")
                 return nil
             }
             return (copy, version)
@@ -270,6 +296,15 @@ final class DiskImageUpdate {
     }
 
     // MARK: Main thread
+
+    private func arm() { armed = pending != nil || staging > 0 || looking > 0 }
+
+    /// The volumes of a mount have been looked at (and a copy found there staged): a hand-over that waited for them
+    /// follows.
+    private func looked() {
+        looking -= 1
+        resume()
+    }
 
     /// A copy was staged (nil: it failed): it is the pending one now, and the copy it supersedes goes.
     private func staged(_ copy: Copy?) {
@@ -290,7 +325,7 @@ final class DiskImageUpdate {
                 if let previous, previous.version != copy.version { remove(previous) }
             }
         }
-        if staging == 0 { resume() }
+        resume()
     }
 
     /// The app came to the front (`applicationDidBecomeActive`, `applicationShouldHandleReopen`): hand over to the staged
@@ -308,7 +343,12 @@ final class DiskImageUpdate {
     private func activatedWithACopy() -> Bool {
         if handedOver { return true }
         handOverWanted = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + activationDelay) { [weak self] in self?.resume() }
+        settling += 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + activationDelay) { [weak self] in
+            guard let self else { return }
+            settling -= 1
+            resume()
+        }
         return false
     }
 
@@ -345,9 +385,10 @@ final class DiskImageUpdate {
         return updates.helperStarted || (updates.installsOnQuit && (updates.readyBuild ?? 0) >= copy.version.build)
     }
 
-    /// Hand over now if one is wanted, nothing holds it back any more and the app is still in front.
+    /// Hand over now if one is wanted, nothing holds it back any more and the app is still in front. Never before the
+    /// last activation is `activationDelay` old, even when a copy is staged sooner: the file opened with it may follow.
     private func resume() {
-        guard handOverWanted, staging == 0, hooks.isActive() else { return }
+        guard handOverWanted, settling == 0, staging == 0, looking == 0, hooks.isActive() else { return }
         handOver()
     }
 
@@ -359,9 +400,12 @@ final class DiskImageUpdate {
             RunLoop.main.perform(inModes: [.default]) { [weak self] in self?.resume() }
             return
         }
-        // A copy on its way may be newer; a file operation would be cut short: once they are done.
-        if staging > 0 || isRunningFileOperation() {
-            Trace.log("disk image: the update waits for \(staging > 0 ? "the copy being staged" : "the file operation")")
+        // A copy on its way, or on a volume just mounted, may be newer; a file operation would be cut short: once they
+        // are done.
+        if staging > 0 || looking > 0 || isRunningFileOperation() {
+            let cause = staging > 0 ? "the copy being staged"
+                : looking > 0 ? "the volume just mounted" : "the file operation"
+            Trace.log("disk image: the update waits for \(cause)")
             return
         }
         handOverWanted = false
