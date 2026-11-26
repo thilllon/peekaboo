@@ -268,24 +268,34 @@ final class InstallationTests: ViewerTestCase {
         XCTAssertEqual(calls.last, "quit", "only once every file is there")
     }
 
-    func testQuittingACopyWaitsUntilNoProcessRunsItsBundle() throws {
-        // A process that runs the bundle's executable (a copy of sleep(1)): no app this session could quit, like the
-        // update installer a quitting copy starts, or a copy of another user's.
-        let bundle = root.appendingPathComponent("Applications/Peekaboo.app", isDirectory: true)
-        let executable = bundle.appendingPathComponent("Contents/MacOS/Peekaboo")
-        try FileManager.default.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try FileManager.default.copyItem(at: URL(fileURLWithPath: "/bin/sleep"), to: executable)
-        XCTAssertTrue(Installation.quit(bundle, timeout: 0.2), "nothing runs it")
-        let process = Process()
-        process.executableURL = executable
-        process.arguments = ["30"]
-        do { try process.run() } catch { throw XCTSkip("cannot run a copy of sleep here: \(error)") }
-        defer { if process.isRunning { process.terminate() } }
+    func testQuittingACopyWaitsUntilNoProcessRunsItsBundle() {
+        // The processes that run the bundle, faked: one that no app this session could quit, like the update installer a
+        // quitting copy starts, or a copy of another user's. Nothing is quit and no process is started (a copy of a
+        // system binary run by a test makes Gatekeeper put dialogs on screen: issue #87).
+        var calls: [String] = []
+        /// `Installation.quit` of the target, while `running(n)` runs it at the n-th look.
+        func quit(timeout: TimeInterval, running: (Int) -> [pid_t]) -> Bool {
+            var looks = 0
+            return Installation.quit(target, timeout: timeout, quitCopies: { calls.append("quit \($0.path)") }) { app in
+                calls.append("look \(app.path)")
+                looks += 1
+                return running(looks)
+            }
+        }
+        let (quitCopies, look) = ("quit \(target.path)", "look \(target.path)")
+        XCTAssertTrue(quit(timeout: 0.2) { _ in [] }, "nothing runs it")
+        XCTAssertEqual(calls, [quitCopies, look], "the copies are quit first")
+
+        calls = []
         let started = Date()
-        XCTAssertFalse(Installation.quit(bundle, timeout: 0.3), "it still runs")
+        XCTAssertFalse(quit(timeout: 0.3) { _ in [4242] }, "it still runs")
         XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.3)
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { process.terminate() }
-        XCTAssertTrue(Installation.quit(bundle, timeout: 5), "it has exited")
+        XCTAssertEqual(calls.first, quitCopies)
+        XCTAssertGreaterThan(calls.count, 2, "it is looked at again while it runs: \(calls)")
+
+        calls = []
+        XCTAssertTrue(quit(timeout: 5) { $0 < 4 ? [4242] : [] }, "it has exited")
+        XCTAssertEqual(calls, [quitCopies] + Array(repeating: look, count: 4))
     }
 
     // MARK: Ejecting the disk images

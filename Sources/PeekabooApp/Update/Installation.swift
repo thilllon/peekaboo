@@ -157,21 +157,28 @@ final class Installation {
         hooks.terminate()
     }
 
-    /// Quit the copies of Peekaboo that run the bundle at `app` in this session, and wait up to `timeout` until no
-    /// process runs it any more: the update installer a quitting copy may start swaps the bundle behind it first.
-    static func quit(_ app: URL, timeout: TimeInterval) -> Bool {
+    /// Quit the copies of Peekaboo that run the bundle at `app` in this session (`quitCopies`), and wait up to `timeout`
+    /// until no process runs it any more (`processes`): the update installer a quitting copy may start swaps the bundle
+    /// behind it first.
+    static func quit(_ app: URL, timeout: TimeInterval, quitCopies: (URL) -> Void = Installation.quitCopies(of:),
+                     processes: (URL) -> [pid_t] = { AppInstall.processes(runningFrom: $0) }) -> Bool {
+        quitCopies(app)
+        let deadline = Date().addingTimeInterval(timeout)
+        while !processes(app).isEmpty {
+            if Date() >= deadline { return false }
+            usleep(50_000)
+        }
+        return true
+    }
+
+    /// Ask the copies of Peekaboo that run the bundle at `app` in this session to quit.
+    private static func quitCopies(of app: URL) {
         let path = app.resolvingSymlinksInPath().path
         for copy in NSRunningApplication.runningApplications(withBundleIdentifier: CodeSignature.bundleIdentifier)
         where copy.processIdentifier != getpid() && copy.bundleURL?.resolvingSymlinksInPath().path == path {
             Trace.log("install: quitting process \(copy.processIdentifier)")
             copy.terminate()
         }
-        let deadline = Date().addingTimeInterval(timeout)
-        while !AppInstall.processes(runningFrom: app).isEmpty {
-            if Date() >= deadline { return false }
-            usleep(50_000)
-        }
-        return true
     }
 
     private static func open(_ urls: [URL], in target: URL, newInstance: Bool, arguments: [String],

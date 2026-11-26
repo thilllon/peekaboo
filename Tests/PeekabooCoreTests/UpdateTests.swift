@@ -5,8 +5,8 @@ import XCTest
 /// Release `n` of the updater tests: `202611nn-0000nn` with build number `n` (24 < 25 < 26 < 27).
 func releaseVersion(_ n: Int) -> AppVersion { AppVersion(name: String(format: "202611%02d-0000%02d", n, n), build: n)! }
 
-/// A minimal app bundle: Info.plist, an executable (a copy of `/usr/bin/true`) and a resource, ad-hoc signed with
-/// `identifier`; `shortVersion` replaces the version's name (an old `0.1.0`).
+/// A minimal app bundle: Info.plist, an executable (a copy of `/usr/bin/true`, which no test may run: issue #87) and a
+/// resource, ad-hoc signed with `identifier`; `shortVersion` replaces the version's name (an old `0.1.0`).
 @discardableResult
 func makeApp(_ url: URL, version: AppVersion, identifier: String = "com.thilllon.Peekaboo", shortVersion: String? = nil,
              sign: Bool = true) throws -> URL {

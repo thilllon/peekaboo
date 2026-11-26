@@ -440,30 +440,61 @@ final class AppInstallTests: XCTestCase {
     // MARK: Processes
 
     func testFindsTheProcessesThatRunABundle() throws {
-        // A bundle whose executable is a copy of sleep(1), running for the test.
+        // The processes as the system lists them, faked: no test runs a copy of a system binary (on macOS 26 XProtect
+        // flags it, and Gatekeeper puts dialogs on screen: issue #87). The kernel names the scratch folder /private/var/….
         let bundle = directory.appendingPathComponent("Running/Peekaboo.app", isDirectory: true)
-        let executable = bundle.appendingPathComponent("Contents/MacOS/Peekaboo")
-        try FileManager.default.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try FileManager.default.copyItem(at: URL(fileURLWithPath: "/bin/sleep"), to: executable)
-        XCTAssertEqual(AppInstall.processes(runningFrom: bundle), [])
-        let process = Process()
-        process.executableURL = executable
-        process.arguments = ["30"]
-        do { try process.run() } catch { throw XCTSkip("cannot run a copy of sleep here: \(error)") }
-        defer { if process.isRunning { process.terminate() } }
-        XCTAssertEqual(AppInstall.processes(runningFrom: bundle), [process.processIdentifier])
-        XCTAssertEqual(AppInstall.processes(runningFrom: bundle.appendingPathComponent("Contents", isDirectory: true)),
-                       [process.processIdentifier], "anywhere inside")
-        // Neither a folder next to it whose name starts the same, nor a missing one.
         let namesake = directory.appendingPathComponent("Running/Peekaboo", isDirectory: true)
-        try FileManager.default.createDirectory(at: namesake, withIntermediateDirectories: true)
-        XCTAssertEqual(AppInstall.processes(runningFrom: namesake), [])
-        XCTAssertEqual(AppInstall.processes(runningFrom: directory.appendingPathComponent("Missing.app", isDirectory: true)), [])
+        for folder in [bundle.appendingPathComponent("Contents/MacOS"), namesake] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
+        let real = try XCTUnwrap(realpath(directory.path, nil))
+        let kernel = String(cString: real)
+        free(real)
+        let executable = kernel + "/Running/Peekaboo.app/Contents/MacOS/Peekaboo"
+        // The app and the update installer it starts, this process, a namesake bundle next to it, and another program.
+        let running: [(pid: pid_t, executable: String)] = [
+            (4242, executable), (4243, executable), (getpid(), executable),
+            (4244, kernel + "/Running/Peekaboo.app 2/Contents/MacOS/Peekaboo"), (4245, "/bin/sleep"),
+        ]
+        var listed = 0
+        func processes(_ folder: URL) -> [pid_t] {
+            AppInstall.processes(runningFrom: folder) {
+                listed += 1
+                return running
+            }
+        }
+        XCTAssertEqual(processes(bundle), [4242, 4243], "the app and its update installer, never this process")
+        XCTAssertEqual(processes(bundle.appendingPathComponent("Contents", isDirectory: true)), [4242, 4243], "anywhere inside")
+        XCTAssertEqual(processes(namesake), [], "a folder next to it whose name starts the same")
+        XCTAssertEqual(listed, 3)
+        XCTAssertEqual(processes(directory.appendingPathComponent("Missing.app", isDirectory: true)), [])
+        XCTAssertEqual(listed, 3, "the processes are not listed for a folder that does not exist")
+    }
+
+    func testFindsTheProcessesThatRunFromAFolder() throws {
+        // sleep(1) at its own path, never a copy (issue #87), running for the test. Other processes may run from /bin too.
+        let bin = URL(fileURLWithPath: "/bin", isDirectory: true)
+        let process = Process()
+        process.executableURL = bin.appendingPathComponent("sleep")
+        process.arguments = ["30"]
+        try process.run()
+        defer { if process.isRunning { process.terminate() } }
+        let pid = process.processIdentifier
+        XCTAssertTrue(AppInstall.runningExecutables().contains { $0.pid == pid && $0.executable == "/bin/sleep" },
+                      "the system lists it with its executable's path")
+        XCTAssertTrue(AppInstall.processes(runningFrom: bin).contains(pid))
+        // Neither a path that starts the same without the separator (sleep itself, /bi), nor a missing folder.
+        for path in ["/bin/sleep", "/bi", directory.appendingPathComponent("Missing.app").path] {
+            XCTAssertFalse(AppInstall.processes(runningFrom: URL(fileURLWithPath: path)).contains(pid), path)
+        }
         process.terminate()
         process.waitUntilExit()
-        XCTAssertEqual(AppInstall.processes(runningFrom: bundle), [])
-        // Never this process: the test runner's own executable lies in its bundle.
-        XCTAssertFalse(AppInstall.processes(runningFrom: Bundle.main.bundleURL).contains(getpid()))
+        XCTAssertFalse(AppInstall.processes(runningFrom: bin).contains(pid), "it has exited")
+        // Never this process, not even from the folder of its own executable (the one the system lists: `Bundle.main`
+        // names the xctest that started it).
+        let me = try XCTUnwrap(AppInstall.runningExecutables().first { $0.pid == getpid() })
+        let runner = URL(fileURLWithPath: me.executable).deletingLastPathComponent()
+        XCTAssertFalse(AppInstall.processes(runningFrom: runner).contains(getpid()), runner.path)
     }
 
     func testMountedVolumesListTheStartupDisk() {
