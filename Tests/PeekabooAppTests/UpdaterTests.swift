@@ -62,6 +62,27 @@ final class UpdaterTests: XCTestCase {
         XCTAssertFalse(controller.canPerformUpdate)
     }
 
+    func testUpToDateClearsTheStagedDownloadsButADiskImagesCopy() throws {
+        // A newer Peekaboo staged from a disk image (`DiskImageUpdate`) sits next to the downloads; a check that finds the
+        // app up to date, or a download, clears everything else there.
+        try publish(releaseVersion(25))
+        let updates = UpdateInstaller.updatesFolder(in: cache)
+        for build in [24, 26, 27] {
+            try FileManager.default.createDirectory(at: updates.appendingPathComponent(releaseVersion(build).token),
+                                                    withIntermediateDirectories: true)
+        }
+        let updater = try XCTUnwrap(Updater(settings: AppConfig.Updates(check: false), bundle: try fakeApp(releaseVersion(25)), cache: cache))
+        updater.keepStaged(releaseVersion(27))
+        _ = statuses(until: "Up to date") { updater.checkNow(show: false) }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: updates.path), [releaseVersion(27).token])
+        updater.keepStaged(nil)
+        _ = statuses(until: "Up to date") { updater.checkNow(show: false) }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: updates.path), [])
+        XCTAssertNil(updater.readyBuild)
+        XCTAssertFalse(updater.installsOnQuit)
+        XCTAssertFalse(updater.helperStarted)
+    }
+
     func testANewerReleaseWaitsForTheUserWithoutAutoInstall() throws {
         try publish(releaseVersion(26))
         let updater = try XCTUnwrap(Updater(settings: AppConfig.Updates(check: false, autoInstall: false),

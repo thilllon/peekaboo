@@ -393,19 +393,70 @@ final class UpdateTests: XCTestCase {
         let job = UpdateInstaller.Job(pid: 4242, staged: URL(fileURLWithPath: "/tmp/u/20261126/Peekaboo.app"),
                                       target: URL(fileURLWithPath: "/Applications/Peekaboo.app"),
                                       version: releaseVersion(26), relaunch: true,
-                                      reopen: URL(fileURLWithPath: "/Photos/a b.jpg"))
-        XCTAssertEqual(job.arguments.first, UpdateInstaller.helperFlag)
+                                      reopen: URL(fileURLWithPath: "/Photos/a b.jpg"), ejectDiskImages: true)
+        XCTAssertEqual(job.arguments, ["--install-update", "4242", "/tmp/u/20261126/Peekaboo.app", "/Applications/Peekaboo.app",
+                                       releaseVersion(26).token, "--relaunch", "--eject-disk-images", "--open", "/Photos/a b.jpg"])
         XCTAssertEqual(UpdateInstaller.Job(arguments: job.arguments), job)
         XCTAssertEqual(UpdateInstaller.Job(arguments: Array(job.arguments.dropFirst())), job)
         var plain = job
         plain.relaunch = false
         plain.reopen = nil
+        plain.ejectDiskImages = false
+        XCTAssertEqual(plain.arguments.count, 5)
         XCTAssertEqual(UpdateInstaller.Job(arguments: plain.arguments), plain)
+        var eject = plain
+        eject.ejectDiskImages = true
+        XCTAssertEqual(UpdateInstaller.Job(arguments: eject.arguments), eject)
+        XCTAssertNotEqual(UpdateInstaller.Job(arguments: eject.arguments), plain)
         let token = releaseVersion(26).token
         for bad in [["--install-update"], ["0", "/a", "/b", token], ["x", "/a", "/b", token], ["1", "/a", "/b", "next"],
-                    ["1", "/a", "/b", "20261126"], ["1", "/a", "/b", token, "--open"], ["1", "/a", "/b", token, "--rm"]] {
+                    ["1", "/a", "/b", "20261126"], ["1", "/a", "/b", token, "--open"], ["1", "/a", "/b", token, "--rm"],
+                    ["1", "/a", "/b", token, "--eject-disk-images=4242"]] {
             XCTAssertNil(UpdateInstaller.Job(arguments: bad), "\(bad)")
         }
+    }
+
+    /// The relaunch after an update from a disk image has the app eject the Peekaboo disk images once the helper has
+    /// exited, but only when the update installed: otherwise the copy relaunched is the one that ran. The command line is
+    /// recorded, never run.
+    func testHelperRelaunchesWithTheEjectOptionOnlyAfterAnInstall() throws {
+        let target = try makeApp(directory.appendingPathComponent("Applications/Peekaboo.app"), version: releaseVersion(25))
+        let photo = URL(fileURLWithPath: "/Photos/a b.jpg")
+        let cache = directory.appendingPathComponent("cache")
+        var relaunches: [[String]] = []
+        func run(_ job: UpdateInstaller.Job) -> Int32 {
+            UpdateInstaller.runHelper(job.arguments, requirement: adHoc, cache: cache) { relaunches.append($0) }
+        }
+        func stagedApp(_ version: AppVersion) throws -> URL {
+            try makeApp(directory.appendingPathComponent("Updates/\(version.token)/Peekaboo.app"), version: version)
+        }
+
+        let installed = UpdateInstaller.Job(pid: try exitedProcess(), staged: try stagedApp(releaseVersion(26)), target: target,
+                                            version: releaseVersion(26), relaunch: true, reopen: photo, ejectDiskImages: true)
+        XCTAssertEqual(run(installed), 0)
+        XCTAssertEqual(try version(of: target), releaseVersion(26))
+        XCTAssertEqual(relaunches, [["-a", target.path, photo.path, "--args", "--eject-disk-images=\(getpid())"]],
+                       "the helper's own pid: the relaunched app waits for it to exit")
+
+        relaunches = []
+        let tampered = try stagedApp(releaseVersion(27))
+        try Data("tampered".utf8).write(to: tampered.appendingPathComponent("Contents/Resources/data.txt"))
+        let failed = UpdateInstaller.Job(pid: try exitedProcess(), staged: tampered, target: target, version: releaseVersion(27),
+                                         relaunch: true, reopen: photo, ejectDiskImages: true)
+        XCTAssertEqual(run(failed), 1)
+        XCTAssertEqual(try version(of: target), releaseVersion(26))
+        XCTAssertEqual(relaunches, [["-a", target.path, photo.path]], "nothing installed: nothing to eject")
+
+        // "Restart to Update" relaunches as before; an install on quit does not relaunch.
+        relaunches = []
+        XCTAssertEqual(run(UpdateInstaller.Job(pid: try exitedProcess(), staged: try stagedApp(releaseVersion(28)), target: target,
+                                               version: releaseVersion(28), relaunch: true)), 0)
+        XCTAssertEqual(run(UpdateInstaller.Job(pid: try exitedProcess(), staged: try stagedApp(releaseVersion(29)), target: target,
+                                               version: releaseVersion(29), ejectDiskImages: true)), 0)
+        XCTAssertEqual(relaunches, [["-a", target.path]])
+        XCTAssertEqual(try version(of: target), releaseVersion(29))
+        XCTAssertEqual(UpdateInstaller.relaunchArguments(target, reopening: nil, ejectingAfter: 77),
+                       ["-a", target.path, "--args", "--eject-disk-images=77"])
     }
 
     func testWhereTheAppCannotReplaceItself() throws {
@@ -449,6 +500,20 @@ final class UpdateTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), [releaseVersion(25).token])
         UpdateInstaller.removeStaged(in: root)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), [])
+    }
+
+    func testRemoveStagedNotNewerThanTheRunningBuild() throws {
+        // What earlier runs staged and this build makes stale (installed by now, or older) goes; a newer one, which the
+        // updater or a disk image's copy may still install, and what is no staged version, stay.
+        let root = directory.appendingPathComponent("Updates")
+        let names = [releaseVersion(24).token, releaseVersion(25).token, releaseVersion(26).token, releaseVersion(27).token, "junk"]
+        for name in names {
+            try FileManager.default.createDirectory(at: root.appendingPathComponent(name), withIntermediateDirectories: true)
+        }
+        UpdateInstaller.removeStaged(in: root, notNewerThan: 25)
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: root.path)),
+                       [releaseVersion(26).token, releaseVersion(27).token, "junk"])
+        UpdateInstaller.removeStaged(in: directory.appendingPathComponent("Missing"), notNewerThan: 25)
     }
 
     private func ditto(_ arguments: [String]) throws {

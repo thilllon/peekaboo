@@ -77,6 +77,17 @@ public enum UpdateInstaller {
         }
     }
 
+    /// Delete the staged versions under `root` whose build is not above `build` (the running one): installed by now, or
+    /// older. Newer ones, and anything that is not a staged version, stay.
+    public static func removeStaged(in root: URL, notNewerThan build: Int) {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { return }
+        for entry in entries {
+            guard let version = AppVersion(entry.lastPathComponent), version.build <= build else { continue }
+            try? fm.removeItem(at: entry)
+        }
+    }
+
     // MARK: Verify
 
     /// SHA-256 of a file, lowercase hex (read in 1 MB chunks).
@@ -235,20 +246,27 @@ public enum UpdateInstaller {
         public var relaunch = false
         /// File the relaunched app opens.
         public var reopen: URL?
+        /// The update came from a disk image: once it is installed, the relaunched app ejects the Peekaboo disk images
+        /// (`relaunchArguments`). Not after a failed install: the app relaunched is the one that ran.
+        public var ejectDiskImages = false
 
-        public init(pid: pid_t, staged: URL, target: URL, version: AppVersion, relaunch: Bool = false, reopen: URL? = nil) {
+        public init(pid: pid_t, staged: URL, target: URL, version: AppVersion, relaunch: Bool = false, reopen: URL? = nil,
+                    ejectDiskImages: Bool = false) {
             self.pid = pid
             self.staged = staged
             self.target = target
             self.version = version
             self.relaunch = relaunch
             self.reopen = reopen
+            self.ejectDiskImages = ejectDiskImages
         }
 
-        /// `--install-update <pid> <staged app> <target app> <version token> [--relaunch] [--open <file>]`
+        /// `--install-update <pid> <staged app> <target app> <version token> [--relaunch] [--eject-disk-images]
+        /// [--open <file>]`. The format is internal to one build: the helper is the quitting app's own executable.
         public var arguments: [String] {
             var arguments = [UpdateInstaller.helperFlag, String(pid), staged.path, target.path, version.token]
             if relaunch { arguments.append("--relaunch") }
+            if ejectDiskImages { arguments.append(AppInstall.ejectFlag) }
             if let reopen { arguments += ["--open", reopen.path] }
             return arguments
         }
@@ -263,6 +281,7 @@ public enum UpdateInstaller {
                 rest.removeFirst()
                 switch option {
                 case "--relaunch": relaunch = true
+                case AppInstall.ejectFlag: ejectDiskImages = true
                 case "--open":
                     guard let path = rest.first else { return nil }
                     rest.removeFirst()
@@ -295,10 +314,13 @@ public enum UpdateInstaller {
     }
 
     /// Body of the helper process; returns its exit status. `requirement` defaults to the one for updates of the
-    /// running app (the helper is the quitting app's own executable); a failed install is recorded in `cache`.
-    public static func runHelper(_ arguments: [String], requirement: String? = nil, cache: URL? = cacheFolder) -> Int32 {
+    /// running app (the helper is the quitting app's own executable); a failed install is recorded in `cache`. A
+    /// relaunch runs `/usr/bin/open` with `relaunchArguments` (`relaunch`; tests record them instead).
+    public static func runHelper(_ arguments: [String], requirement: String? = nil, cache: URL? = cacheFolder,
+                                 relaunch: ([String]) -> Void = openApp) -> Int32 {
         guard let job = Job(arguments: arguments) else {
-            FileHandle.standardError.write(Data("usage: Peekaboo \(helperFlag) <pid> <staged app> <target app> <version> [--relaunch] [--open <file>]\n".utf8))
+            FileHandle.standardError.write(Data(("usage: Peekaboo \(helperFlag) <pid> <staged app> <target app> <version>"
+                                                 + " [--relaunch] [\(AppInstall.ejectFlag)] [--open <file>]\n").utf8))
             return 64
         }
         // Replacing the bundle under a running app could break it: without its exit, install nothing.
@@ -323,8 +345,21 @@ public enum UpdateInstaller {
         // the attempt it holds the old app or a download that failed its checks.
         let folder = job.staged.deletingLastPathComponent()
         if AppVersion(folder.lastPathComponent) == job.version { try? FileManager.default.removeItem(at: folder) }
-        if job.relaunch { relaunch(job.target, reopening: job.reopen) }
+        if job.relaunch {
+            relaunch(relaunchArguments(job.target, reopening: job.reopen,
+                                       ejectingAfter: job.ejectDiskImages && status == 0 ? getpid() : nil))
+        }
         return status
+    }
+
+    /// Arguments of `/usr/bin/open` that start the app at `app` again, on `file`: `-a <app> [<file>]`. With
+    /// `ejectingAfter`, `--args --eject-disk-images=<pid>` follow: once process `pid` (the helper) has exited, the
+    /// relaunched app ejects the Peekaboo disk images and says which version is installed where (`DiskImageEjector`).
+    public static func relaunchArguments(_ app: URL, reopening file: URL?, ejectingAfter pid: pid_t?) -> [String] {
+        var arguments = ["-a", app.path]
+        if let file { arguments.append(file.path) }
+        if let pid { arguments += ["--args", "\(AppInstall.ejectFlag)=\(pid)"] }
+        return arguments
     }
 
     /// Wait until process `pid` has exited (true) or `timeout` passed (false).
@@ -337,15 +372,16 @@ public enum UpdateInstaller {
         return true
     }
 
-    private static func relaunch(_ app: URL, reopening file: URL?) {
+    /// Run `/usr/bin/open` with `arguments` (`relaunchArguments`) and wait for it: how the helper relaunches the app.
+    public static func openApp(_ arguments: [String]) {
         let open = Process()
         open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        open.arguments = ["-a", app.path] + (file.map { [$0.path] } ?? [])
+        open.arguments = arguments
         do {
             try open.run()
             open.waitUntilExit()
         } catch {
-            Trace.log("update: cannot relaunch \(app.path): \(error)")
+            Trace.log("update: cannot relaunch (open \(arguments.joined(separator: " "))): \(error)")
         }
     }
 }

@@ -26,6 +26,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     var installation: Installation?
     /// Ejects the Peekaboo disk images in a copy that one of them installed (tests set one).
     lazy var diskImageEjector = DiskImageEjector()
+    /// A newer Peekaboo on a disk image the user opened, installed over this one when the app comes to the front (set a
+    /// second after launch in the interactive Peekaboo.app only; tests set one).
+    var diskImageUpdate: DiskImageUpdate? {
+        didSet { if let diskImageUpdate { connect(diskImageUpdate) } }
+    }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         let arguments = Array(CommandLine.arguments.dropFirst())
@@ -116,10 +121,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if selfTest == nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
                 self?.startUpdates()
+                self?.watchDiskImages()
                 self?.requestFolderAccess()
                 self?.ejectDiskImages()
             }
         }
+    }
+
+    /// From a second after launch: a newer Peekaboo on a disk image the user opens is staged on a utility queue, and
+    /// installed over this one the next time the app comes to the front (`DiskImageUpdate`). The main thread only creates
+    /// it; its workspace observers are registered on its queue.
+    private func watchDiskImages() {
+        let started = Trace.now()
+        guard let update = DiskImageUpdate.forApp(presentation: presentation, selfTest: selfTest != nil,
+                                                 installing: installation != nil, updates: updates?.updater) else { return }
+        diskImageUpdate = update
+        update.start()
+        Trace.log(String(format: "disk image: set up in %.3f ms on the main thread", Trace.ms(since: started)))
+    }
+
+    /// What the disk-image update asks of the app: the file shown, a file operation in flight, a toast.
+    private func connect(_ update: DiskImageUpdate) {
+        update.shownFile = { [weak self] in self?.viewer?.pipeline.currentFile?.url }
+        update.isRunningFileOperation = { [weak self] in self?.viewer?.isRunningFileOperation ?? false }
+        update.toast = { [weak self] text in self?.viewer?.toast(text, seconds: 6) }
+        viewer?.onFileOperationsEnded = { [weak self] in self?.diskImageUpdate?.fileOperationsEnded() }
     }
 
     /// Started by the copy that installed this one (`--eject-disk-images=<pid>`): eject the Peekaboo disk images on a
@@ -157,9 +183,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         }
     }
 
-    /// A ready update installs behind the quitting app (`[updates] auto_install`).
+    /// A ready update installs behind the quitting app (`[updates] auto_install`), or the copy staged from a disk image
+    /// (`DiskImageUpdate` decides between the two; nothing more after its hand-over).
     func applicationWillTerminate(_ notification: Notification) {
-        updates?.updater.installOnQuit()
+        if let diskImageUpdate { diskImageUpdate.willTerminate() } else { updates?.updater.installOnQuit() }
+    }
+
+    /// In front: a newer Peekaboo staged from a disk image installs (a quarter second later). Double-clicking it in Finder
+    /// brings this copy forward instead of starting it (Gatekeeper's first launch of a quarantined copy). One check when
+    /// none is staged.
+    func applicationDidBecomeActive(_ notification: Notification) {
+        diskImageUpdate?.activated()
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -171,8 +205,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     /// Stay resident after the last window closes so the next open is instant.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
-    /// Dock click: bring back the window with the last image (or the drop hint).
+    /// Dock click: bring back the window with the last image (or the drop hint), unless the app is quitting for a copy
+    /// staged from a disk image. With one staged, the click starts that hand-over too.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        if diskImageUpdate?.activated() == true { return false }
         if !hasVisibleWindows { viewer?.reopen() }
         return true
     }

@@ -285,6 +285,42 @@ viewers score 21–26 dB and alias 10–25× more.
   once more 2 s later). One toast says which version is installed where and names the images left. If the install
   or the start fails, the copy launches as usual, with a toast that gives the reason on its own line. Tests
   (headless), `--selftest` and `PEEKABOO_ACTIONS` never install or eject.
+- A newer Peekaboo opened while one runs (`DiskImageUpdate`): the downloaded copy is quarantined and was never opened,
+  so Finder hands its launch to Gatekeeper's first-launch path (CoreServicesUIAgent), which brings the running copy to
+  the front (`SETFRONT`) instead of starting the new one: the copy above never runs. So the running copy acts. A second
+  after launch, next to the updater, it is created (0.15–0.25 ms of main-thread time once, about what the updater's own
+  setup costs right before it; 11–17 µs warm); its two workspace observers are registered on its utility queue, because
+  on the main thread they cost 0.9–1.8 ms (0.21–0.32 ms CPU, the rest waiting on the system). On every mount, and
+  once for the volumes mounted already 2 s later, the queue looks at the disk images under `/Volumes` it has not seen
+  (read-only local volumes whose device DiskArbitration calls a disk image, then one `Info.plist` each: a locked card, a
+  read-only drive or a network share is never read, so macOS never asks for the Removable or Network Volumes
+  permission on Peekaboo's behalf) and stages the newest Peekaboo.app of this identifier above the running build like
+  a download: `<staging root>/<version token>/Peekaboo.app`, the updater's folder, copied without its quarantine flag and
+  verified against the running app's Developer ID requirement (`AppInstall.stage`: 21.5–22.1 ms median for the 4.6 MB
+  20261126-6c7b06 bundle from the SSD, 2.6–3.1 ms of it the copy, the rest the signature check; a copy staged there
+  before that still verifies is kept, 16–19 ms). An ad-hoc signed app stages nothing: its requirement names no team,
+  and a disk image comes without the manifest's SHA-256. A version whose install failed at this bundle
+  (`InstallFailure.plist`) is not staged again, so a failing install cannot relaunch the app over and over; the first
+  scan deletes the staged copies
+  that are not above the running build. The staged copy stays when the volume is unmounted, the updater's clean-ups
+  leave it (`keepStaged`), and a newer one replaces it. An activation costs one stored flag when nothing is staged
+  (0.9 ns in a release build, `applicationDidBecomeActive` 1.0 ns with or without the component; a `Copy?` holds a
+  URL, whose layout Foundation only knows at run time, and testing it for nil took 42 ns; the stack space `asyncAfter`
+  needs, set up before the check, cost 7 ns until that part moved out of line). With a copy staged,
+  `applicationDidBecomeActive` or `applicationShouldHandleReopen` hands over 0.25 s later, so that a photo opened from
+  Finder with the activation is the one reopened: the staged copy and the bundle in its place are read again
+  (76–88 µs, 0.14–0.22 ms the first time), then the update installer is started with `--relaunch`, the photo shown and
+  `--eject-disk-images`, and the app quits; the installer swaps the copy in and relaunches the app with
+  `open -a <app> [photo] --args --eject-disk-images=<installer pid>` (only after a successful install), so the
+  relaunched copy ejects the Peekaboo disk images and says which version is installed where. The updater's ready
+  download installs instead when it is as new or newer (`restartToUpdate`, ejecting too); there is never a second
+  installer, and quitting with a copy staged installs it without a relaunch unless the updater installs a build as new
+  or newer then. The hand-over waits for a copy being staged, a background file operation (copy, move to another
+  volume, slow undo or redo, copying the picks; 2.5 s more so its result can be read) and a menu or modal panel (it
+  runs in the default run-loop mode only), and needs the app still in front; one attempt per version and run, and an
+  installer that cannot start leaves the app running with a toast. Never in tests (headless), `--selftest`,
+  `PEEKABOO_ACTIONS`, an installing copy, an app that cannot replace itself, or once the app quits. Releases up to
+  20261126-6c7b06 cannot do this: quit them before opening a newer one.
 
 ### Animation
 

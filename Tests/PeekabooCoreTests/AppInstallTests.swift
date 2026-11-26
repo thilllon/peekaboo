@@ -338,6 +338,48 @@ final class AppInstallTests: XCTestCase {
         XCTAssertNoThrow(try AppInstall.removeQuarantine(in: bundle), "nothing left to remove")
     }
 
+    /// A newer Peekaboo on a disk image, staged by the running copy for the update installer (`DiskImageUpdate`): next to
+    /// the updater's downloads, without the quarantine flag, verified like an update; nothing is left of a copy that fails.
+    func testStagesADiskImagesCopyLikeADownload() throws {
+        let app = try source(releaseVersion(26))
+        let files = [app.path, app.appendingPathComponent("Contents/MacOS/Peekaboo").path,
+                     app.appendingPathComponent("Contents/Resources/data.txt").path]
+        for file in files { try setQuarantine(file) }
+        let root = directory.appendingPathComponent("cache/Updates", isDirectory: true)
+        let folder = root.appendingPathComponent(releaseVersion(26).token, isDirectory: true)
+        let staged = try AppInstall.stage(app, version: releaseVersion(26), in: root, requirement: adHoc)
+        XCTAssertEqual(staged, folder.appendingPathComponent("Peekaboo.app", isDirectory: true), "where the updater stages a download")
+        XCTAssertEqual(AppInstall.peekabooVersion(staged), releaseVersion(26))
+        XCTAssertNoThrow(try CodeSignature.check(staged, requirement: adHoc))
+        for file in files {
+            XCTAssertFalse(hasQuarantine(file.replacingOccurrences(of: app.path, with: staged.path)), file)
+            XCTAssertTrue(hasQuarantine(file), "the disk image's copy is left as it is: \(file)")
+        }
+
+        // Staged before (an earlier run, or the updater's download of that release): kept as it is.
+        let inode = try FileManager.default.attributesOfItem(atPath: staged.path)[.systemFileNumber] as? Int
+        XCTAssertEqual(try AppInstall.stage(app, version: releaseVersion(26), in: root, requirement: adHoc), staged)
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: staged.path)[.systemFileNumber] as? Int, inode)
+        // Unless it no longer verifies: copied again.
+        try Data("edited".utf8).write(to: staged.appendingPathComponent("Contents/Resources/data.txt"))
+        XCTAssertEqual(try AppInstall.stage(app, version: releaseVersion(26), in: root, requirement: adHoc), staged)
+        XCTAssertEqual(try resource(staged), "resource of \(releaseVersion(26))")
+        XCTAssertNoThrow(try CodeSignature.check(staged, requirement: adHoc))
+
+        // A copy that fails its checks (edited after signing, another version than it says, another team's) leaves nothing.
+        try FileManager.default.removeItem(at: folder)
+        let tampered = try makeApp(directory.appendingPathComponent("Volumes/Tampered/Peekaboo.app"), version: releaseVersion(26))
+        try Data("tampered".utf8).write(to: tampered.appendingPathComponent("Contents/Resources/data.txt"))
+        let team = CodeSignature.updateRequirement(teamIdentifier: "ABCDE12345")!
+        for (copy, version, requirement) in [(tampered, releaseVersion(26), adHoc), (app, releaseVersion(27), adHoc),
+                                             (app, releaseVersion(26), team)] {
+            XCTAssertThrowsError(try AppInstall.stage(copy, version: version, in: root, requirement: requirement)) { error in
+                XCTAssertTrue(AppInstall.failureReason(error).hasPrefix("The copy failed verification: "), "\(error)")
+            }
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), [], "\(copy.path) \(version)")
+        }
+    }
+
     private func setQuarantine(_ path: String, noFollow: Bool = false) throws {
         let value = Array("0083;6745e3a1;Safari;".utf8)
         guard setxattr(path, Self.quarantine, value, value.count, 0, noFollow ? XATTR_NOFOLLOW : 0) == 0 else {

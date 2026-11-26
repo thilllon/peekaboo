@@ -138,13 +138,7 @@ public enum AppInstall {
         let scratch = try stagingFolder(for: folder)
         defer { try? fm.removeItem(at: scratch) }
         let staged = scratch.appendingPathComponent(target.lastPathComponent, isDirectory: true)
-        do {
-            try fm.copyItem(at: app, to: staged)
-        } catch {
-            throw UpdateError.install("cannot copy \(app.lastPathComponent): \(error.localizedDescription)")
-        }
-        try removeQuarantine(in: staged)
-        try UpdateInstaller.verify(staged, version: version, requirement: requirement)
+        try copyVerified(app, to: staged, version: version, requirement: requirement)
         // The copy and its signature check took 20–130 ms: a copy started meanwhile keeps its bundle.
         if let build = peekabooBuild(target), isRunning(target) { return .running(target, build: build) }
         do {
@@ -161,6 +155,45 @@ public enum AppInstall {
 
     /// The swap moved a newer Peekaboo out of the target: undone.
     private enum Displaced: Error { case newer(Int) }
+
+    /// Copy the bundle `app` to `copy` (in a folder that exists), remove the copy's quarantine flag (Gatekeeper would ask
+    /// about it again, or translocate it) and verify it like an update: identifier, version and build, `requirement`.
+    static func copyVerified(_ app: URL, to copy: URL, version: AppVersion, requirement: String) throws {
+        do {
+            try FileManager.default.copyItem(at: app, to: copy)
+        } catch {
+            throw UpdateError.install("cannot copy \(app.lastPathComponent): \(error.localizedDescription)")
+        }
+        try removeQuarantine(in: copy)
+        try UpdateInstaller.verify(copy, version: version, requirement: requirement)
+    }
+
+    /// Stage the Peekaboo bundle `app` (Peekaboo `version`, on a disk image) for the update installer the way a download
+    /// is staged: at `<root>/<version token>/Peekaboo.app`, copied without its quarantine flag and verified like an update
+    /// (`copyVerified`). A copy staged there before that still verifies (an earlier run's, or the updater's download of the
+    /// same release) is used as it is. Nothing is left of a copy that fails.
+    public static func stage(_ app: URL, version: AppVersion, in root: URL, requirement: String) throws -> URL {
+        let fm = FileManager.default
+        let folder = root.appendingPathComponent(version.token, isDirectory: true)
+        let staged = folder.appendingPathComponent("Peekaboo.app", isDirectory: true)
+        if fm.fileExists(atPath: staged.path), (try? removeQuarantine(in: staged)) != nil,
+           (try? UpdateInstaller.verify(staged, version: version, requirement: requirement)) != nil {
+            return staged
+        }
+        try? fm.removeItem(at: folder)
+        do {
+            do {
+                try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            } catch {
+                throw UpdateError.install("cannot create \(folder.path): \(error.localizedDescription)")
+            }
+            try copyVerified(app, to: staged, version: version, requirement: requirement)
+        } catch {
+            try? fm.removeItem(at: folder)
+            throw error
+        }
+        return staged
+    }
 
     /// Version of the Peekaboo bundle at `app`; nil when it is not Peekaboo or carries no release version.
     public static func peekabooVersion(_ app: URL) -> AppVersion? {
