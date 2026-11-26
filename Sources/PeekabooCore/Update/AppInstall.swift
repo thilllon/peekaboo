@@ -226,21 +226,31 @@ public enum AppInstall {
 
     /// The processes other than this one whose executable lies in the bundle at `app`: copies of the app (other users'
     /// too, as far as the system tells), and the update installer a quitting copy starts (`--install-update`), which no
-    /// list of apps shows. 1–2 ms.
-    public static func processes(runningFrom app: URL) -> [pid_t] {
+    /// list of apps shows. 1–2 ms. `running` lists the processes (`runningExecutables`); it is asked only when `app`
+    /// exists.
+    public static func processes(runningFrom app: URL,
+                                 among running: () -> [(pid: pid_t, executable: String)] = runningExecutables) -> [pid_t] {
         // The path as the kernel names an executable (`/private/var/…`, where `resolvingSymlinksInPath` drops `/private`).
         guard let real = realpath(app.path, nil) else { return [] }
         let prefix = String(cString: real) + "/"
         free(real)
+        let me = getpid()
+        return running().compactMap { $0.pid != me && $0.executable.hasPrefix(prefix) ? $0.pid : nil }
+    }
+
+    /// Every process the system lists, with the path of its executable as the kernel names it.
+    public static func runningExecutables() -> [(pid: pid_t, executable: String)] {
         let capacity = proc_listallpids(nil, 0)
         guard capacity > 0 else { return [] }
         var pids = [pid_t](repeating: 0, count: Int(capacity) + 64)
         let count = pids.withUnsafeMutableBytes { proc_listallpids($0.baseAddress, Int32($0.count)) }
         var path = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
-        let me = getpid()
-        return pids.prefix(Int(max(count, 0))).filter { pid in
-            pid != me && proc_pidpath(pid, &path, UInt32(path.count)) > 0 && String(cString: path).hasPrefix(prefix)
+        var running: [(pid: pid_t, executable: String)] = []
+        running.reserveCapacity(Int(max(count, 0)))
+        for pid in pids.prefix(Int(max(count, 0))) where proc_pidpath(pid, &path, UInt32(path.count)) > 0 {
+            running.append((pid, String(cString: path)))
         }
+        return running
     }
 
     // MARK: Eject
