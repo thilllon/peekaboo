@@ -138,13 +138,7 @@ public enum AppInstall {
         let scratch = try stagingFolder(for: folder)
         defer { try? fm.removeItem(at: scratch) }
         let staged = scratch.appendingPathComponent(target.lastPathComponent, isDirectory: true)
-        do {
-            try fm.copyItem(at: app, to: staged)
-        } catch {
-            throw UpdateError.install("cannot copy \(app.lastPathComponent): \(error.localizedDescription)")
-        }
-        try removeQuarantine(in: staged)
-        try UpdateInstaller.verify(staged, version: version, requirement: requirement)
+        try copyVerified(app, to: staged, version: version, requirement: requirement)
         // The copy and its signature check took 20–130 ms: a copy started meanwhile keeps its bundle.
         if let build = peekabooBuild(target), isRunning(target) { return .running(target, build: build) }
         do {
@@ -162,12 +156,73 @@ public enum AppInstall {
     /// The swap moved a newer Peekaboo out of the target: undone.
     private enum Displaced: Error { case newer(Int) }
 
-    /// Version of the Peekaboo bundle at `app`; nil when it is not Peekaboo or carries no release version.
-    public static func peekabooVersion(_ app: URL) -> AppVersion? {
-        guard let info = try? UpdateInstaller.bundleInfo(app), info.identifier == CodeSignature.bundleIdentifier else {
-            return nil
+    /// Copy the bundle `app` to `copy` (in a folder that exists), verify the copy like an update (a folder, identifier,
+    /// version and build, the macOS it needs, `requirement`), then remove its quarantine flag (Gatekeeper would ask
+    /// about it again, or translocate it). The signature does not cover that flag: a copy that fails verification keeps
+    /// it. A symbolic link is refused before anything is copied: copied as a link, every step would act on what it
+    /// points to.
+    static func copyVerified(_ app: URL, to copy: URL, version: AppVersion, requirement: String) throws {
+        try refuseLink(app)
+        do {
+            try FileManager.default.copyItem(at: app, to: copy)
+        } catch {
+            throw UpdateError.install("cannot copy \(app.lastPathComponent): \(error.localizedDescription)")
         }
-        return info.version
+        try UpdateInstaller.verify(copy, version: version, requirement: requirement)
+        try removeQuarantine(in: copy)
+    }
+
+    /// Stage the Peekaboo bundle `app` (Peekaboo `version`, on a disk image) for the update installer the way a download
+    /// is staged: at `<root>/<version token>/Peekaboo.app`, copied, verified like an update and without its quarantine
+    /// flag (`copyVerified`). A copy staged there before that still verifies (an earlier run's, or the updater's
+    /// download of the same release) is used as it is. Nothing is left of a copy that fails.
+    public static func stage(_ app: URL, version: AppVersion, in root: URL, requirement: String) throws -> URL {
+        let fm = FileManager.default
+        let folder = root.appendingPathComponent(version.token, isDirectory: true)
+        let staged = folder.appendingPathComponent("Peekaboo.app", isDirectory: true)
+        // `verify` refuses a symbolic link there; it goes with the folder.
+        if fm.fileExists(atPath: staged.path),
+           (try? UpdateInstaller.verify(staged, version: version, requirement: requirement)) != nil,
+           (try? removeQuarantine(in: staged)) != nil {
+            return staged
+        }
+        try? fm.removeItem(at: folder)
+        do {
+            do {
+                try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            } catch {
+                throw UpdateError.install("cannot create \(folder.path): \(error.localizedDescription)")
+            }
+            try copyVerified(app, to: staged, version: version, requirement: requirement)
+        } catch {
+            try? fm.removeItem(at: folder)
+            throw error
+        }
+        return staged
+    }
+
+    /// Version of the Peekaboo bundle at `app`; nil when it is not Peekaboo or carries no release version.
+    public static func peekabooVersion(_ app: URL) -> AppVersion? { peekabooRelease(app)?.version }
+
+    /// Version of the Peekaboo bundle at `app` and the macOS it needs (`LSMinimumSystemVersion`; nil when it names
+    /// none), from one read of its `Info.plist`; nil when it is not Peekaboo or carries no release version.
+    public static func peekabooRelease(_ app: URL) -> (version: AppVersion, minimumSystemVersion: String?)? {
+        guard let info = try? UpdateInstaller.bundleInfo(app), info.identifier == CodeSignature.bundleIdentifier,
+              let version = info.version else { return nil }
+        return (version, info.minimumSystemVersion)
+    }
+
+    /// The item at `url` is a symbolic link (`lstat`: the last component is not followed).
+    public static func isSymbolicLink(_ url: URL) -> Bool {
+        var info = stat()
+        return lstat(url.path, &info) == 0 && info.st_mode & S_IFMT == S_IFLNK
+    }
+
+    /// Throws when the bundle at `url` is a symbolic link: the signature check, the removal of the quarantine flag and
+    /// the install would act on what it points to, a folder of the user's or a copy someone else may change later.
+    static func refuseLink(_ url: URL) throws {
+        guard isSymbolicLink(url) else { return }
+        throw UpdateError.verification("\(url.lastPathComponent) is a symbolic link")
     }
 
     /// Build number (`CFBundleVersion`) of the Peekaboo bundle at `app`, 0 when it is not a number; nil when `app` is
@@ -197,8 +252,10 @@ public enum AppInstall {
     }
 
     /// Remove the quarantine flag (`com.apple.quarantine`) from `bundle` and everything in it (symbolic links
-    /// themselves, never what they point to).
+    /// themselves, never what they point to). A `bundle` that is a symbolic link is refused: the paths through it would
+    /// reach what it points to.
     public static func removeQuarantine(in bundle: URL) throws {
+        try refuseLink(bundle)
         try removeQuarantine(bundle.lastPathComponent, in: bundle)
         guard let entries = FileManager.default.enumerator(atPath: bundle.path) else { return }
         for case let entry as String in entries { try removeQuarantine(bundle.lastPathComponent + "/" + entry, in: bundle) }
@@ -279,18 +336,20 @@ public enum AppInstall {
     }
 
     /// The Peekaboo disk images among `volumes`: read-only local volumes mounted under `root`, holding none of the files
-    /// in `keeping` (the ones the installed copy shows), with a Peekaboo.app of this bundle identifier at the top, as
-    /// every Peekaboo disk image has it, and that are disk images indeed (`isDiskImage`), not a drive macOS mounts
-    /// read-only (NTFS, a locked card, a disc). Only a volume that passes the first checks is read (one `Info.plist`)
-    /// and asked about (DiskArbitration); the system volumes, writable drives and network shares are not.
+    /// in `keeping` (the ones the installed copy shows), that are disk images indeed (`isDiskImage`), not a drive macOS
+    /// mounts read-only (NTFS, a locked card, a disc), with a Peekaboo.app of this bundle identifier at the top, as
+    /// every Peekaboo disk image has it. Only a volume that passes the first checks is asked about (DiskArbitration),
+    /// and only a disk image is read (one `Info.plist`): the first read of a card or a drive may have macOS ask the
+    /// user for the Removable Volumes permission on Peekaboo's behalf. The system volumes, writable drives and network
+    /// shares are neither asked about nor read.
     public static func diskImages(in volumes: [Volume], under root: String = "/Volumes/", keeping: [URL] = [],
                                   isDiskImage: (URL) -> Bool = isDiskImage) -> [URL] {
         let kept = keeping.map { $0.standardizedFileURL.path }
         return volumes.filter { volume in
             let path = volume.url.standardizedFileURL.path
             return volume.isReadOnly && volume.isLocal && path.hasPrefix(root) && !kept.contains { $0.hasPrefix(path + "/") }
-                && peekabooBuild(volume.url.appendingPathComponent("Peekaboo.app", isDirectory: true)) != nil
                 && isDiskImage(volume.url)
+                && peekabooBuild(volume.url.appendingPathComponent("Peekaboo.app", isDirectory: true)) != nil
         }.map(\.url)
     }
 

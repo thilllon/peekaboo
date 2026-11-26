@@ -77,6 +77,17 @@ public enum UpdateInstaller {
         }
     }
 
+    /// Delete the staged versions under `root` whose build is not above `build` (the running one): installed by now, or
+    /// older. Newer ones, and anything that is not a staged version, stay.
+    public static func removeStaged(in root: URL, notNewerThan build: Int) {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { return }
+        for entry in entries {
+            guard let version = AppVersion(entry.lastPathComponent), version.build <= build else { continue }
+            try? fm.removeItem(at: entry)
+        }
+    }
+
     // MARK: Verify
 
     /// SHA-256 of a file, lowercase hex (read in 1 MB chunks).
@@ -107,8 +118,11 @@ public enum UpdateInstaller {
         return apps[0]
     }
 
-    /// The bundle at `app` is Peekaboo `version`, signed so that it meets `requirement`.
+    /// The bundle at `app` is Peekaboo `version`, runs on this macOS (`LSMinimumSystemVersion`) and is signed so that
+    /// it meets `requirement`. It is a folder, not a symbolic link: the signature check would follow a link to wherever
+    /// it points, and the install would put the link in the app's place.
     public static func verify(_ app: URL, version: AppVersion, requirement: String) throws {
+        try AppInstall.refuseLink(app)
         let info = try bundleInfo(app)
         guard info.identifier == CodeSignature.bundleIdentifier else {
             throw UpdateError.verification("unexpected bundle identifier \(info.identifier ?? "none")")
@@ -118,11 +132,18 @@ public enum UpdateInstaller {
             let found = info.version.map { "\($0) (build \($0.build))" } ?? "?"
             throw UpdateError.verification("it is version \(found), not \(version) (build \(version.build))")
         }
+        // Installed, it would not start, and the app it replaced would be gone.
+        if let minimum = info.minimumSystemVersion,
+           !UpdateManifest.runs(minimum, on: ProcessInfo.processInfo.operatingSystemVersion) {
+            throw UpdateError.verification("it needs macOS \(minimum)")
+        }
         try CodeSignature.check(app, requirement: requirement)
     }
 
-    /// Identifier and version of a bundle, read from its `Info.plist` (not through `Bundle`, which caches by path).
-    static func bundleInfo(_ app: URL) throws -> (identifier: String?, version: AppVersion?) {
+    /// Identifier, version and the macOS it needs (`LSMinimumSystemVersion`, nil when it names none) of a bundle, read
+    /// from its `Info.plist` (not through `Bundle`, which caches by path).
+    static func bundleInfo(_ app: URL) throws
+        -> (identifier: String?, version: AppVersion?, minimumSystemVersion: String?) {
         let data: Data
         do {
             data = try Data(contentsOf: app.appendingPathComponent("Contents/Info.plist"))
@@ -130,8 +151,9 @@ public enum UpdateInstaller {
             throw UpdateError.verification("no Info.plist in \(app.lastPathComponent)")
         }
         let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
-        return (plist?["CFBundleIdentifier"] as? String,
-                AppVersion(shortVersion: plist?["CFBundleShortVersionString"], bundleVersion: plist?["CFBundleVersion"]))
+        let version = AppVersion(shortVersion: plist?["CFBundleShortVersionString"],
+                                 bundleVersion: plist?["CFBundleVersion"])
+        return (plist?["CFBundleIdentifier"] as? String, version, plist?["LSMinimumSystemVersion"] as? String)
     }
 
     // MARK: Install
@@ -235,20 +257,27 @@ public enum UpdateInstaller {
         public var relaunch = false
         /// File the relaunched app opens.
         public var reopen: URL?
+        /// The update came from a disk image: once it is installed, the relaunched app ejects the Peekaboo disk images
+        /// (`relaunchArguments`). Not after a failed install: the app relaunched is the one that ran.
+        public var ejectDiskImages = false
 
-        public init(pid: pid_t, staged: URL, target: URL, version: AppVersion, relaunch: Bool = false, reopen: URL? = nil) {
+        public init(pid: pid_t, staged: URL, target: URL, version: AppVersion, relaunch: Bool = false, reopen: URL? = nil,
+                    ejectDiskImages: Bool = false) {
             self.pid = pid
             self.staged = staged
             self.target = target
             self.version = version
             self.relaunch = relaunch
             self.reopen = reopen
+            self.ejectDiskImages = ejectDiskImages
         }
 
-        /// `--install-update <pid> <staged app> <target app> <version token> [--relaunch] [--open <file>]`
+        /// `--install-update <pid> <staged app> <target app> <version token> [--relaunch] [--eject-disk-images]
+        /// [--open <file>]`. The format is internal to one build: the helper is the quitting app's own executable.
         public var arguments: [String] {
             var arguments = [UpdateInstaller.helperFlag, String(pid), staged.path, target.path, version.token]
             if relaunch { arguments.append("--relaunch") }
+            if ejectDiskImages { arguments.append(AppInstall.ejectFlag) }
             if let reopen { arguments += ["--open", reopen.path] }
             return arguments
         }
@@ -263,6 +292,7 @@ public enum UpdateInstaller {
                 rest.removeFirst()
                 switch option {
                 case "--relaunch": relaunch = true
+                case AppInstall.ejectFlag: ejectDiskImages = true
                 case "--open":
                     guard let path = rest.first else { return nil }
                     rest.removeFirst()
@@ -295,10 +325,14 @@ public enum UpdateInstaller {
     }
 
     /// Body of the helper process; returns its exit status. `requirement` defaults to the one for updates of the
-    /// running app (the helper is the quitting app's own executable); a failed install is recorded in `cache`.
-    public static func runHelper(_ arguments: [String], requirement: String? = nil, cache: URL? = cacheFolder) -> Int32 {
+    /// running app (the helper is the quitting app's own executable); a failed install is recorded in `cache`. A
+    /// relaunch runs `/usr/bin/open` with `relaunchArguments` (`relaunch`, true when `open` succeeded; tests record the
+    /// arguments instead).
+    public static func runHelper(_ arguments: [String], requirement: String? = nil, cache: URL? = cacheFolder,
+                                 relaunch: ([String]) -> Bool = openApp) -> Int32 {
         guard let job = Job(arguments: arguments) else {
-            FileHandle.standardError.write(Data("usage: Peekaboo \(helperFlag) <pid> <staged app> <target app> <version> [--relaunch] [--open <file>]\n".utf8))
+            FileHandle.standardError.write(Data(("usage: Peekaboo \(helperFlag) <pid> <staged app> <target app> <version>"
+                                                 + " [--relaunch] [\(AppInstall.ejectFlag)] [--open <file>]\n").utf8))
             return 64
         }
         // Replacing the bundle under a running app could break it: without its exit, install nothing.
@@ -323,8 +357,27 @@ public enum UpdateInstaller {
         // the attempt it holds the old app or a download that failed its checks.
         let folder = job.staged.deletingLastPathComponent()
         if AppVersion(folder.lastPathComponent) == job.version { try? FileManager.default.removeItem(at: folder) }
-        if job.relaunch { relaunch(job.target, reopening: job.reopen) }
+        if job.relaunch {
+            let eject = job.ejectDiskImages && status == 0 ? getpid() : nil
+            // `open` checks the file before it starts the app, and refuses one that no longer exists (the photo shown
+            // was deleted, or was on a card ejected meanwhile): the app then starts without it, as after any failed
+            // `open`.
+            let file = job.reopen.flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }
+            if !relaunch(relaunchArguments(job.target, reopening: file, ejectingAfter: eject)), file != nil {
+                _ = relaunch(relaunchArguments(job.target, reopening: nil, ejectingAfter: eject))
+            }
+        }
         return status
+    }
+
+    /// Arguments of `/usr/bin/open` that start the app at `app` again, on `file`: `-a <app> [<file>]`. With
+    /// `ejectingAfter`, `--args --eject-disk-images=<pid>` follow: once process `pid` (the helper) has exited, the
+    /// relaunched app ejects the Peekaboo disk images and says which version is installed where (`DiskImageEjector`).
+    public static func relaunchArguments(_ app: URL, reopening file: URL?, ejectingAfter pid: pid_t?) -> [String] {
+        var arguments = ["-a", app.path]
+        if let file { arguments.append(file.path) }
+        if let pid { arguments += ["--args", "\(AppInstall.ejectFlag)=\(pid)"] }
+        return arguments
     }
 
     /// Wait until process `pid` has exited (true) or `timeout` passed (false).
@@ -337,15 +390,23 @@ public enum UpdateInstaller {
         return true
     }
 
-    private static func relaunch(_ app: URL, reopening file: URL?) {
+    /// Run `/usr/bin/open` with `arguments` (`relaunchArguments`) and wait for it: how the helper relaunches the app.
+    /// True when it succeeded.
+    public static func openApp(_ arguments: [String]) -> Bool {
         let open = Process()
         open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        open.arguments = ["-a", app.path] + (file.map { [$0.path] } ?? [])
+        open.arguments = arguments
         do {
             try open.run()
             open.waitUntilExit()
         } catch {
-            Trace.log("update: cannot relaunch \(app.path): \(error)")
+            Trace.log("update: cannot relaunch (open \(arguments.joined(separator: " "))): \(error)")
+            return false
         }
+        guard open.terminationStatus == 0 else {
+            Trace.log("update: open \(arguments.joined(separator: " ")) exited with \(open.terminationStatus)")
+            return false
+        }
+        return true
     }
 }

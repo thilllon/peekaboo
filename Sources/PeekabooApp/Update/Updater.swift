@@ -55,7 +55,8 @@ final class Updater {
     private var settings: AppConfig.Updates
     /// The user asked for the available update ("Update to …"), so it installs on quit even without auto-install.
     private var requested = false
-    private var helperStarted = false
+    /// The installer runs: it installs behind the quitting app (one per run).
+    private(set) var helperStarted = false
     private var suddenTerminationDisabled = false
 
     // On `queue`.
@@ -72,6 +73,8 @@ final class Updater {
     private var connectivity = ConnectivityEdge()
     private var stagingRoot: URL?
     private var staged: (manifest: UpdateManifest, app: URL)?
+    /// A copy that `DiskImageUpdate` staged in the same folder: the clean-ups leave it.
+    private var keptStaged: AppVersion?
     /// The helper could not install this version after an earlier quit: automatic checks offer it as a download
     /// instead of fetching it again; a manual check or a newer release tries again.
     private var failedInstall: UpdateInstaller.Failure?
@@ -151,23 +154,38 @@ final class Updater {
         }
     }
 
-    /// "Restart to Update": start the installer, which relaunches the app (reopening `file`) once it has quit.
-    /// False when the installer cannot start (the phase then says why): the app keeps running.
-    func restartToUpdate(reopening file: URL?) -> Bool {
+    /// "Restart to Update": start the installer, which relaunches the app (reopening `file`) once it has quit, and
+    /// with `ejectingDiskImages` has the relaunched app eject the Peekaboo disk images (a newer Peekaboo was opened from
+    /// one: `DiskImageUpdate`). False when the installer cannot start (the phase then says why): the app keeps running.
+    func restartToUpdate(reopening file: URL?, ejectingDiskImages: Bool = false) -> Bool {
         guard let ready else { return false }
-        return startInstaller(ready.manifest, staged: ready.app, relaunch: true, reopen: file)
+        return startInstaller(ready.manifest, staged: ready.app, relaunch: true, reopen: file,
+                              ejectDiskImages: ejectingDiskImages)
     }
+
+    /// Build of the update that is ready to install; nil when none is (main thread).
+    var readyBuild: Int? { ready?.manifest.version.build }
+
+    /// Quitting installs the ready update: auto-install is on, or the user asked for it (main thread).
+    var installsOnQuit: Bool { ready != nil && (settings.autoInstall || requested) }
 
     /// The app is quitting: install a ready update behind it (auto-install on, or asked for).
     func installOnQuit() {
-        guard let ready, settings.autoInstall || requested else { return }
+        guard installsOnQuit, let ready else { return }
         _ = startInstaller(ready.manifest, staged: ready.app, relaunch: false, reopen: nil)
     }
 
-    private func startInstaller(_ manifest: UpdateManifest, staged: URL, relaunch: Bool, reopen: URL?) -> Bool {
+    /// `version` (nil: none) is staged from a disk image in the updater's staging folder (`DiskImageUpdate`): clearing
+    /// the folder for a download, or once the app is up to date, leaves it.
+    func keepStaged(_ version: AppVersion?) {
+        queue.async { [weak self] in self?.keptStaged = version }
+    }
+
+    private func startInstaller(_ manifest: UpdateManifest, staged: URL, relaunch: Bool, reopen: URL?,
+                                ejectDiskImages: Bool = false) -> Bool {
         guard !helperStarted else { return true }
         let job = UpdateInstaller.Job(pid: getpid(), staged: staged, target: app, version: manifest.version,
-                                      relaunch: relaunch, reopen: reopen)
+                                      relaunch: relaunch, reopen: reopen, ejectDiskImages: ejectDiskImages)
         do {
             try UpdateInstaller.spawnHelper(job, executable: executable)
             helperStarted = true
@@ -281,8 +299,8 @@ final class Updater {
             // An update staged but installed another way (the DMG), or a withdrawn release, is stale now.
             staged = nil
             forgetFailedInstall()
-            if let cache { UpdateInstaller.removeStaged(in: UpdateInstaller.updatesFolder(in: cache)) }
-            if let stagingRoot { UpdateInstaller.removeStaged(in: stagingRoot) }
+            if let cache { UpdateInstaller.removeStaged(in: UpdateInstaller.updatesFolder(in: cache), keeping: keptStaged) }
+            if let stagingRoot { UpdateInstaller.removeStaged(in: stagingRoot, keeping: keptStaged) }
             return finish(.upToDate)
         }
         guard manifest.runs(on: ProcessInfo.processInfo.operatingSystemVersion) else {
@@ -318,9 +336,9 @@ final class Updater {
 
     private func download(_ manifest: UpdateManifest, into folder: URL, root: URL, requirement: String) {
         let fm = FileManager.default
-        // A newer release replaces whatever was staged before.
+        // A newer release replaces whatever was staged before (but a disk image's copy, which may be newer still).
         staged = nil
-        UpdateInstaller.removeStaged(in: root)
+        UpdateInstaller.removeStaged(in: root, keeping: keptStaged)
         do {
             try fm.createDirectory(at: folder, withIntermediateDirectories: true)
         } catch {

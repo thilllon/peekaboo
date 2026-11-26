@@ -80,8 +80,12 @@ public struct UpdateManifest: Equatable, Sendable {
     }
 
     /// The release runs on `system` (its `minimumSystemVersion` is not newer).
-    public func runs(on system: OperatingSystemVersion) -> Bool {
-        guard let minimum = Self.systemVersion(minimumSystemVersion) else { return false }
+    public func runs(on system: OperatingSystemVersion) -> Bool { Self.runs(minimumSystemVersion, on: system) }
+
+    /// An app that needs macOS `minimum` (`LSMinimumSystemVersion`, e.g. `14.0`) runs on `system`; false when `minimum`
+    /// is not a dotted number.
+    public static func runs(_ minimum: String, on system: OperatingSystemVersion) -> Bool {
+        guard let minimum = systemVersion(minimum) else { return false }
         let have = [system.majorVersion, system.minorVersion, system.patchVersion]
         return !have.lexicographicallyPrecedes(minimum)
     }

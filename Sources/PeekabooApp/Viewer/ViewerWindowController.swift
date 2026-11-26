@@ -68,8 +68,15 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         let actions = FileActions { [weak self] in self?.configStore.config ?? .default }
         // Work that finishes later (exec:, open-with, make-default) still updates the list and shows its toast.
         actions.onLateResult = { [weak self] result in self?.handle(result) }
+        actions.onIdle = { [weak self] in self?.onFileOperationsEnded?() }
         return actions
     }()
+    /// Main thread: the last file operation running in the background has ended, and its result is shown.
+    var onFileOperationsEnded: (() -> Void)?
+
+    /// A file operation runs in the background: a copy, a move to another volume, an undo or redo that copies across
+    /// volumes, copying the picks.
+    var isRunningFileOperation: Bool { fileActions.isBusy }
     private let hud: HUD
     private lazy var gate = InteractionGate(
         begin: { [weak self] in self?.renderer.beginInteraction() },

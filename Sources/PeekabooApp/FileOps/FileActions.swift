@@ -51,9 +51,24 @@ final class FileActions {
     private var imageProvider: ImageDataProvider?
     /// Main thread: results of work that completes after `perform` returned.
     var onLateResult: ((FileActionResult) -> Void)?
+    /// Main thread: the last file operation running in the background has ended, after its late result.
+    var onIdle: (() -> Void)?
+    /// File operations running in the background (main thread): copies, moves to another volume, undos and redos that
+    /// copy across volumes, copying the picks.
+    private var running = 0
 
     init(config: @escaping () -> AppConfig) {
         self.config = config
+    }
+
+    /// A file operation runs in the background (an app update waits for it: `DiskImageUpdate`).
+    var isBusy: Bool { running > 0 }
+
+    private func began() { running += 1 }
+
+    private func ended() {
+        running -= 1
+        if running == 0 { onIdle?() }
     }
 
     /// Whether `perform` implements `action` (the viewer handles everything else).
@@ -109,6 +124,7 @@ final class FileActions {
     /// puts the file back in the list.
     private func runInBackground(_ slow: FileOperations.SlowChange) -> FileActionResult {
         slowInFlight = slow
+        began()
         let verb = slow.isUndo ? "Undo" : "Redo"
         // The file a redone move takes out of the browsing set.
         let leaving: ImageFile?
@@ -135,6 +151,7 @@ final class FileActions {
             DispatchQueue.main.async {
                 guard let actions = owner.value else { return }
                 actions.slowInFlight = nil
+                defer { actions.ended() }
                 do {
                     let change = try actions.operations.finish(slow, with: result)
                     var finished = actions.describe(change, undo: slow.isUndo)
@@ -307,11 +324,13 @@ final class FileActions {
         // at once; the change joins the undo stack when it completes, and a failure puts the file back.
         if copy || FileOperations.crossesVolumes(file.url, folder) {
             lastDestination = folder
+            began()
             let owner = WeakFileActions(self)
             DispatchQueue.global(qos: .userInitiated).async {
                 let result = Result { try FileOperations.transfer(file.url, toFolder: folder, copy: copy) }
                 DispatchQueue.main.async {
                     guard let actions = owner.value else { return }
+                    defer { actions.ended() }
                     switch result {
                     case .success(let change):
                         actions.operations.record(change)
@@ -392,6 +411,7 @@ final class FileActions {
         lastDestination = folder
         let job = PicksCopy(folderName: folder.lastPathComponent)
         picksCopy = job
+        began()
         let timer = Timer(timeInterval: Self.picksProgressInterval, repeats: true) { [weak self] _ in
             guard let self, let job = self.picksCopy else { return }
             let progress = job.progress
@@ -414,6 +434,7 @@ final class FileActions {
                 job.timer?.invalidate()
                 guard let actions = owner.value else { return }
                 actions.picksCopy = nil
+                defer { actions.ended() }
                 Trace.log(String(format: "copy picks: %d to %@ in %.1f ms: %d copied, %d renamed, %d already there, %d failed",
                                  chosen.count, job.folderName, Trace.ms(since: started), result.copied, result.renamed,
                                  result.alreadyThere, result.failures.count))

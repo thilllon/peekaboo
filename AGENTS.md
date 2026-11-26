@@ -154,6 +154,23 @@ stable: every released version relies on them. main.swift decides before any war
 string comparisons on `argv[0]` for it, a copy on a writable drive under `/Volumes` one `statfs` more. To try it,
 open the app from a disk image of `mise run dmg`: it replaces `/Applications/Peekaboo.app`.
 
+A freshly downloaded copy never gets that far while another Peekaboo runs: it is quarantined and was never opened, so
+Finder hands its launch to Gatekeeper (CoreServicesUIAgent), which only brings the running copy to the front
+(`SETFRONT`). So the running copy acts (`Sources/PeekabooApp/Update/DiskImageUpdate.swift`): from a second after
+launch it watches the mounts (observers registered on a utility queue), and the newer Peekaboo.app of this identifier
+at the top of a disk image under `/Volumes` (DiskArbitration's device model: no other volume is read, so no privacy
+prompt) is staged like a download (`AppInstall.stage`: the updater's staging folder, verified against the running
+app's Developer ID requirement and the macOS it needs, then cleared of its quarantine flag; a Peekaboo.app that is a
+symbolic link, an ad-hoc signed app and a version whose install failed here before are left). The next activation,
+which is what that double-click causes (one while the mount is still being looked at waits for it), has the update
+installer swap it in and relaunch the app on the photo shown, if it still exists, with
+`--eject-disk-images=<installer pid>` (only after a successful install); quitting first installs it without a relaunch.
+The updater's ready download wins when it is as new or newer, and there is never a second installer. No hand-over in
+tests (headless), the self-test, scripted runs, an installing copy, an app that cannot replace itself, while a
+background file operation runs or a menu or modal panel is up. To try it, run a Developer ID build from
+`/Applications` and open a newer, quarantined disk image (a download, or `xattr -w com.apple.quarantine …` on one of
+`mise run dmg`). Releases up to 20261126-6c7b06 cannot do this: quit them before opening a newer one.
+
 ## Performance rules
 
 - Nothing slow on the main thread: no decoding, colour conversion, file I/O or large allocations.
