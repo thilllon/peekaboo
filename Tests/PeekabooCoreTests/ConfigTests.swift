@@ -27,7 +27,10 @@ final class ConfigTests: XCTestCase {
     func testEmptyFileIsTheDefault() throws {
         XCTAssertEqual(try AppConfig(toml: ""), AppConfig.default)
         XCTAssertEqual(try AppConfig(toml: "# only comments\n\n"), AppConfig.default)
-        XCTAssertEqual(try AppConfig(toml: ConfigStore.sampleConfig), AppConfig.default)
+        // The starter file of earlier versions (all comments) changes nothing.
+        XCTAssertEqual(LegacyConfigFiles.releasedStarter.utf8.count, 3650, "the fixture is the released file, byte for byte")
+        XCTAssertEqual(try AppConfig(toml: LegacyConfigFiles.releasedStarter), AppConfig.default)
+        XCTAssertEqual(try AppConfig(toml: LegacyConfigFiles.firstStarter), AppConfig.default)
     }
 
     func testMapsEveryKey() throws {
@@ -91,24 +94,6 @@ final class ConfigTests: XCTestCase {
         XCTAssertTrue(layers.vimKeys)
         XCTAssertTrue(layers.autoAdvance)
         XCTAssertEqual(layers.keymap, Keymap.build(defaults: false, vim: true, autoAdvance: true))
-    }
-
-    func testSampleTemplateIsAValidConfig() throws {
-        let config = try AppConfig(toml: ConfigStore.sampleTemplate)
-        XCTAssertEqual(config.slots.count, 4)
-        XCTAssertEqual(config.apps["preview"], "com.apple.Preview")
-        XCTAssertEqual(config.keymap.resolve([KeyChord(key: "k")], context: .normal), .actions([.move("keep")]))
-        XCTAssertEqual(config.keymap.resolve([KeyChord(key: "tab")], context: .normal), .unbound)
-        XCTAssertEqual(config.keymap.resolve(KeyChord.sequence(spec: "ctrl+x p")!, context: .normal),
-                       .actions([.exec("open -a 'Pixelmator Pro' {path}")]))
-        // Apart from the examples, the sample spells out the defaults.
-        var expected = AppConfig.default
-        expected.slots = config.slots
-        expected.apps = config.apps
-        expected.keymap = config.keymap
-        XCTAssertEqual(config, expected)
-        // Every line of the starter file is a comment or blank.
-        XCTAssertTrue(ConfigStore.sampleConfig.split(separator: "\n").allSatisfy { $0.hasPrefix("#") })
     }
 
     func testErrorsNameTheLine() {
@@ -192,35 +177,19 @@ final class ConfigTests: XCTestCase {
         XCTAssertThrowsError(try AppConfig(toml: "[view]\nfit = \"fit\"\n"))
     }
 
-    func testStarterFileRoundTripsWithoutErrors() throws {
+    /// The file `app.config_file` creates is the full file, and the store loads it as the built-in configuration with
+    /// zero errors and zero warnings.
+    func testTheCreatedFileLoadsWithoutErrors() throws {
         let url = directory.appendingPathComponent("config.toml")
         let store = ConfigStore(url: url)
-        try store.createDefaultFileIfMissing()
+        XCTAssertTrue(try store.createDefaultFileIfMissing())
         let written = try String(contentsOf: url, encoding: .utf8)
-        let (config, warnings) = try AppConfig.parse(toml: written)
-        XCTAssertEqual(config, .default)
-        XCTAssertEqual(warnings, [])
+        XCTAssertEqual(written, ConfigFile.defaultText)
         store.load()
         XCTAssertNil(store.lastError)
         XCTAssertEqual(store.warnings, [])
-
-        // Uncomment every setting and table line, as the header tells the user to: still zero errors and
-        // zero warnings (planned keys are named only in prose), and the result is the template's.
-        let uncommented = written.split(separator: "\n", omittingEmptySubsequences: false).map { line -> String in
-            guard line.hasPrefix("# ") else { return String(line) }
-            let rest = line.dropFirst(2)
-            return rest.hasPrefix("[") || rest.contains(" = ") ? String(rest) : String(line)
-        }.joined(separator: "\n")
-        XCTAssertNotEqual(uncommented, written)
-        let full = try AppConfig.parse(toml: uncommented)
-        XCTAssertEqual(full.warnings, [])
-        XCTAssertEqual(full.config, try AppConfig(toml: ConfigStore.sampleTemplate))
-        XCTAssertEqual(full.config.slots.count, 4)
-        try Data(uncommented.utf8).write(to: url)
-        store.load()
-        XCTAssertNil(store.lastError)
-        XCTAssertNil(store.lastWarning)
-        XCTAssertEqual(store.config.apps["preview"], "com.apple.Preview")
+        XCTAssertEqual(store.config.keymap, Keymap.default)
+        XCTAssertFalse(store.config.keymapDefaults)
     }
 
     func testStoreAppliesAFileWithUnknownKeysAndReportsThem() throws {
@@ -283,13 +252,13 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(changes, 1)
     }
 
-    func testCreateDefaultFileWritesTheCommentedSample() throws {
+    func testCreateDefaultFileWritesTheFullFile() throws {
         let url = directory.appendingPathComponent("nested/dir/config.toml")
         let store = ConfigStore(url: url)
-        XCTAssertEqual(try store.createDefaultFileIfMissing(), url)
-        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), ConfigStore.sampleConfig)
+        XCTAssertTrue(try store.createDefaultFileIfMissing())
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), ConfigFile.defaultText)
         try Data("# mine\n".utf8).write(to: url)
-        try store.createDefaultFileIfMissing()
+        XCTAssertFalse(try store.createDefaultFileIfMissing())
         XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "# mine\n", "never overwrites")
         store.load()
         XCTAssertEqual(store.config, .default)
@@ -350,19 +319,23 @@ final class ConfigTests: XCTestCase {
         XCTAssertTrue(ConfigStore.defaultURL.path.hasSuffix("/.config/peekaboo/config.toml"))
     }
 
+    /// The full file (every setting, the whole keymap) and the starter file of earlier versions load in well under a
+    /// millisecond (a loose bound: debug build, busy machine; `peekaboo-bench config` measures release builds).
     func testLoadIsFast() throws {
-        let url = directory.appendingPathComponent("config.toml")
-        try Data(ConfigStore.sampleTemplate.utf8).write(to: url)
-        let store = ConfigStore(url: url)
-        store.load()
-        var best = Double.infinity
-        for _ in 0..<20 {
-            let started = Trace.now()
+        for (name, text) in [("full file", ConfigFile.defaultText), ("released starter", LegacyConfigFiles.releasedStarter)] {
+            let url = directory.appendingPathComponent("\(name).toml")
+            try Data(text.utf8).write(to: url)
+            let store = ConfigStore(url: url)
             store.load()
-            best = min(best, Trace.ms(since: started))
+            var best = Double.infinity
+            for _ in 0..<20 {
+                let started = Trace.now()
+                store.load()
+                best = min(best, Trace.ms(since: started))
+            }
+            XCTAssertNil(store.lastError)
+            XCTAssertLessThan(best, 5)
+            print("ConfigStore.load (\(name), \(text.utf8.count) B): best \(String(format: "%.3f", best)) ms")
         }
-        XCTAssertNil(store.lastError)
-        XCTAssertLessThan(best, 5)
-        print("ConfigStore.load (sample, \(ConfigStore.sampleTemplate.utf8.count) B): best \(String(format: "%.3f", best)) ms")
     }
 }

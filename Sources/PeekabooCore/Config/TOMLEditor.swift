@@ -24,9 +24,10 @@ struct TOMLEditor {
 
     /// Set `key` of `table` to `value`. `quoteKey` always quotes a new key (chords: `"k" = …`); otherwise it is bare
     /// when it can be. `reuseCommentedLine`: a commented-out line of the key may become the entry (tables of fixed
-    /// settings, whose commented lines document the key; not example entries of `[slots]` or `[keys]`).
+    /// settings, whose commented lines document the key; not example entries of `[slots]` or `[keys]`). `comment` goes
+    /// after a new line (at the column of the file Peekaboo writes).
     mutating func set(_ value: TOMLValue, key: String, in table: [String], quoteKey: Bool = false,
-                      reuseCommentedLine: Bool = true) throws {
+                      reuseCommentedLine: Bool = true, comment: String? = nil) throws {
         let bytes = Array(text.utf8)
         let document = try TOMLDocument(parsing: text)
         let path = table + [key]
@@ -36,7 +37,7 @@ struct TOMLEditor {
             candidates.append(Self.replacingValue(in: bytes, entry.valueStart..<entry.valueEnd, with: value.tomlText))
         } else {
             let scan = Scan(bytes, document)
-            let line = Array((Self.spelling(key: key, quoted: quoteKey) + " = " + value.tomlText).utf8)
+            let line = Array(ConfigFile.commented(Self.spelling(key: key, quoted: quoteKey) + " = " + value.tomlText, comment).utf8)
             if let header = document.tables.first(where: { $0.path == table }) {
                 let headerLine = scan.lineIndex(at: header.start)
                 if reuseCommentedLine, let ghost = scan.commentedEntry([key], inSectionBelow: headerLine) {
@@ -75,6 +76,50 @@ struct TOMLEditor {
         result.removeSubrange(first.start..<last.next)
         guard Self.verify(result, against: document, path: path, value: nil, table: nil) else {
             throw TOMLEditError("cannot remove \(path.joined(separator: ".")) without changing other lines")
+        }
+        text = String(decoding: result, as: UTF8.self)
+    }
+
+    /// Replace the sections of `tables` with `replacement`, at the end of the text. A section is the header line and
+    /// every line below it up to the next header, less the comment lines right above that header (no blank line
+    /// between: they are its own). Throws, changing nothing, when that would change an entry of another table (a
+    /// dotted key of these tables written under another one, say).
+    mutating func replaceSections(_ tables: Set<[String]>, with replacement: String) throws {
+        let bytes = Array(text.utf8)
+        let document = try TOMLDocument(parsing: text)
+        let scan = Scan(bytes, document)
+        let headers = document.tables.map { (path: $0.path, line: scan.lineIndex(at: $0.start)) }.sorted { $0.line < $1.line }
+        var keep = Array(repeating: true, count: scan.lines.count)
+        for (index, header) in headers.enumerated() where tables.contains(header.path) {
+            var end = scan.lines.count
+            if index + 1 < headers.count {
+                end = headers[index + 1].line
+                while end - 1 > header.line, scan.isComment(end - 1) { end -= 1 }
+            }
+            for n in header.line..<end { keep[n] = false }
+        }
+        // The lines kept, without blank lines at the end, then one blank line and the new sections.
+        let kept = scan.lines.indices.filter { keep[$0] }
+        let lastContent = kept.last { !scan.isBlank($0) } ?? -1
+        var result: [UInt8] = []
+        for n in kept where n <= lastContent {
+            let line = scan.lines[n]
+            result += bytes[line.start..<line.next]
+            if line.next == line.end { result += scan.newline }  // the last line, without its newline
+        }
+        if !result.isEmpty { result += scan.newline }
+        result += Array((scan.newline == [0x0A] ? replacement : replacement.replacingOccurrences(of: "\n", with: "\r\n")).utf8)
+        // Every entry of the other tables as it was, and exactly the replacement's entries in these tables.
+        let added = try TOMLDocument(parsing: replacement)
+        guard let edited = try? TOMLDocument(parsing: String(decoding: result, as: UTF8.self)) else {
+            throw TOMLEditError("cannot reset \(tables.map { $0.joined(separator: ".") }.sorted().joined(separator: ", "))")
+        }
+        func entries(_ document: TOMLDocument, inside: Bool) -> [String] {
+            document.entries.filter { tables.contains(Array($0.path.dropLast())) == inside }.map { "\($0.path)=\($0.value)" }
+        }
+        guard entries(edited, inside: false) == entries(document, inside: false),
+              entries(edited, inside: true) == entries(added, inside: true) else {
+            throw TOMLEditError("cannot reset \(tables.map { $0.joined(separator: ".") }.sorted().joined(separator: ", ")) without changing other lines")
         }
         text = String(decoding: result, as: UTF8.self)
     }
@@ -218,6 +263,14 @@ struct TOMLEditor {
         }
 
         func lineIndex(at offset: Int) -> Int { Self.index(lines, at: offset) }
+
+        /// Line `n` holds only spaces and tabs.
+        func isBlank(_ n: Int) -> Bool { bytes[lines[n].start..<lines[n].end].allSatisfy { $0 == 0x20 || $0 == 0x09 } }
+
+        /// Line `n` is a comment (no header or entry on it, `#` after optional spaces).
+        func isComment(_ n: Int) -> Bool {
+            !real[n] && bytes[lines[n].start..<lines[n].end].first { $0 != 0x20 && $0 != 0x09 } == UInt8(ascii: "#")
+        }
 
         /// `# [table]` or `# key = value` (one optional space after `#`; anything that is not exactly one header or one
         /// entry, such as prose, is not commented-out TOML).

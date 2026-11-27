@@ -339,6 +339,30 @@ final class SettingsWindowTests: ViewerTestCase {
         XCTAssertTrue(fileText().contains("\"tab\" = \"none\"\n"), fileText())
     }
 
+    /// The file Peekaboo writes lists the keymap: its untouched lines are not "changed", removing a key deletes it from
+    /// its line, Change… puts the new key in the old one's place, ↺ and Reset All write the default lines back.
+    func testTheShortcutEditorEditsAFileThatListsTheKeymapInPlace() throws {
+        let controller = try makeController(toml: ConfigFile.defaultText)
+        let pane = shortcuts(controller)
+        XCTAssertEqual(pane.rows().filter(\.modified).map(\.id), [], "the defaults as written are the built-in keys")
+        let hide = try XCTUnwrap(pane.rows().first { $0.actions == [.hudHide] })
+        pane.remove([KeyChord(key: "tab")], from: hide)
+        XCTAssertTrue(spin(3) { self.store.config.keymap.resolve([KeyChord(key: "tab")], context: .normal) == .unbound })
+        XCTAssertEqual(fileText(), ConfigFile.defaultText.replacingOccurrences(of: "\"view.hud_hide\" = \"tab\"\n", with: ""))
+        XCTAssertTrue(try XCTUnwrap(pane.rows().first { $0.actions == [.hudHide] }).modified)
+
+        pane.record([.fullscreen], replacing: [KeyChord(key: "f")])
+        pane.recorded(key(controller.window, kVK_ANSI_G, "g"))
+        XCTAssertTrue(spin(3) { self.store.config.keymap.resolve([KeyChord(key: "g")], context: .normal) == .actions([.fullscreen]) })
+        XCTAssertTrue(fileText().contains("\"view.fullscreen\" = [\"g\", \"return\", \"ctrl+cmd+f\"]\n"), fileText())
+        XCTAssertEqual(store.config.keymap.resolve([KeyChord(key: "f")], context: .normal), .unbound)
+
+        pane.reset(try XCTUnwrap(pane.rows().first { $0.actions == [.fullscreen] }))
+        XCTAssertTrue(spin(3) { self.fileText().contains("\"view.fullscreen\" = [\"f\", \"return\", \"ctrl+cmd+f\"]\n") }, fileText())
+        controller.model.edit { try $0.resetBindings() }
+        XCTAssertTrue(spin(3) { self.fileText() == ConfigFile.defaultText && self.store.config.keymap == Keymap.default }, fileText())
+    }
+
     /// Rows are every parameterless action plus whatever the keymap binds (parameterized ones, action lists), so new
     /// actions appear without a hard-coded list.
     func testRowsListEveryActionDynamically() throws {

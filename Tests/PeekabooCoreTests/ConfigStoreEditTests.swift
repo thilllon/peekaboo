@@ -28,7 +28,7 @@ final class ConfigStoreEditTests: XCTestCase {
         return failure
     }
 
-    func testEditCreatesTheStarterFileAppliesItAndNotifies() throws {
+    func testEditCreatesTheFullFileAppliesItAndNotifies() throws {
         let url = directory.appendingPathComponent("nested/config.toml")
         let store = ConfigStore(url: url)
         store.load()
@@ -44,13 +44,17 @@ final class ConfigStoreEditTests: XCTestCase {
 
         XCTAssertNil(edit(store) { try $0.set("hdr", in: "decode", to: .bool(true)) })
         let written = try String(contentsOf: url, encoding: .utf8)
-        XCTAssertTrue(written.hasPrefix("# Peekaboo configuration."), "starts from the commented starter file")
+        // The full file, with the one value changed in place (its comment keeps its column).
+        let line = { (value: String) in ConfigFile.commented("hdr = \(value)", "gain-map and PQ / HLG photos in HDR (10-15x the SDR decode time; PEEKABOO_HDR=1 forces it)") }
+        XCTAssertEqual(written, ConfigFile.defaultText.replacingOccurrences(of: line("false"), with: line("true")))
+        XCTAssertNotEqual(written, ConfigFile.defaultText)
         XCTAssertTrue(store.config.decodeHDR)
         XCTAssertEqual(changes.last?.decodeHDR, true)
         XCTAssertEqual(notified, 1)
         XCTAssertEqual(store.text, written)
         XCTAssertEqual(store.storedValue("hdr", in: "decode"), .bool(true))
-        XCTAssertNil(store.storedValue("trace", in: "debug"), "a key the file does not set")
+        XCTAssertEqual(store.storedValue("trace", in: "debug"), .bool(false), "the full file sets every key")
+        XCTAssertNil(store.storedValue("keep", in: "slots"), "a key the file does not set")
 
         // An edit that changes nothing writes nothing and notifies nobody.
         XCTAssertNil(edit(store) { try $0.set("hdr", in: "decode", to: .bool(true)) })
@@ -113,7 +117,7 @@ final class ConfigStoreEditTests: XCTestCase {
     /// A Settings change is on disk and applied within a few milliseconds (read, edit, verify, write, reload).
     func testAnEditIsAppliedQuickly() throws {
         let url = directory.appendingPathComponent("config.toml")
-        try Data(ConfigStore.sampleConfig.utf8).write(to: url)
+        try Data(ConfigFile.defaultText.utf8).write(to: url)
         let store = ConfigStore(url: url)
         store.load()
         var times: [Double] = []
@@ -124,8 +128,8 @@ final class ConfigStoreEditTests: XCTestCase {
         }
         XCTAssertEqual(store.config.refineDelayMs, 111)
         let median = times.sorted()[times.count / 2]
-        print(String(format: "ConfigStore.edit (starter file, %d B): median %.2f ms, best %.2f ms",
-                     ConfigStore.sampleConfig.utf8.count, median, times.min() ?? 0))
+        print(String(format: "ConfigStore.edit (full file, %d B): median %.2f ms, best %.2f ms",
+                     ConfigFile.defaultText.utf8.count, median, times.min() ?? 0))
         XCTAssertLessThan(median, 250, "a regression guard: ~1.3 ms on an M4 Pro, ~18 ms on a CI runner")
     }
 

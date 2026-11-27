@@ -118,9 +118,17 @@ public final class ConfigStore {
     private var sources: [DispatchSourceFileSystemObject] = []
     private var pending: DispatchWorkItem?
     private var watching = false
+    /// The settings and default bindings the file is read and written with (nil: this version's; tests play later
+    /// versions with others).
+    let schema: ConfigSchema?
 
-    public init(url: URL = ConfigStore.defaultURL) {
+    public convenience init(url: URL = ConfigStore.defaultURL) {
+        self.init(url: url, schema: nil)
+    }
+
+    init(url: URL, schema: ConfigSchema?) {
         self.url = url
+        self.schema = schema
     }
 
     deinit { sources.forEach { $0.cancel() } }
@@ -145,16 +153,121 @@ public final class ConfigStore {
         }
     }
 
-    /// Make sure a commented starter file exists (for `app.config`) and return its URL.
-    @discardableResult
-    public func createDefaultFileIfMissing() throws -> URL {
-        let fm = FileManager.default
-        if !fm.fileExists(atPath: url.path) {
-            try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try Data(ConfigStore.sampleConfig.utf8).write(to: url, options: .atomic)
-            if watching { queue.async { [weak self] in self?.arm() } }
+    /// For `app.config_file`, on the store's queue (no file I/O on the main thread): create the full file when there is
+    /// none, else bring the file Peekaboo wrote up to date (`upgradeFile`); then `completion` on the main thread with
+    /// the file's URL, once the new contents are applied.
+    public func prepareFile(completion: @escaping (Result<URL, Error>) -> Void) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let result: Result<Outcome?, Error> = Result {
+                if try self.createDefaultFileIfMissing() { return self.read(force: true) }
+                return self.upgradeNow().outcome
+            }
+            DispatchQueue.main.async {
+                if case .success(let outcome?) = result { self.apply(outcome) }
+                completion(result.map { _ in self.url })
+            }
         }
-        return url
+    }
+
+    /// The full file of the built-in configuration.
+    private var fullText: String { schema.map { ConfigFile.text($0) } ?? ConfigFile.defaultText }
+
+    /// Write the full file if there is no file (true when it did). On `queue`.
+    func createDefaultFileIfMissing() throws -> Bool {
+        guard !FileManager.default.fileExists(atPath: url.path) else { return false }
+        try write(Data(fullText.utf8))
+        Trace.log("config created \(url.lastPathComponent): every setting and the whole keymap")
+        return true
+    }
+
+    // MARK: Upgrading
+
+    /// What `upgradeFile` did.
+    public enum Upgrade: Equatable, Sendable {
+        /// Nothing: no file, a file of the user's, or a full file of this generation (or a newer one).
+        case nothing
+        /// An untouched starter file of an earlier version (only comments) became the full file.
+        case rewroteStarter
+        /// A full file of an older generation got the settings and default bindings of the later ones.
+        case appended(from: Int, to: Int)
+        /// It was left as it is: it changed while being upgraded, or the write failed.
+        case failed(String)
+    }
+
+    /// Bring the file Peekaboo wrote up to date, on the store's queue (a second after launch, never on the launch path):
+    /// an untouched starter file of an earlier version becomes the full file, and a full file of an older generation
+    /// gets the settings that later versions added, with their defaults, and their default bindings on the keys it
+    /// leaves free; its generation is raised, so that a binding the user deleted never comes back. Any other file —
+    /// with an active line of the user's, an error, bytes that are not UTF-8 — is left as it is. The configuration in
+    /// effect does not change (the new text must load as the same one); the write is atomic. `completion` runs on the
+    /// main thread, after the new text is applied.
+    public func upgradeFile(completion: ((Upgrade) -> Void)? = nil) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let (upgrade, outcome) = self.upgradeNow()
+            DispatchQueue.main.async {
+                if let outcome { self.apply(outcome) }
+                completion?(upgrade)
+            }
+        }
+    }
+
+    /// On `queue`.
+    private func upgradeNow() -> (upgrade: Upgrade, outcome: Outcome?) {
+        guard let data = try? Data(contentsOf: url) else { return (.nothing, nil) }
+        let text = String(decoding: data, as: UTF8.self)
+        guard text.utf8.elementsEqual(data), let (upgraded, upgrade) = Self.upgraded(text, schema: schema) else { return (.nothing, nil) }
+        // An editor may have saved the file meanwhile: write only over the bytes the new text was made from.
+        guard (try? Data(contentsOf: url)) == data else { return (.failed("\(url.lastPathComponent) changed meanwhile"), nil) }
+        let started = Trace.now()
+        do {
+            try write(Data(upgraded.utf8))
+        } catch {
+            Trace.log("config upgrade failed: \(error.localizedDescription)")
+            return (.failed(error.localizedDescription), nil)
+        }
+        Trace.log("config upgraded \(url.lastPathComponent) (\(upgrade)) in \(String(format: "%.2f", Trace.ms(since: started))) ms")
+        return (upgrade, read(force: true))
+    }
+
+    /// `text` brought up to date (nil: nothing to do), as `upgradeFile` describes: the result loads as the same
+    /// configuration (the starter's keymap becomes the file's own: `keymap.defaults` is false), with no new warning.
+    static func upgraded(_ text: String, schema: ConfigSchema? = nil) -> (text: String, upgrade: Upgrade)? {
+        let schema = schema ?? .current
+        // A file with an error is the user's to fix: it is never touched.
+        guard let reading = try? AppConfig.read(toml: text, schema: schema) else { return nil }
+        let result: (text: String, upgrade: Upgrade)
+        if isStarter(text, reading.document) {
+            result = (ConfigFile.text(schema), .rewroteStarter)
+        } else {
+            guard let generation = reading.generation, generation < schema.generation else { return nil }
+            var editor = ConfigEditor(text: text)
+            do {
+                for setting in schema.settings where setting.generation > generation && reading.document.value(setting.path) == nil {
+                    try editor.set(setting.key, in: setting.table, to: setting.value(.default), comment: setting.comment)
+                }
+                for binding in reading.added { try editor.add(binding) }
+                try editor.set("generation", in: "keymap", to: .integer(schema.generation))
+            } catch {
+                Trace.log("config upgrade skipped: \(error)")
+                return nil
+            }
+            result = (editor.text, .appended(from: generation, to: schema.generation))
+        }
+        guard let after = try? AppConfig.read(toml: result.text, schema: schema), after.unknown.count <= reading.unknown.count
+        else { return nil }
+        var before = reading.config
+        before.keymapDefaults = after.config.keymapDefaults
+        return before == after.config ? result : nil
+    }
+
+    /// A starter file of an earlier version: it starts with the starter's first line and holds nothing but comments
+    /// and blank lines (no table, no setting: it changes nothing). A file of comments that does not start so — the
+    /// user's own notes — is not one.
+    static func isStarter(_ text: String, _ document: TOMLDocument) -> Bool {
+        document.entries.isEmpty && document.tables.isEmpty
+            && text.unicodeScalars.drop(while: { $0 == "\u{FEFF}" }).starts(with: "# Peekaboo configuration".unicodeScalars)
     }
 
     /// The value of `key` in `table` as the applied file writes it; nil when the file does not set it (the Settings
@@ -170,24 +283,30 @@ public final class ConfigStore {
 
     // MARK: Editing
 
-    /// Change the file through `ConfigEditor` (minimal edits of its text; a missing file starts as the commented
-    /// starter file), then write it and apply it. The result must load: an edit that would leave the file with an
-    /// error — or one made while the file has one, or is not UTF-8 — is not written, and `completion` gets the error,
-    /// e.g. `config.toml:17: unknown action "nav.nxt"`. The write is atomic and goes to the file a symbolic link points
-    /// to, keeping the link and the file's permissions. Runs on the store's queue (no file I/O on the main thread);
-    /// `completion` runs on the main thread after the new configuration is applied.
+    /// Change the file through `ConfigEditor` (minimal edits of its text; a missing file starts as the full file, and a
+    /// file `upgradeFile` would bring up to date is brought up to date first), then write it and apply it. The result
+    /// must load: an edit that would leave the file with an error — or one made while the file has one, or is not
+    /// UTF-8 — is not written, and `completion` gets the error, e.g. `config.toml:17: unknown action "nav.nxt"`. The
+    /// write is atomic and goes to the file a symbolic link points to, keeping the link and the file's permissions. Runs
+    /// on the store's queue (no file I/O on the main thread); `completion` runs on the main thread after the new
+    /// configuration is applied.
     public func edit(_ change: @escaping (inout ConfigEditor) throws -> Void, completion: ((Error?) -> Void)? = nil) {
         queue.async { [weak self] in
             guard let self else { return }
             let started = Trace.now()
             let result: Result<Outcome, Error> = Result {
                 let name = self.url.lastPathComponent
-                let existing = try? Data(contentsOf: self.url)
-                let original = existing.map { String(decoding: $0, as: UTF8.self) } ?? ConfigStore.sampleConfig
-                // Decoding replaces invalid UTF-8 (a Latin-1 comment) all over the text: writing it back would change
-                // lines the edit never touched.
-                if let existing, !original.utf8.elementsEqual(existing) {
-                    throw ConfigEditError(line: nil, message: "\(name): not UTF-8 text (save it as UTF-8 to change it here)")
+                let original: String
+                if let existing = try? Data(contentsOf: self.url) {
+                    let text = String(decoding: existing, as: UTF8.self)
+                    // Decoding replaces invalid UTF-8 (a Latin-1 comment) all over the text: writing it back would
+                    // change lines the edit never touched.
+                    guard text.utf8.elementsEqual(existing) else {
+                        throw ConfigEditError(line: nil, message: "\(name): not UTF-8 text (save it as UTF-8 to change it here)")
+                    }
+                    original = Self.upgraded(text, schema: self.schema)?.text ?? text
+                } else {
+                    original = self.fullText
                 }
                 var editor = ConfigEditor(text: original)
                 do {
@@ -199,7 +318,7 @@ public final class ConfigStore {
                 }
                 // A change that changes nothing writes nothing (and creates no file).
                 guard editor.text != original else { return .unchanged }
-                _ = try AppConfig.parse(toml: editor.text, fileName: name)
+                _ = try AppConfig.read(toml: editor.text, fileName: name, schema: self.schema)
                 try self.write(Data(editor.text.utf8))
                 Trace.log("config edited in \(String(format: "%.2f", Trace.ms(since: started))) ms")
                 return self.read(force: true)
@@ -244,7 +363,8 @@ public final class ConfigStore {
         let started = Trace.now()
         let text = String(decoding: data, as: UTF8.self)
         do {
-            let (config, warnings) = try AppConfig.parse(toml: text, fileName: url.lastPathComponent)
+            let reading = try AppConfig.read(toml: text, fileName: url.lastPathComponent, schema: schema)
+            let (config, warnings) = (reading.config, reading.warnings(fileName: url.lastPathComponent))
             Trace.log("config loaded \(url.lastPathComponent) (\(data.count) B) in \(String(format: "%.2f", Trace.ms(since: started))) ms")
             if !warnings.isEmpty { Trace.log("config warnings: \(warnings.joined(separator: "; "))") }
             return .loaded(config, warnings: warnings, text: text)

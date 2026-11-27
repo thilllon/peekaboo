@@ -167,7 +167,8 @@ private struct TOMLParser {
         i += 1
         if peek == UInt8(ascii: "[") { throw error("arrays of tables ([[…]]) are not supported", at: start) }
         skipSpaces()
-        let path = try parseKey()
+        var path: [String] = []
+        try parseKey(into: &path)
         skipSpaces()
         guard peek == UInt8(ascii: "]") else { throw error("expected ']' to close the table header") }
         i += 1
@@ -189,8 +190,10 @@ private struct TOMLParser {
     private mutating func parseKeyValue() throws {
         let start = i
         let keyLine = line
-        let column = error("", at: start).column
-        let key = try parseKey()
+        let column = start == lineStart ? 1 : error("", at: start).column
+        // The table's path, then the key's parts: one array.
+        var path = currentTable
+        try parseKey(into: &path)
         let keyEnd = i
         skipSpaces()
         guard peek == UInt8(ascii: "=") else {
@@ -201,30 +204,30 @@ private struct TOMLParser {
         }
         i += 1
         skipSpaces()
-        let path = currentTable + key
         for n in (currentTable.count + 1)..<path.count {
             let prefix = Array(path.prefix(n))
             if defined[prefix] == .value { throw error("\"\(prefix.joined(separator: "."))\" is a value, not a table", at: start) }
             if defined[prefix] == nil { defined[prefix] = .implicitTable }
         }
-        if defined[path] != nil {
+        // Defined before its value is parsed: a value that fails to parse ends the whole document anyway.
+        if defined.updateValue(.value, forKey: path) != nil {
             throw TOMLError(line: keyLine, column: column, message: "duplicate key \"\(path.joined(separator: "."))\"")
         }
         let valueStart = i
         let value = try parseValue()
-        defined[path] = .value
         entries.append(TOMLEntry(path: path, value: value, line: keyLine, column: column, keyStart: start,
                                  valueStart: valueStart, valueEnd: i))
     }
 
     // MARK: Keys
 
-    private mutating func parseKey() throws -> [String] {
-        var parts = [try parseSimpleKey()]
+    /// A key's parts (`a."b.c".d`), appended to `parts`.
+    private mutating func parseKey(into parts: inout [String]) throws {
+        parts.append(try parseSimpleKey())
         while true {
             let save = i
             skipSpaces()
-            guard peek == UInt8(ascii: ".") else { i = save; return parts }
+            guard peek == UInt8(ascii: ".") else { i = save; return }
             i += 1
             skipSpaces()
             parts.append(try parseSimpleKey())
@@ -346,10 +349,22 @@ private struct TOMLParser {
 
     private mutating func parseBasicString() throws -> String {
         let open = i
-        if bytes[i...].starts(with: Array("\"\"\"".utf8)) {
+        if i + 2 < bytes.count, bytes[i + 1] == 0x22, bytes[i + 2] == 0x22 {
             throw error("multi-line strings (\"\"\"…\"\"\") are not supported", at: open)
         }
         i += 1
+        // Most strings (keys, chords, action ids) have no escape: the bytes up to the closing quote are the string.
+        var end = i
+        while end < bytes.count {
+            let c = bytes[end]
+            if c == 0x22 {
+                let string = String(decoding: bytes[i..<end], as: UTF8.self)
+                i = end + 1
+                return string
+            }
+            if c == 0x5C || c < 0x20 || c == 0x7F { break }  // an escape, a tab, a line end, a control character
+            end += 1
+        }
         var out: [UInt8] = []
         while true {
             guard let c = peek, c != 0x0A, c != 0x0D else { throw error("unterminated string", at: open) }
@@ -390,7 +405,7 @@ private struct TOMLParser {
 
     private mutating func parseLiteralString() throws -> String {
         let open = i
-        if bytes[i...].starts(with: Array("'''".utf8)) {
+        if i + 2 < bytes.count, bytes[i + 1] == 0x27, bytes[i + 2] == 0x27 {
             throw error("multi-line strings ('''…''') are not supported", at: open)
         }
         i += 1

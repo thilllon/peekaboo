@@ -1458,7 +1458,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     }
 
     private func openConfigFile() {
-        if let toast = FileActions.openConfigFile().toast { hud.showToast(toast) }
+        FileActions.openConfigFile { [weak self] in self?.hud.showToast($0) }
     }
 
     private func toggleHelp() {

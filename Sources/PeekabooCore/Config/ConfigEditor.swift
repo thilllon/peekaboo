@@ -4,9 +4,14 @@ import Foundation
 /// comments, order and formatting stay as the user wrote them, and nothing but the changed entries moves.
 ///
 /// Key bindings follow the file's own semantics (docs/CONFIG.md): user entries in `[keys]` / `[keys.zoomed]`
-/// (either spelling, `"chord" = "action"` or `"action" = ["chord", …]`) on top of the built-in keymap that
-/// `[keymap] defaults`, `[keymap] vim` and `[rating] auto_advance` select. A binding that only restates the built-in
-/// keymap is not written; turning off a built-in binding writes `"chord" = "none"`.
+/// (either spelling, `"chord" = "action"` or `"action" = ["chord", …]`) on top of the built-in layers that
+/// `[keymap] defaults`, `[keymap] vim` and `[rating] auto_advance` select. Two forms:
+///
+/// - The file lists the keymap (`defaults = false`, as Peekaboo writes it): a new key goes into its action's
+///   `"action" = [...]` line, removing a key deletes it from its line (or the line), and changing a key replaces it in
+///   place. `"none"` is written only for a key of the vim layer.
+/// - An older file (`defaults = true`): entries on top of the built-in keymap. A binding that only restates it is not
+///   written; turning off a built-in binding writes `"chord" = "none"`.
 public struct ConfigEditor {
     private var toml: TOMLEditor
 
@@ -27,10 +32,16 @@ public struct ConfigEditor {
         try? toml.value(at: Self.path(table) + [key])
     }
 
-    /// Set `key` of `table`, e.g. `set("background", in: "view", to: .string("gray"))`.
+    /// Set `key` of `table`, e.g. `set("background", in: "view", to: .string("gray"))`. A new line gets `comment`.
     public mutating func set(_ key: String, in table: String, to value: TOMLValue) throws {
+        try set(key, in: table, to: value, comment: nil)
+    }
+
+    mutating func set(_ key: String, in table: String, to value: TOMLValue, comment: String?) throws {
         let path = Self.path(table)
-        try edit { try $0.set(value, key: key, in: path, reuseCommentedLine: !Self.exampleTables.contains(path[0])) }
+        try edit {
+            try $0.set(value, key: key, in: path, reuseCommentedLine: !Self.exampleTables.contains(path[0]), comment: comment)
+        }
     }
 
     /// Remove `key` of `table` (its built-in default applies again). Nothing happens when it is absent.
@@ -62,59 +73,165 @@ public struct ConfigEditor {
     // MARK: Key bindings
 
     /// Make `sequence` run `actions` in `context`, taking it from whatever it ran before (other actions keep their
-    /// other keys). Nothing is written when the built-in keymap already does exactly that.
+    /// other keys). Nothing is written when the layer below the file's bindings already does exactly that.
     public mutating func bind(_ sequence: [KeyChord], to actions: [Action], context: KeyContext) throws {
-        let builtIn = try builtInKeymap()
+        let base = try baseKeymap()
+        // Already so in the file: nothing moves (a key would leave its place in its line and come back at the end).
+        if try bindingEntries(context).contains(where: { $0.binds(sequence) == actions }) { return }
         try removeUserBindings(of: sequence, context: context)
-        guard builtIn.bindings[context]?[sequence] != actions else { return }
-        let table = try keyTables(context).primary
-        try edit {
-            try $0.set(Self.value(of: actions), key: KeyChord.spec(of: sequence), in: table, quoteKey: true,
-                       reuseCommentedLine: false)
-        }
+        guard base.bindings[context]?[sequence] != actions else { return }
+        try write(sequence, actions, context: context)
     }
 
-    /// Free `sequence` in `context`: the user's entries for it go, and a built-in binding is turned off with `"none"`
-    /// (in `[keys.zoomed]` that lets the key fall back to `[keys]`).
-    public mutating func unbind(_ sequence: [KeyChord], context: KeyContext) throws {
-        let builtIn = try builtInKeymap()
+    /// Free `sequence` in `context`: the user's entries for it go, and a binding of the layer below them (the built-in
+    /// keymap, or with `defaults = false` the vim layer) is turned off with `"none"` (in `[keys.zoomed]` that lets the
+    /// key fall back to `[keys]`). Given the `actions` the key is taken off (a row's key, removed), a file that lists the
+    /// keymap writes `"none"` only for a binding of the vim layer to those actions: where its line shadowed another
+    /// action of the vim layer (`k`), deleting the line gives the key to that one, as deleting it in an editor does.
+    public mutating func unbind(_ sequence: [KeyChord], from actions: [Action]? = nil, context: KeyContext) throws {
+        let base = try baseKeymap()
         try removeUserBindings(of: sequence, context: context)
-        guard builtIn.bindings[context]?[sequence] != nil else { return }
+        guard let below = base.bindings[context]?[sequence] else { return }
+        if let actions, below != actions, try listsKeymap() { return }
         let table = try keyTables(context).primary
         try edit {
             try $0.set(.string("none"), key: KeyChord.spec(of: sequence), in: table, quoteKey: true, reuseCommentedLine: false)
         }
     }
 
-    /// Give `actions` exactly its built-in keys in `context` again: the user's entries that bind it go, and so do the
-    /// overrides of its built-in keys (`"none"`, or another action that took one of them).
-    public mutating func reset(_ actions: [Action], context: KeyContext) throws {
-        let builtIn = try builtInKeymap()
-        for entry in try bindingEntries(context) where entry.actions == actions {
-            try edit { try $0.remove(entry.path) }
+    /// Give `actions` the key `new` instead of `old` in `context`. An `"action" = [...]` line of the file that lists `old`
+    /// gets `new` in its place; otherwise it is `unbind(old, from: actions)`, then `bind(new)`.
+    public mutating func rebind(_ old: [KeyChord], to new: [KeyChord], actions: [Action], context: KeyContext) throws {
+        let base = try baseKeymap()
+        func line() throws -> BindingEntry? {
+            try bindingEntries(context).first { $0.sequence == nil && $0.actions == actions && $0.lists(old) }
         }
-        for (sequence, bound) in builtIn.bindings[context] ?? [:] where bound == actions {
+        // In place unless the layer below gives `old` to `actions` too (then it is turned off there), or to another
+        // action in an older file (where taking a key off an action always frees it).
+        let below = base.bindings[context]?[old]
+        let inPlace = try listsKeymap() ? below != actions : below == nil
+        guard actions.count == 1, inPlace, base.bindings[context]?[new] != actions, try line() != nil else {
+            try unbind(old, from: actions, context: context)
+            return try bind(new, to: actions, context: context)
+        }
+        try removeUserBindings(of: new, context: context)
+        guard let entry = try line() else { return try bind(new, to: actions, context: context) }
+        let chords = entry.chords.map { KeyChord.sequence(spec: $0) == old ? KeyChord.spec(of: new) : $0 }
+        try edit { try $0.set(Self.value(ofKeys: chords), key: entry.key, in: entry.table) }
+    }
+
+    /// Give `actions` exactly its built-in keys in `context` again: the user's entries that bind it go, and so do the
+    /// overrides of its built-in keys (`"none"`, or another action that took one of them). In a file that lists the
+    /// keymap the built-in keys are those of the default lines (written back, an `"action" = [...]` line in its place)
+    /// and of the vim layer when it is on.
+    public mutating func reset(_ actions: [Action], context: KeyContext) throws {
+        guard try listsKeymap() else {
+            let builtIn = try baseKeymap()
+            for entry in try bindingEntries(context) where entry.actions == actions {
+                try edit { try $0.remove(entry.path) }
+            }
+            for (sequence, bound) in builtIn.bindings[context] ?? [:] where bound == actions {
+                try removeUserBindings(of: sequence, context: context)
+            }
+            return
+        }
+        let autoAdvance = try flag(["rating", "auto_advance"], false)
+        func effective(_ sequence: [KeyChord], _ bound: [Action]) -> [Action] {
+            autoAdvance && Keymap.advancesAutomatically(sequence, bound) ? bound + [.next] : bound
+        }
+        // The default lines that bind `actions` here (auto_advance makes a plain rating key advance), with those keys.
+        let lines = Keymap.defaultBindings.filter { $0.context == context }.compactMap { binding -> Keymap.DefaultBinding? in
+            let keys = zip(binding.keys, binding.sequences).filter { effective($0.1, binding.actions) == actions }.map(\.0)
+            return keys.isEmpty ? nil : Keymap.DefaultBinding(context, binding.actions, keys, generation: binding.generation)
+        }
+        let defaultKeys = Set(lines.flatMap(\.sequences))
+        // The vim layer's keys of `actions` that no default line takes: free them of the file's overrides.
+        let reference = try Keymap.written(vim: flag(["keymap", "vim"], false), autoAdvance: autoAdvance)
+        let base = try baseKeymap()
+        for (sequence, bound) in base.bindings[context] ?? [:]
+        where bound == actions && reference.bindings[context]?[sequence] == actions {
             try removeUserBindings(of: sequence, context: context)
+        }
+        // The file's other keys of `actions` go.
+        for entry in try bindingEntries(context) {
+            for sequence in entry.sequences where !defaultKeys.contains(sequence) && effective(sequence, entry.actions) == actions {
+                try removeUserBindings(of: sequence, context: context)
+            }
+        }
+        // Each default line: its keys taken from other bindings, then written (an "action" = [...] line keeps its place).
+        for line in lines {
+            func own() throws -> BindingEntry? {
+                guard line.actions.count == 1 else { return nil }
+                return try bindingEntries(context).first { $0.sequence == nil && $0.actions == line.actions }
+            }
+            for sequence in line.sequences {
+                // A line of an action list the file still has stays where it is.
+                if line.actions.count > 1, try bindingEntries(context).contains(where: { $0.binds(sequence) == line.actions }) {
+                    continue
+                }
+                try removeUserBindings(of: sequence, context: context, except: own()?.path)
+            }
+            if let entry = try own() {
+                let kept = entry.chords.filter { chord in !line.keys.contains { KeyChord.sequence(spec: $0) == KeyChord.sequence(spec: chord) } }
+                try edit { try $0.set(Self.value(ofKeys: line.keys + kept), key: entry.key, in: entry.table) }
+            } else {
+                for sequence in line.sequences where base.bindings[context]?[sequence] != line.actions {
+                    guard try !bindingEntries(context).contains(where: { $0.binds(sequence) == line.actions }) else { continue }
+                    try write(sequence, line.actions, context: context)
+                }
+            }
         }
     }
 
-    /// Remove every entry of `[keys]`, `[keys.normal]` and `[keys.zoomed]`: the built-in keymap applies as it is.
+    /// The built-in keymap again. In a file that lists the keymap, `[keys]` and `[keys.zoomed]` are written anew with
+    /// the default lines (their sections replaced, `[keys.normal]` too); in an older file, every entry of those tables is
+    /// removed, so the built-in keymap applies as it is.
     public mutating func resetBindings() throws {
         let tables = try keyTables(.normal).all + keyTables(.zoomed).all
+        if try listsKeymap() {
+            var generation = ConfigFile.generation
+            if case .integer(let n)? = try document().value(["keymap", "generation"]) { generation = n }
+            return try edit { try $0.replaceSections(Set(tables), with: ConfigFile.keysText(generation: generation)) }
+        }
         for entry in try document().entries where tables.contains(Array(entry.path.dropLast())) {
             try edit { try $0.remove(entry.path) }
         }
     }
 
-    /// The keymap the file starts from before its `[keys]` tables.
-    private func builtInKeymap() throws -> Keymap {
-        let document = try document()
-        func flag(_ path: [String], _ fallback: Bool) -> Bool {
-            if case .bool(let value)? = document.value(path) { return value }
-            return fallback
+    /// Add a default binding of a later generation (`ConfigStore.upgradeFile`), as `bind` would write each of its keys.
+    mutating func add(_ binding: Keymap.DefaultBinding) throws {
+        for sequence in binding.sequences { try write(sequence, binding.actions, context: binding.context) }
+    }
+
+    /// The file lists the keymap: `[keymap] defaults = false`.
+    private func listsKeymap() throws -> Bool { try !flag(["keymap", "defaults"], true) }
+
+    private func flag(_ path: [String], _ fallback: Bool) throws -> Bool {
+        if case .bool(let value)? = try document().value(path) { return value }
+        return fallback
+    }
+
+    /// The layer the file's `[keys]` tables go on top of: the built-in keymap (`defaults = true`), or the vim layer.
+    private func baseKeymap() throws -> Keymap {
+        try Keymap.build(defaults: flag(["keymap", "defaults"], true), vim: flag(["keymap", "vim"], false),
+                         autoAdvance: flag(["rating", "auto_advance"], false))
+    }
+
+    /// Write a binding of `sequence` (none in the file now). In a file that lists the keymap, one action's key goes into
+    /// that action's `"action" = [...]` line (a new one at the end of the table if there is none); otherwise, and for an
+    /// action list, it is a new `"chord" = action(s)` line.
+    private mutating func write(_ sequence: [KeyChord], _ actions: [Action], context: KeyContext) throws {
+        let spec = KeyChord.spec(of: sequence)
+        let table = try keyTables(context).primary
+        guard try listsKeymap(), actions.count == 1 else {
+            return try edit {
+                try $0.set(Self.value(of: actions), key: spec, in: table, quoteKey: true, reuseCommentedLine: false)
+            }
         }
-        return Keymap.build(defaults: flag(["keymap", "defaults"], true), vim: flag(["keymap", "vim"], false),
-                            autoAdvance: flag(["rating", "auto_advance"], false))
+        if let entry = try bindingEntries(context).first(where: { $0.sequence == nil && $0.actions == actions }) {
+            return try edit { try $0.set(Self.value(ofKeys: entry.chords + [spec]), key: entry.key, in: entry.table) }
+        }
+        try edit { try $0.set(.string(spec), key: actions[0].id, in: table, quoteKey: true, reuseCommentedLine: false) }
     }
 
     /// Where new bindings of `context` go, and every table its bindings may be in (`[keys.normal]` is `[keys]`).
@@ -138,6 +255,17 @@ public struct ConfigEditor {
         let actions: [Action]
         /// An action entry's chords as written.
         let chords: [String]
+
+        var key: String { path[path.count - 1] }
+        var table: [String] { Array(path.dropLast()) }
+        /// The key sequences it binds.
+        var sequences: [[KeyChord]] { sequence.map { [$0] } ?? chords.compactMap(KeyChord.sequence(spec:)) }
+        func lists(_ sequence: [KeyChord]) -> Bool { chords.contains { KeyChord.sequence(spec: $0) == sequence } }
+        /// What it binds `sequence` to (nil: not that key).
+        func binds(_ sequence: [KeyChord]) -> [Action]? {
+            if let own = self.sequence { return own == sequence ? actions : nil }
+            return lists(sequence) ? actions : nil
+        }
     }
 
     private func bindingEntries(_ context: KeyContext) throws -> [BindingEntry] {
@@ -162,9 +290,10 @@ public struct ConfigEditor {
         return result
     }
 
-    /// Take `sequence` out of the user's entries of `context`: a chord entry for it goes, an action entry loses it.
-    private mutating func removeUserBindings(of sequence: [KeyChord], context: KeyContext) throws {
-        for entry in try bindingEntries(context) {
+    /// Take `sequence` out of the user's entries of `context` (but the one at `except`): a chord entry for it goes, an
+    /// action entry loses it.
+    private mutating func removeUserBindings(of sequence: [KeyChord], context: KeyContext, except: [String]? = nil) throws {
+        for entry in try bindingEntries(context) where entry.path != except {
             if let own = entry.sequence {
                 if own == sequence { try edit { try $0.remove(entry.path) } }
                 continue
@@ -182,6 +311,11 @@ public struct ConfigEditor {
 
     private static func value(of actions: [Action]) -> TOMLValue {
         actions.count == 1 ? .string(actions[0].id) : .array(actions.map { .string($0.id) })
+    }
+
+    /// An action entry's value: one chord, or a list of them.
+    private static func value(ofKeys chords: [String]) -> TOMLValue {
+        chords.count == 1 ? .string(chords[0]) : .array(chords.map(TOMLValue.string))
     }
 }
 

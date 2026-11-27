@@ -136,13 +136,158 @@ final class ConfigEditorTests: XCTestCase {
     }
 
     func testTheStarterFileKeepsItsExamples() throws {
-        let starter = ConfigStore.sampleConfig
+        let starter = LegacyConfigFiles.releasedStarter
         let text = try edit(starter) { try $0.bind(seq("y"), to: [.copyName], context: .normal) }
         XCTAssertTrue(text.contains("\n[keys]                        # \"chord\" = \"action\" or [\"action\", ...]; \"none\" removes a default binding\n\"y\" = \"file.copy_name\"\n# \"k\" = \"file.move:keep\""), text)
         XCTAssertEqual(try resolve(text, "y"), .actions([.copyName]))
         var expected = Keymap.default
         expected.bind(seq("y"), to: [.copyName])
         XCTAssertEqual(try AppConfig(toml: text).keymap, expected)
+    }
+
+    // MARK: A file that lists the keymap (as Peekaboo writes it)
+
+    private var full: String { ConfigFile.defaultText }
+
+    /// `full` with `old` replaced by `new` (each must be in it).
+    private func full(_ old: String, _ new: String) -> String {
+        XCTAssertTrue(full.contains(old), old)
+        return full.replacingOccurrences(of: old, with: new)
+    }
+
+    func testANewKeyJoinsItsActionsLine() throws {
+        XCTAssertEqual(try edit(full) { try $0.bind(seq("g"), to: [.fullscreen], context: .normal) },
+                       full("\"view.fullscreen\" = [\"f\", \"return\", \"ctrl+cmd+f\"]", "\"view.fullscreen\" = [\"f\", \"return\", \"ctrl+cmd+f\", \"g\"]"))
+        // An action without a line gets one at the end of [keys], above the examples; an action list a line of its own.
+        XCTAssertEqual(try edit(full) { try $0.bind(seq("y"), to: [.copyName], context: .normal) },
+                       full("\"app.open\" = \"cmd+o\"\n", "\"app.open\" = \"cmd+o\"\n\"file.copy_name\" = \"y\"\n"))
+        XCTAssertEqual(try edit(full) { try $0.bind(seq("shift+y"), to: [.copyName, .next], context: .normal) },
+                       full("\"app.open\" = \"cmd+o\"\n", "\"app.open\" = \"cmd+o\"\n\"shift+y\" = [\"file.copy_name\", \"nav.next\"]\n"))
+        XCTAssertEqual(try edit(full) { try $0.bind(seq("y"), to: [.panCenter], context: .zoomed) },
+                       full("\"pan.edge:bottom\" = \"shift+down\"\n", "\"pan.edge:bottom\" = \"shift+down\"\n\"pan.center\" = \"y\"\n"))
+        // What the file already does changes nothing.
+        XCTAssertEqual(try edit(full) { try $0.bind(seq("right"), to: [.next], context: .normal) }, full)
+        // A key another action has leaves that action's line; no "none" is written.
+        let taken = try edit(full) { try $0.bind(seq("f"), to: [.copyName], context: .normal) }
+        XCTAssertEqual(taken, full("\"view.fullscreen\" = [\"f\", \"return\", \"ctrl+cmd+f\"]", "\"view.fullscreen\" = [\"return\", \"ctrl+cmd+f\"]")
+            .replacingOccurrences(of: "\"app.open\" = \"cmd+o\"\n", with: "\"app.open\" = \"cmd+o\"\n\"file.copy_name\" = \"f\"\n"))
+        XCTAssertEqual(try resolve(taken, "f"), .actions([.copyName]))
+        XCTAssertEqual(try resolve(taken, "return"), .actions([.fullscreen]))
+    }
+
+    func testRemovingAKeyDeletesItFromItsLine() throws {
+        let line = try edit(full) { try $0.unbind(seq("tab"), context: .normal) }
+        XCTAssertEqual(line, full("\"view.hud_hide\" = \"tab\"\n", ""))
+        XCTAssertEqual(try resolve(line, "tab"), .unbound)
+        XCTAssertEqual(try edit(full) { try $0.unbind(seq("return"), context: .normal) },
+                       full("[\"f\", \"return\", \"ctrl+cmd+f\"]", "[\"f\", \"ctrl+cmd+f\"]"))
+        XCTAssertEqual(try edit(full) { try $0.unbind(seq("p"), context: .normal) }, full("\"meta.flag:pick\" = \"p\"\n", ""))
+        let zoomed = try edit(full) { try $0.unbind(seq("left"), context: .zoomed) }
+        XCTAssertEqual(zoomed, full("\"pan.left\" = \"left\"\n", ""))
+        XCTAssertEqual(try resolve(zoomed, "left", .zoomed), .actions([.previous]), "falls back to [keys]")
+        // A key of the vim layer is turned off with "none".
+        let vim = full("vim = false ", "vim = true  ")
+        let h = try edit(vim) { try $0.unbind(seq("h"), context: .normal) }
+        XCTAssertEqual(h, vim.replacingOccurrences(of: "\"app.open\" = \"cmd+o\"\n", with: "\"app.open\" = \"cmd+o\"\n\"h\" = \"none\"\n"))
+        XCTAssertEqual(try resolve(h, "h"), .unbound)
+    }
+
+    /// With vim on, the file's `"view.play_pause" = "k"` shadows the vim layer's `k`: moving or removing it gives `k` to
+    /// the vim layer (as editing the line by hand does), while a key of the vim layer itself is turned off with "none".
+    func testTheVimLayerUnderAFileThatListsTheKeymap() throws {
+        let vim = full("vim = false ", "vim = true  ")
+        let moved = try edit(vim) { try $0.rebind(seq("k"), to: seq("s"), actions: [.playPause], context: .normal) }
+        XCTAssertEqual(moved, vim.replacingOccurrences(of: "\"view.play_pause\" = \"k\"", with: "\"view.play_pause\" = \"s\""))
+        XCTAssertEqual(try resolve(moved, "k"), .actions([.previous]))
+        let removed = try edit(vim) { try $0.unbind(seq("k"), from: [.playPause], context: .normal) }
+        XCTAssertEqual(removed, vim.replacingOccurrences(of: "\"view.play_pause\" = \"k\"\n", with: ""))
+        XCTAssertEqual(try resolve(removed, "k"), .actions([.previous]))
+        // Freeing the key altogether (a conflict, or no action named) turns the vim layer's off too.
+        let freed = try edit(vim) { try $0.unbind(seq("k"), context: .normal) }
+        XCTAssertEqual(try resolve(freed, "k"), .unbound)
+        // A key of the vim layer: "none", then the new key in the action's line.
+        let changed = try edit(vim) { try $0.rebind(seq("h"), to: seq("t"), actions: [.previous], context: .normal) }
+        XCTAssertTrue(changed.contains("\"nav.prev\" = [\"left\", \"up\", \"shift+space\", \"backspace\", \"pageup\", \"t\"]\n"), changed)
+        XCTAssertTrue(changed.contains("\n\"h\" = \"none\"\n"), changed)
+        XCTAssertEqual(try resolve(changed, "h"), .unbound)
+        XCTAssertEqual(try resolve(changed, "t"), .actions([.previous]))
+        // An older file keeps freeing a key it takes off an action: "none" for the built-in key under it.
+        XCTAssertEqual(try edit("[keys]\n\"f\" = \"file.trash\"\n") { try $0.unbind(seq("f"), from: [.trash], context: .normal) },
+                       "[keys]\n\"f\" = \"none\"\n")
+    }
+
+    func testChangingAKeyReplacesItInPlace() throws {
+        XCTAssertEqual(try edit(full) { try $0.rebind(seq("f"), to: seq("g"), actions: [.fullscreen], context: .normal) },
+                       full("[\"f\", \"return\", \"ctrl+cmd+f\"]", "[\"g\", \"return\", \"ctrl+cmd+f\"]"))
+        XCTAssertEqual(try edit(full) { try $0.rebind(seq("tab"), to: seq("h"), actions: [.hudHide], context: .normal) },
+                       full("\"view.hud_hide\" = \"tab\"", "\"view.hud_hide\" = \"h\""))
+        // To a key another action has: it leaves that action's line.
+        XCTAssertEqual(try edit(full) { try $0.rebind(seq("f"), to: seq("b"), actions: [.fullscreen], context: .normal) },
+                       full("[\"f\", \"return\", \"ctrl+cmd+f\"]", "[\"b\", \"return\", \"ctrl+cmd+f\"]")
+                        .replacingOccurrences(of: "\"view.background\" = \"b\"\n", with: ""))
+        // A key of an action list: its line goes, the new key gets one.
+        let list = try edit(full) { try $0.rebind(seq("shift+3"), to: seq("shift+t"), actions: [.rate(3), .next], context: .normal) }
+        XCTAssertEqual(list, full("\"shift+3\" = [\"meta.rate:3\", \"nav.next\"]\n", "")
+            .replacingOccurrences(of: "\"app.open\" = \"cmd+o\"\n", with: "\"app.open\" = \"cmd+o\"\n\"shift+t\" = [\"meta.rate:3\", \"nav.next\"]\n"))
+        // An older file: "none" for the built-in key and a line for the new one, as before; a line of the user's that
+        // lists the key is changed in place.
+        XCTAssertEqual(try edit("") { try $0.rebind(seq("f"), to: seq("g"), actions: [.fullscreen], context: .normal) },
+                       "[keys]\n\"f\" = \"none\"\n\"g\" = \"view.fullscreen\"\n")
+        XCTAssertEqual(try edit("[keys]\n\"nav.next\" = [\"n\", \"ctrl+f\"]\n") {
+            try $0.rebind(seq("n"), to: seq("j"), actions: [.next], context: .normal)
+        }, "[keys]\n\"nav.next\" = [\"j\", \"ctrl+f\"]\n")
+    }
+
+    func testResetWritesTheDefaultLinesBack() throws {
+        var editor = ConfigEditor(text: full)
+        try editor.rebind(seq("f"), to: seq("g"), actions: [.fullscreen], context: .normal)
+        try editor.bind(seq("y"), to: [.fullscreen], context: .normal)
+        try editor.bind(seq("return"), to: [.copyName], context: .normal)
+        try editor.reset([.fullscreen], context: .normal)
+        XCTAssertEqual(editor.text, full, "in place; the key another action took is back")
+        // A deleted line comes back (at the end of the table), and so does a line of an action list.
+        let hud = try edit(full("\"view.hud\" = \"i\"\n", "")) { try $0.reset([.hud], context: .normal) }
+        XCTAssertEqual(try AppConfig(toml: hud).keymap, Keymap.default)
+        let rated = try edit(full) { editor in
+            try editor.unbind(seq("shift+3"), context: .normal)
+            try editor.reset([.rate(3), .next], context: .normal)
+        }
+        XCTAssertEqual(try AppConfig(toml: rated).keymap, Keymap.default)
+        // With auto_advance, the plain key's own line ("meta.rate:3" = "3") is written back, at the end of the table;
+        // the shift line it still has stays where it is.
+        let advancing = full("auto_advance = false ", "auto_advance = true  ")
+        let advanced = try edit(advancing) { editor in
+            try editor.unbind(seq("3"), context: .normal)
+            try editor.bind(seq("t"), to: [.rate(3), .next], context: .normal)
+            try editor.reset([.rate(3), .next], context: .normal)
+        }
+        XCTAssertEqual(advanced, advancing.replacingOccurrences(of: "\"meta.rate:3\" = \"3\"\n", with: "")
+            .replacingOccurrences(of: "\"app.open\" = \"cmd+o\"\n", with: "\"app.open\" = \"cmd+o\"\n\"meta.rate:3\" = \"3\"\n"))
+        XCTAssertEqual(try AppConfig(toml: advanced).keymap, Keymap.written(vim: false, autoAdvance: true))
+        // With vim, its keys are freed of their "none" (and k stays the file's).
+        let vim = full("vim = false ", "vim = true  ")
+        let freed = try edit(vim) { editor in
+            try editor.unbind(seq("h"), context: .normal)
+            try editor.reset([.previous], context: .normal)
+        }
+        XCTAssertEqual(freed, vim)
+        XCTAssertEqual(try AppConfig(toml: freed).keymap, Keymap.written(vim: true, autoAdvance: false))
+    }
+
+    func testResetAllWritesTheKeysAnew() throws {
+        let gray = full("background = \"black\"   ", "background = \"gray\"    ")
+        var editor = ConfigEditor(text: gray)
+        try editor.bind(seq("y"), to: [.copyName], context: .normal)
+        try editor.unbind(seq("tab"), context: .normal)
+        try editor.unbind(seq("left"), context: .zoomed)
+        try editor.resetBindings()
+        XCTAssertEqual(editor.text, gray, "every other line as it was")
+        // Key tables elsewhere ([keys.normal] too): replaced at the end, the comment of the next table kept.
+        let mixed = "[keymap]\ndefaults = false\n\n[keys.normal]\n\"n\" = \"nav.next\"\n# mine\n[view]\nbackground = \"gray\"\n[keys.zoomed]\n\"j\" = \"pan.down\"\n"
+        let reset = try edit(mixed) { try $0.resetBindings() }
+        XCTAssertEqual(reset, "[keymap]\ndefaults = false\n\n# mine\n[view]\nbackground = \"gray\"\n\n" + ConfigFile.keysText())
+        XCTAssertEqual(try AppConfig(toml: reset).keymap, Keymap.default)
+        XCTAssertEqual(try AppConfig(toml: reset).background, "gray")
     }
 
     // MARK: Conflicts

@@ -213,7 +213,9 @@ final class FileActions {
             let done = ["pick": "Pick", "reject": "Reject"][flag] ?? "Flag cleared"
             return tag(context, done: done) { FileOperations.flag(flag, in: $0) }
         case .exec(let template): return exec(template, context: context)
-        case .configFile: return Self.openConfigFile()
+        case .configFile:
+            Self.openConfigFile { [weak self] in self?.onLateResult?(FileActionResult(toast: $0)) }
+            return FileActionResult()
         case .reloadConfig: return reloadConfig()
         case .makeDefault: return makeDefault()
         default: return FileActionResult()
@@ -658,22 +660,25 @@ final class FileActions {
 
     // MARK: App
 
-    /// `app.config_file`: create the commented starter file if needed and open it in the editor for `.toml` files
-    /// (TextEdit when there is none).
-    static func openConfigFile() -> FileActionResult {
+    /// `app.config_file`: create the file of every setting and the whole keymap if there is none (or bring the file
+    /// Peekaboo wrote up to date), off the main thread, then open it in the editor for `.toml` files (TextEdit when there
+    /// is none); `toast` (main thread) says which file opened, or why it could not be created.
+    static func openConfigFile(toast: @escaping (String) -> Void) {
         let store = ConfigStore.current ?? ConfigStore()
-        do {
-            let url = try store.createDefaultFileIfMissing()
-            let editor = NSWorkspace.shared.urlForApplication(toOpen: url)
-                ?? NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.TextEdit")
-            if let editor {
-                NSWorkspace.shared.open([url], withApplicationAt: editor, configuration: NSWorkspace.OpenConfiguration())
-            } else {
-                NSWorkspace.shared.open(url)
+        store.prepareFile { result in
+            switch result {
+            case .success(let url):
+                let editor = NSWorkspace.shared.urlForApplication(toOpen: url)
+                    ?? NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.TextEdit")
+                if let editor {
+                    NSWorkspace.shared.open([url], withApplicationAt: editor, configuration: NSWorkspace.OpenConfiguration())
+                } else {
+                    NSWorkspace.shared.open(url)
+                }
+                toast("Opened \((url.path as NSString).abbreviatingWithTildeInPath)")
+            case .failure(let error):
+                toast("Cannot create the config file: \(error.localizedDescription)")
             }
-            return FileActionResult(toast: "Opened \((url.path as NSString).abbreviatingWithTildeInPath)")
-        } catch {
-            return FileActionResult(toast: "Cannot create the config file: \(error.localizedDescription)")
         }
     }
 
