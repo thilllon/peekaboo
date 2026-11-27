@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import Metal
 import XCTest
 @testable import PeekabooApp
 @testable import PeekabooCore
@@ -162,6 +163,8 @@ final class ImageListTests: ViewerTestCase {
     func testOpenOrClosedIsKeptAcrossLaunches() throws {
         let state = ViewerUIState.inMemory()
         let urls = writeFolder(10)
+        // Large enough that its decode outlasts a main-queue turn: the list must still wait for it.
+        writeImage(urls[0], width: 6000, height: 4000, gray: 0.4)
         let first = try makeViewer(uiState: state)
         openAndWait(first, [urls[0]])
         first.perform(.imageList)
@@ -177,12 +180,17 @@ final class ImageListTests: ViewerTestCase {
         XCTAssertEqual(viewerView(second).frame.width, root.bounds.width - ImageListPanel.width,
                        "the first frame would not fit beside the list")
         second.open([urls[0]])
-        XCTAssertTrue(spin(5) { self.panel(second) != nil }, "the list was not built after the first frame")
-        XCTAssertEqual(second.displayedFile?.name, "IMG_0000.jpg")
-        XCTAssertTrue(second.shownTierForTests.map { $0 >= .screen } == true, "the list was built before the image was sharp")
+        // Checked in the run-loop turn the list appears in: never before the image is sharp.
+        var builtWhileDecoding = false
+        XCTAssertTrue(spin(10) {
+            guard self.panel(second) != nil else { return false }
+            builtWhileDecoding = !(second.displayedFile?.name == "IMG_0000.jpg" && second.shownTierForTests.map { $0 >= .screen } == true)
+            return true
+        }, "the list was not built after the first frame")
+        XCTAssertFalse(builtWhileDecoding, "the list was built before the image was sharp")
         let list = try XCTUnwrap(panel(second))
         XCTAssertFalse(list.isHidden)
-        XCTAssertEqual(list.files.count, 10)
+        XCTAssertTrue(spin(10) { list.files.count == 10 }, "the list did not follow the folder's listing: \(list.files.count) rows")
         second.perform(.imageList)
         XCTAssertFalse(state.isImageListOpen())
         XCTAssertEqual(viewerView(second).frame.width, root.bounds.width)
@@ -487,23 +495,42 @@ final class ImageListTests: ViewerTestCase {
         XCTAssertTrue(spin(10) { thumbnails.count("img39.jpg") >= 1 }, "the rows on screen got no thumbnails")
     }
 
-    /// A file the viewer holds a preview of (its sweep decodes them around the image on screen) gets its thumbnail from
-    /// that preview, not from the file.
+    /// A file the viewer holds a preview of gets its thumbnail from that preview, not from the file. Which source a job
+    /// uses is decided when it starts, so a preview that landed while it waited counts; the list asks the pipeline.
     func testThumbnailsComeFromTheViewersPreviews() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("no Metal device") }
+        let pool = PixelBufferPool(device: device)
+        let pixels = try XCTUnwrap(pool.make(width: 64, height: 48, layout: .bgra8, alpha: .opaque,
+                                             colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!))
+        let preview = DecodedImage(pixels: pixels, tier: .preview, fullWidth: 640, fullHeight: 480, orientation: .up,
+                                   isHDR: false, decodeNanos: 0)
+        let files = (0..<6).map { i in
+            ImageFile(url: folder.appendingPathComponent("p\(i).jpg"), name: "p\(i).jpg", byteSize: 100, modified: 1, fileID: 0)
+        }
         let thumbnails = ThumbnailRecorder()
-        let viewer = try makeViewer(makeThumbnail: thumbnails.make)
-        let urls = writeSequence(8, width: 1200, height: 800)
+        let loader = ThumbnailLoader(maxPixelSize: ImageListPanel.thumbnailPixels, make: thumbnails.make)
+        var held: Set<String> = ["p0.jpg", "p3.jpg"]
+        loader.preview = { file in held.contains(file.name) ? preview : nil }
+        loader.isPaused = true
+        for file in files { loader.request(file, key: ThumbnailLoader.key(file)) }
+        held.insert("p5.jpg")  // landed while the jobs waited
+        loader.isPaused = false
+        XCTAssertTrue(spin(5) { loader.pendingCount == 0 })
+        XCTAssertEqual(Set(thumbnails.made.filter(\.fromPreview).map(\.name)), ["p0.jpg", "p3.jpg", "p5.jpg"])
+        XCTAssertEqual(Set(thumbnails.made.filter { !$0.fromPreview }.map(\.name)), ["p1.jpg", "p2.jpg", "p4.jpg"])
+        XCTAssertEqual(loader.madeFromPreviews, 3)
+
+        // The list's loader asks the viewer's pipeline.
+        let viewer = try makeViewer(makeThumbnail: ThumbnailRecorder().make)
+        let urls = writeSequence(6, width: 1200, height: 800)
         openAndWait(viewer, [urls[0]])
-        let previews = { viewer.pipeline.files.filter { viewer.pipeline.preview(for: $0) != nil }.count }
-        XCTAssertTrue(spin(10) { previews() >= 7 }, "the sweep made \(previews()) previews")
-        let held = previews()
         viewer.perform(.imageList)
         let list = try XCTUnwrap(panel(viewer))
-        display(viewer)
-        XCTAssertTrue(spin(10) { list.thumbnails.pendingCount == 0 && thumbnails.made.count == 8 })
-        XCTAssertGreaterThanOrEqual(thumbnails.made.filter(\.fromPreview).count, held,
-                                    "made from the files: \(thumbnails.made.filter { !$0.fromPreview }.map(\.name))")
-        XCTAssertEqual(list.thumbnails.madeFromPreviews, thumbnails.made.filter(\.fromPreview).count)
+        XCTAssertTrue(spin(20) { viewer.pipeline.files.contains { viewer.pipeline.preview(for: $0) != nil } },
+                      "the pipeline holds no preview")
+        for file in viewer.pipeline.files {
+            XCTAssertEqual(list.thumbnails.preview(file)?.pixels === viewer.pipeline.preview(for: file)?.pixels, true, file.name)
+        }
     }
 
     /// The real thumbnails reach the rows: small images, from the embedded previews or the viewer's.

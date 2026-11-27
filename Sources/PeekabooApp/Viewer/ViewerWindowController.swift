@@ -1959,7 +1959,11 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             guard !imageListBuildScheduled, !isDecodingCurrent else { return }
             imageListBuildScheduled = true
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.imageListOpen, self.imageList == nil else { return }
+                guard let self else { return }
+                self.imageListBuildScheduled = false
+                // An image opened meanwhile (at launch: after this was scheduled) is decoded first; the `updateHUD` that
+                // shows it sharp schedules the build again.
+                guard self.imageListOpen, self.imageList == nil, !self.isDecodingCurrent else { return }
                 let started = Trace.now()
                 self.buildImageList()
                 self.syncImageList()
