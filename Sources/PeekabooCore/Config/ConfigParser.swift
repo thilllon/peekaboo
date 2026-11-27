@@ -45,7 +45,7 @@ extension AppConfig {
     }
 
     /// The config plus what the file holds (the skipped unknown tables and keys, its generation, the default bindings of
-    /// later generations its keymap got); throws for the other errors.
+    /// later generations it leaves the keys free for); throws for the other errors.
     static func read(toml text: String, fileName: String = "config.toml", schema: ConfigSchema? = nil) throws -> ConfigReading {
         let document: TOMLDocument
         do {
@@ -69,8 +69,8 @@ struct ConfigReading {
     let document: TOMLDocument
     /// `[keymap] generation`: which settings and default bindings of later versions a full file has (nil: none).
     let generation: Int?
-    /// The default bindings of later generations that its keymap got on the keys the file leaves free
-    /// (`[keymap] defaults = false` with an older generation), each with those keys only.
+    /// The default bindings of later generations on the keys a full file of an older generation leaves free, each with
+    /// those keys only: its keymap got them (`[keymap] defaults = false`), or has them through the built-in one (`true`).
     let added: [Keymap.DefaultBinding]
 
     func warnings(fileName: String) -> [String] {
@@ -197,13 +197,21 @@ private struct ConfigReader {
     // MARK: Keys
 
     /// The file's bindings on top of the built-in layers `[keymap]` selects. With `defaults = false` (the file lists the
-    /// keymap) the vim layer is under the file's bindings, the default bindings of generations newer than the file's go
-    /// on the keys it leaves free (`ConfigStore.upgradeFile` then writes them in), and `auto_advance` applies to the
-    /// file's plain rating, label and flag keys.
+    /// keymap) the vim layer is under the file's bindings; with `true`, the built-in keymap with the vim layer on top.
+    /// A full file of an older generation gets the default bindings of the later ones on the keys its own lines and the
+    /// vim layer leave free (in `added`, for `ConfigStore.upgradeFile` to write in); they apply at once with
+    /// `defaults = false`, and with `true` the built-in keymap has them already. `auto_advance` applies to the file's
+    /// plain rating, label and flag keys in a file that lists the keymap or that Peekaboo wrote (it has a generation);
+    /// an older file of overrides keeps its own entries as they are.
     private mutating func buildKeymap(_ entries: [(entry: TOMLEntry, context: KeyContext, chord: String)],
                                       defaults: Bool, vim: Bool, autoAdvance: Bool) -> Keymap {
-        var keymap = defaults && !vim && !autoAdvance ? Keymap.default
-            : Keymap.build(defaults: defaults, vim: vim, autoAdvance: defaults && autoAdvance)
+        var keymap = defaults && !vim && !autoAdvance && schema == nil ? Keymap.default
+            : Keymap.build(defaults ? schema?.bindings ?? Keymap.defaultBindings : [], vim: vim,
+                           autoAdvance: defaults && autoAdvance)
+        let older = generation.map { $0 < schema?.generation ?? ConfigFile.generation } ?? false
+        // With the built-in keymap under the file, the file's own lines and the vim layer: what later bindings must leave
+        // free (built only for a full file of an older generation, never at launch for one of this generation).
+        var own = older && defaults ? Keymap.build([], vim: vim, autoAdvance: false) : nil
         var lineOf: [KeyContext: [[KeyChord]: Int]] = [:]
         func bind(_ sequence: [KeyChord], _ actions: [Action], _ entry: TOMLEntry, _ context: KeyContext) {
             if let earlier = lineOf[context, default: [:]].updateValue(entry.line, forKey: sequence) {
@@ -212,6 +220,7 @@ private struct ConfigReader {
                 return
             }
             keymap.bind(sequence, to: actions, context: context)
+            own?.bind(sequence, to: actions, context: context)
         }
         for (entry, context, spec) in entries {
             // Two spellings: "chord" = action(s), or "action" = chord(s) to give one action several keys.
@@ -235,12 +244,14 @@ private struct ConfigReader {
                 }
             }
         }
-        if !defaults {
-            if let generation, generation < schema?.generation ?? ConfigFile.generation {
+        if let generation, older {
+            if var own {
+                addLaterBindings(after: generation, to: &own, used: lineOf)
+            } else {
                 addLaterBindings(after: generation, to: &keymap, used: lineOf)
             }
-            if autoAdvance { keymap.applyAutoAdvance() }
         }
+        if autoAdvance, !defaults || generation != nil { keymap.applyAutoAdvance() }
         for conflict in keymap.conflicts() {
             let line = [conflict.sequence, conflict.prefix].compactMap { lineOf[.normal]?[$0] ?? lineOf[.zoomed]?[$0] }.first ?? 0
             errors.append(TOMLError(line: line, column: 1, message:
@@ -249,8 +260,9 @@ private struct ConfigReader {
         return keymap
     }
 
-    /// The default bindings of the generations after `generation`, on each of their keys that the file does not mention
-    /// (in either table, `"none"` included) and that no binding starts or is the start of (the vim layer's included).
+    /// The default bindings of the generations after `generation`, bound in `keymap` on each of their keys that the file
+    /// does not mention (in either table, `"none"` included) and that no binding of `keymap` starts or is the start of
+    /// (the file's and the vim layer's), and listed in `added`.
     private mutating func addLaterBindings(after generation: Int, to keymap: inout Keymap,
                                            used: [KeyContext: [[KeyChord]: Int]]) {
         for binding in (schema ?? .current).bindings where binding.generation > generation {

@@ -363,6 +363,29 @@ final class SettingsWindowTests: ViewerTestCase {
         XCTAssertTrue(spin(3) { self.fileText() == ConfigFile.defaultText && self.store.config.keymap == Keymap.default }, fileText())
     }
 
+    /// With `auto_advance` and the built-in shortcuts under the file Peekaboo writes, its culling keys advance as the
+    /// built-in ones do: no row is "changed".
+    func testAFullFileWithBuiltInShortcutsAndAutoAdvanceChangesNoRow() throws {
+        var editor = ConfigEditor(text: ConfigFile.defaultText)
+        try editor.set("auto_advance", in: "rating", to: .bool(true))
+        try editor.set("defaults", in: "keymap", to: .bool(true))
+        let pane = shortcuts(try makeController(toml: editor.text))
+        XCTAssertEqual(store.config.keymap.resolve([KeyChord(key: "3")], context: .normal), .actions([.rate(3), .next]))
+        XCTAssertEqual(pane.rows().filter(\.modified).map(\.id), [])
+    }
+
+    /// Without a file the built-in shortcuts are on; unticking them writes the full file, whose keys are the keymap.
+    func testTurningTheBuiltInShortcutsOffWithoutAFileWritesTheFullFile() throws {
+        let pane = shortcuts(try makeController())
+        let box = try checkbox("Add built-in shortcuts config.toml does not list", in: pane.view)
+        XCTAssertEqual(box.state, .on)
+        box.performClick(nil)
+        XCTAssertTrue(spin(3) { !self.store.config.keymapDefaults }, "written and applied")
+        XCTAssertEqual(fileText(), ConfigFile.defaultText)
+        XCTAssertEqual(store.config.keymap, Keymap.default)
+        XCTAssertTrue(spin(1) { box.state == .off })
+    }
+
     /// Rows are every parameterless action plus whatever the keymap binds (parameterized ones, action lists), so new
     /// actions appear without a hard-coded list.
     func testRowsListEveryActionDynamically() throws {

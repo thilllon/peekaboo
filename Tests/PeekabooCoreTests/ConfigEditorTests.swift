@@ -274,6 +274,19 @@ final class ConfigEditorTests: XCTestCase {
         XCTAssertEqual(try AppConfig(toml: freed).keymap, Keymap.written(vim: true, autoAdvance: false))
     }
 
+    /// With the built-in keymap under the full file (`defaults = true`) and `auto_advance`, the file's culling lines
+    /// advance, so ↺ on an advancing row finds them: here it takes the file's `9` back for the built-in one.
+    func testResetFindsTheAdvancingKeysOfAFullFileWithTheBuiltInKeymapUnderIt() throws {
+        var editor = ConfigEditor(text: full("\"meta.label:blue\" = \"9\"", "\"meta.label:purple\" = \"9\""))
+        try editor.set("auto_advance", in: "rating", to: .bool(true))
+        try editor.set("defaults", in: "keymap", to: .bool(true))
+        XCTAssertEqual(try resolve(editor.text, "9"), .actions([.label("purple"), .next]))
+        let reset = try edit(editor.text) { try $0.reset([.label("purple"), .next], context: .normal) }
+        XCTAssertFalse(reset.contains("meta.label:purple"), reset)
+        XCTAssertEqual(try resolve(reset, "9"), .actions([.label("blue"), .next]))
+        XCTAssertEqual(try AppConfig(toml: reset).keymap, Keymap.build(defaults: true, vim: false, autoAdvance: true))
+    }
+
     func testResetAllWritesTheKeysAnew() throws {
         let gray = full("background = \"black\"   ", "background = \"gray\"    ")
         var editor = ConfigEditor(text: gray)

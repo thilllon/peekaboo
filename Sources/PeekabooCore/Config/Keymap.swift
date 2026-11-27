@@ -219,6 +219,11 @@ public struct Keymap: Sendable, Equatable {
     /// Build the built-in part of a keymap: the default layer, the optional vim layer on top, and
     /// `rating.auto_advance` (plain rating/label/flag keys also advance).
     public static func build(defaults: Bool, vim: Bool, autoAdvance: Bool) -> Keymap {
+        build(defaults ? defaultBindings : [], vim: vim, autoAdvance: autoAdvance)
+    }
+
+    /// `layer` (a version's default bindings, or none), the optional vim layer on top, and `rating.auto_advance`.
+    static func build(_ layer: [DefaultBinding], vim: Bool, autoAdvance: Bool) -> Keymap {
         var map = Keymap.empty
         func bind(_ context: KeyContext, _ actions: [Action], _ specs: [String]) {
             for spec in specs {
@@ -229,9 +234,7 @@ public struct Keymap: Sendable, Equatable {
         func normal(_ action: Action, _ specs: String...) { bind(.normal, [action], specs) }
         func zoomed(_ action: Action, _ specs: String...) { bind(.zoomed, [action], specs) }
 
-        if defaults {
-            for binding in defaultBindings { bind(binding.context, binding.actions, binding.keys) }
-        }
+        for binding in layer { bind(binding.context, binding.actions, binding.keys) }
         if vim {
             normal(.next, "l", "j", "n")
             normal(.previous, "h", "k", "shift+n")
@@ -270,7 +273,7 @@ public struct Keymap: Sendable, Equatable {
     }
 
     /// `rating.auto_advance`: every plain rating, label and flag key also goes to the next image. Applied to the default
-    /// layer (`build`), or, with `[keymap] defaults = false`, to the file's bindings.
+    /// layer (`build`), and to the file's bindings when it lists the keymap or Peekaboo wrote it (`ConfigReader`).
     mutating func applyAutoAdvance() {
         for (sequence, actions) in bindings[.normal] ?? [:] where Self.advancesAutomatically(sequence, actions) {
             bindings[.normal]?[sequence] = actions + [.next]

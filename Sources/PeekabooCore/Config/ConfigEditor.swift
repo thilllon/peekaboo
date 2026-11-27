@@ -125,19 +125,27 @@ public struct ConfigEditor {
     /// keymap the built-in keys are those of the default lines (written back, an `"action" = [...]` line in its place)
     /// and of the vim layer when it is on.
     public mutating func reset(_ actions: [Action], context: KeyContext) throws {
+        let autoAdvance = try flag(["rating", "auto_advance"], false)
+        // What a key of the file runs: `auto_advance` makes its plain rating key advance, as the parser reads it.
+        let advances = try autoAdvance && fileKeysAdvance()
+        func effective(_ sequence: [KeyChord], _ bound: [Action]) -> [Action] {
+            advances && Keymap.advancesAutomatically(sequence, bound) ? bound + [.next] : bound
+        }
         guard try listsKeymap() else {
             let builtIn = try baseKeymap()
-            for entry in try bindingEntries(context) where entry.actions == actions {
-                try edit { try $0.remove(entry.path) }
+            for entry in try bindingEntries(context) {
+                let keys = entry.sequences.filter { effective($0, entry.actions) == actions }
+                guard !keys.isEmpty else { continue }
+                if keys.count == entry.sequences.count {
+                    try edit { try $0.remove(entry.path) }
+                } else {
+                    for sequence in keys { try removeUserBindings(of: sequence, context: context) }
+                }
             }
             for (sequence, bound) in builtIn.bindings[context] ?? [:] where bound == actions {
                 try removeUserBindings(of: sequence, context: context)
             }
             return
-        }
-        let autoAdvance = try flag(["rating", "auto_advance"], false)
-        func effective(_ sequence: [KeyChord], _ bound: [Action]) -> [Action] {
-            autoAdvance && Keymap.advancesAutomatically(sequence, bound) ? bound + [.next] : bound
         }
         // The default lines that bind `actions` here (auto_advance makes a plain rating key advance), with those keys.
         let lines = Keymap.defaultBindings.filter { $0.context == context }.compactMap { binding -> Keymap.DefaultBinding? in
@@ -198,13 +206,23 @@ public struct ConfigEditor {
         }
     }
 
-    /// Add a default binding of a later generation (`ConfigStore.upgradeFile`), as `bind` would write each of its keys.
+    /// Add a default binding of a later generation to a full file (`ConfigStore.upgradeFile`) as the file lists the
+    /// default ones, whether the built-in keymap is under it or not: each key in its action's line (a new line at the
+    /// end of the table if there is none), a `"key" = [actions]` line for an action list.
     mutating func add(_ binding: Keymap.DefaultBinding) throws {
-        for sequence in binding.sequences { try write(sequence, binding.actions, context: binding.context) }
+        for sequence in binding.sequences { try write(sequence, binding.actions, context: binding.context, listed: true) }
     }
 
     /// The file lists the keymap: `[keymap] defaults = false`.
     private func listsKeymap() throws -> Bool { try !flag(["keymap", "defaults"], true) }
+
+    /// `rating.auto_advance` applies to the file's own plain rating, label and flag keys (`ConfigReader`): in a file
+    /// that lists the keymap, or in one Peekaboo wrote (it has `[keymap] generation`), whatever `defaults` says.
+    private func fileKeysAdvance() throws -> Bool {
+        if try listsKeymap() { return true }
+        if case .integer? = try document().value(["keymap", "generation"]) { return true }
+        return false
+    }
 
     private func flag(_ path: [String], _ fallback: Bool) throws -> Bool {
         if case .bool(let value)? = try document().value(path) { return value }
@@ -217,13 +235,13 @@ public struct ConfigEditor {
                          autoAdvance: flag(["rating", "auto_advance"], false))
     }
 
-    /// Write a binding of `sequence` (none in the file now). In a file that lists the keymap, one action's key goes into
-    /// that action's `"action" = [...]` line (a new one at the end of the table if there is none); otherwise, and for an
-    /// action list, it is a new `"chord" = action(s)` line.
-    private mutating func write(_ sequence: [KeyChord], _ actions: [Action], context: KeyContext) throws {
+    /// Write a binding of `sequence` (none in the file now). In a file that lists the keymap (or `listed`), one action's
+    /// key goes into that action's `"action" = [...]` line (a new one at the end of the table if there is none);
+    /// otherwise, and for an action list, it is a new `"chord" = action(s)` line.
+    private mutating func write(_ sequence: [KeyChord], _ actions: [Action], context: KeyContext, listed: Bool? = nil) throws {
         let spec = KeyChord.spec(of: sequence)
         let table = try keyTables(context).primary
-        guard try listsKeymap(), actions.count == 1 else {
+        guard try listed ?? listsKeymap(), actions.count == 1 else {
             return try edit {
                 try $0.set(Self.value(of: actions), key: spec, in: table, quoteKey: true, reuseCommentedLine: false)
             }

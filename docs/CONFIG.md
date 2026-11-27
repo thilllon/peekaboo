@@ -52,11 +52,14 @@ changed keeps them, also when a later version changes a default: the file lists 
 value it lists is the one in effect.
 
 A starter file of an earlier version (every setting commented out, so it changes nothing) is
-rewritten as the full file. That is a file that starts with `# Peekaboo configuration` and holds only
-comments and blank lines; one with any active line, or your own file of comments, is left as it is,
-and so is a file with an error or one that is not UTF-8. A file that does not list the keymap
-(`[keymap] defaults = true`, or no generation) gets nothing appended: the built-in keymap and the
-built-in defaults of a later version reach it as before.
+rewritten as the full file, if it is exactly as that version wrote it (a byte order mark, CRLF line
+ends and blank lines at the end aside). Anything of yours keeps the file as it is: an active line, a
+comment you added, a commented-out value you changed, a line you deleted; and so does an error, or
+text that is not UTF-8. A file without a generation (a file of overrides of an earlier version, or one
+you wrote) gets nothing appended: the built-in keymap and the built-in defaults of a later version
+reach it as before. A full file with `[keymap] defaults = true` gets the same as one with `false`: its
+new keys work through the built-in keymap until then, and the file still lists every default key when
+you turn `defaults` off.
 
 ## Reloading and errors
 
@@ -103,9 +106,9 @@ trace logging) and Updates (`[updates]`, **Check Now** and the updater's status 
 
 The file stays the single source of truth. A change in the window is written at once as a minimal edit:
 only the changed line moves, your comments, order and spacing stay, and the value is replaced in place,
-its comment kept (`background = "black"` becomes `background = "gray"`). A starter file of an earlier
-version first becomes the full file; in a file of yours where a setting's line is commented out, that
-line is uncommented in place. A change that would leave the file with an error is not
+its comment kept (`background = "black"` becomes `background = "gray"`). An untouched starter file of an
+earlier version first becomes the full file; in a file of yours where a setting's line is commented out,
+that line is uncommented in place. A change that would leave the file with an error is not
 written, and while the file has an error (from an edit in your editor) the window shows it and waits
 until it is fixed; a file that is not UTF-8 text is never rewritten. Saving the file in an editor
 updates the window.
@@ -147,7 +150,7 @@ whole keymap; on, the built-in shortcuts it does not list apply too. Actions wit
 | `[cache]` `memory_mb` | `"auto"` | decoded-image memory budget in MB (64–1048576), or `"auto"` to derive it from installed memory |
 | `[rating]` `storage` | `"finder-tags"` | `"finder-tags"` or `"none"` (turns `meta.*` actions and [picks](#picks) off) |
 | `[rating]` `star` | `"★"` | the character a rating is spelled with: 3 stars is the Finder tag `★★★` |
-| `[rating]` `auto_advance` | `false` | `true`: plain `0`–`9`, `p`, `x`, `u` also go to the next image (`shift+` always does); with `defaults = false`, the file's bindings of those keys to a rating, label or flag |
+| `[rating]` `auto_advance` | `false` | `true`: plain `0`–`9`, `p`, `x`, `u` also go to the next image (`shift+` always does); in a file that lists the keymap (`defaults = false`) or that Peekaboo wrote (it has a `generation`), the file's own bindings of those keys to a rating, label or flag |
 | `[keymap]` `defaults` | `true` (`false` in the file Peekaboo writes) | `false`: the file's `[keys]` and `[keys.zoomed]` are the whole keymap (and the vim layer, if on); `true`: the built-in keymap, with `[keys]` on top (see [key bindings](#key-bindings)) |
 | `[keymap]` `vim` | `false` | add the [vim layer](#vim-layer): with `defaults = false` on the keys the file leaves free, with `true` on top of the built-in keymap |
 | `[keymap]` `generation` | none (`1` in the file Peekaboo writes) | which settings and default keys of later versions the file has; Peekaboo raises it when it appends them ([later versions](#later-versions)). Leave it as it is |

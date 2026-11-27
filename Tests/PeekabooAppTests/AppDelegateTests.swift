@@ -44,7 +44,7 @@ final class AppDelegateTests: ViewerTestCase {
     /// config file, its own or the user's. The interactive app's call is `ConfigStore.upgradeFile`, tested in Core.
     func testAHeadlessLaunchNeverRewritesTheConfigFile() throws {
         let config = root.appendingPathComponent("starter.toml")
-        let starter = Data("# Peekaboo configuration. Every setting is optional.\n# [view]\n# background = \"black\"\n".utf8)
+        let starter = Data("# Peekaboo configuration — every key is optional.\n".utf8)  // the first starter file
         try starter.write(to: config)
         XCTAssertNotNil(ConfigStore.upgraded(String(decoding: starter, as: UTF8.self)), "a starter file the interactive app rewrites")
         let previous = ProcessInfo.processInfo.environment["PEEKABOO_CONFIG"]

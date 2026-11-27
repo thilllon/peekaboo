@@ -245,6 +245,27 @@ final class ConfigFileTests: XCTestCase {
         XCTAssertEqual(old.resolve(seq("3"), context: .normal), .actions([.rate(3), .next]))
     }
 
+    /// With the built-in keymap under the full file too (`defaults = true`: Settings' "Add built-in shortcuts config.toml
+    /// does not list", or the line deleted), its culling lines still advance: they are the file's own bindings.
+    func testAutoAdvanceAppliesToAFullFileWithTheBuiltInKeymapUnderIt() throws {
+        var editor = ConfigEditor(text: ConfigFile.defaultText)
+        try editor.set("auto_advance", in: "rating", to: .bool(true))
+        try editor.set("defaults", in: "keymap", to: .bool(true))
+        var deleted = editor
+        try deleted.remove("defaults", in: "keymap")
+        for text in [editor.text, deleted.text] {
+            let config = try AppConfig(toml: text)
+            XCTAssertTrue(config.keymapDefaults)
+            XCTAssertEqual(config.keymap.resolve(seq("3"), context: .normal), .actions([.rate(3), .next]))
+            XCTAssertEqual(config.keymap.resolve(seq("p"), context: .normal), .actions([.flag("pick"), .next]))
+            XCTAssertEqual(config.keymap, Keymap.build(defaults: true, vim: false, autoAdvance: true))
+        }
+        // Another action on a culling key advances, as with defaults = false.
+        let moved = editor.text.replacingOccurrences(of: "\"meta.label:blue\" = \"9\"", with: "\"meta.label:purple\" = \"9\"")
+        XCTAssertNotEqual(moved, editor.text)
+        XCTAssertEqual(try AppConfig(toml: moved).keymap.resolve(seq("9"), context: .normal), .actions([.label("purple"), .next]))
+    }
+
     /// The default keys name the slots 1…9 whether they are set or not; another unknown slot is still an error.
     func testTheNumberedSlotsNeedNoEntry() throws {
         XCTAssertNoThrow(try AppConfig(toml: "[keys]\n\"file.move:4\" = \"opt+4\"\n\"x\" = \"file.copy:9\"\n"))
@@ -288,7 +309,7 @@ final class ConfigFileTests: XCTestCase {
             XCTAssertEqual(read.config.keymap.resolve(seq(spec), context: .normal),
                            line.contains("none") ? .unbound : .actions([.trash]), line)
         }
-        // A file of generation 2 (or one with the built-in keymap under it) gets nothing more.
+        // A file of generation 2 gets nothing more.
         let current = try AppConfig.read(toml: ConfigFile.text(later), schema: later)
         XCTAssertEqual(current.added.map(\.keys), [])
         let deleted = ConfigFile.text(later).replacingOccurrences(of: "\"file.copy_name\" = \"y\"\n", with: "")
@@ -324,6 +345,35 @@ final class ConfigFileTests: XCTestCase {
         XCTAssertFalse(kept.contains("file.copy_name"))
     }
 
+    /// A full file with the built-in keymap under it (`defaults = true`) gets the later keys appended too, as the file
+    /// lists keys: nothing changes in effect (the built-in keymap has them), and the file has them when it is the whole
+    /// keymap again. A key its own lines use is not taken.
+    func testTheUpgradeAppendsTheLaterKeysWithTheBuiltInKeymapUnderTheFile() throws {
+        var editor = ConfigEditor(text: generationOne)
+        try editor.set("defaults", in: "keymap", to: .bool(true))
+        let text = editor.text
+        let reading = try AppConfig.read(toml: text, schema: later)
+        XCTAssertEqual(reading.config.keymap.resolve(seq("y"), context: .normal), .actions([.copyName]), "the later version's built-in key")
+        XCTAssertEqual(reading.added.map(\.keys), [["y"], ["shift+m"]])
+        let (upgraded, upgrade) = try XCTUnwrap(ConfigStore.upgraded(text, schema: later))
+        XCTAssertEqual(upgrade, .appended(from: 1, to: 2))
+        XCTAssertTrue(upgraded.contains("\"app.open\" = \"cmd+o\"\n\"file.copy_name\" = \"y\"\n"), upgraded)
+        XCTAssertTrue(upgraded.contains("\"pan.edge:bottom\" = \"shift+down\"\n\"pan.center\" = \"shift+m\"\n"))
+        XCTAssertTrue(upgraded.contains("\n[debug]\n" + ConfigFile.commented("trace = false", "timestamped trace lines on stderr (PEEKABOO_TRACE=1 forces it)") + "\n"))
+        XCTAssertNil(ConfigStore.upgraded(upgraded, schema: later), "once")
+        var off = ConfigEditor(text: upgraded)
+        try off.set("defaults", in: "keymap", to: .bool(false))
+        let whole = try AppConfig.read(toml: off.text, schema: later).config.keymap
+        XCTAssertEqual(whole.resolve(seq("y"), context: .normal), .actions([.copyName]))
+        XCTAssertEqual(whole.resolve(seq("shift+m"), context: .zoomed), .actions([.panCenter]))
+
+        let mine = text.replacingOccurrences(of: "\n[keys.zoomed]", with: "\"y\" = \"file.trash\"\n\n[keys.zoomed]")
+        XCTAssertEqual(try AppConfig.read(toml: mine, schema: later).added.map(\.keys), [["shift+m"]])
+        let (kept, _) = try XCTUnwrap(ConfigStore.upgraded(mine, schema: later))
+        XCTAssertFalse(kept.contains("file.copy_name"), kept)
+        XCTAssertEqual(try AppConfig.read(toml: kept, schema: later).config.keymap.resolve(seq("y"), context: .normal), .actions([.trash]))
+    }
+
     /// A deleted binding of the file's own generation never comes back, whatever later versions add.
     func testADeletedBindingNeverComesBack() throws {
         let deleted = generationOne.replacingOccurrences(of: "\"view.hud\" = \"i\"\n", with: "")
@@ -334,31 +384,47 @@ final class ConfigFileTests: XCTestCase {
 
     // MARK: Upgrading the files of earlier versions
 
+    /// Every starter file a version wrote, untouched, becomes the full file; a byte order mark, CRLF line ends and the
+    /// line ends at the end of the file do not count.
     func testAnUntouchedStarterFileBecomesTheFullFile() throws {
-        for starter in [LegacyConfigFiles.releasedStarter, LegacyConfigFiles.firstStarter, "\u{FEFF}" + LegacyConfigFiles.releasedStarter,
-                        LegacyConfigFiles.releasedStarter.replacingOccurrences(of: "\n", with: "\r\n")] {
-            let (text, upgrade) = try XCTUnwrap(ConfigStore.upgraded(starter), String(starter.prefix(40)))
-            XCTAssertEqual(upgrade, .rewroteStarter)
-            XCTAssertEqual(text, ConfigFile.defaultText)
+        XCTAssertEqual(LegacyConfigFiles.starters.count, 5)
+        for starter in LegacyConfigFiles.starters {
+            for text in ["\u{FEFF}" + starter, starter.replacingOccurrences(of: "\n", with: "\r\n"), String(starter.dropLast()),
+                         starter + "\n\n", starter] {
+                let (upgraded, upgrade) = try XCTUnwrap(ConfigStore.upgraded(text), String(text.prefix(60)))
+                XCTAssertEqual(upgrade, .rewroteStarter)
+                XCTAssertEqual(upgraded, ConfigFile.defaultText)
+            }
         }
     }
 
-    /// Any file with an active line, or that is not a starter file, is the user's: never rewritten.
+    /// Any file with an active line, or that is not a starter file exactly, is the user's: never rewritten. A starter
+    /// file the user wrote in without changing what it applies keeps what they wrote.
     func testOtherFilesAreLeftAsTheyAre() throws {
+        let starter = LegacyConfigFiles.releasedStarter
         let cases = [
-            LegacyConfigFiles.releasedStarter.replacingOccurrences(of: "# [view]\n# background = \"black\"", with: "[view]\nbackground = \"gray\""),
-            LegacyConfigFiles.releasedStarter.replacingOccurrences(of: "# [view]\n", with: "[view]\n"),  // a table, no setting
+            starter.replacingOccurrences(of: "# [view]\n# background = \"black\"", with: "[view]\nbackground = \"gray\""),
+            starter.replacingOccurrences(of: "# [view]\n", with: "[view]\n"),  // a table, no setting
             "# my notes\n# [view]\n# background = \"gray\"\n",  // comments, not a starter file
+            // The starter file with the user's notes, a binding of theirs commented out for now, a commented-out value
+            // changed, a line deleted.
+            starter + "# Slot 1 is the client folder.\n# \"s\" = \"file.move:keep\"   # my keep key, off for now\n",
+            starter.replacingOccurrences(of: "# background = \"black\" ", with: "# background = \"gray\"  "),
+            starter.replacingOccurrences(of: "# star = \"★\"                    # 3 stars -> Finder tag \"★★★\"\n", with: ""),
+            "# Peekaboo configuration: my own\n",
             "",
             "\n\n",
             "[view]\nbackground = \"gray\"\n",
             "[keymap]\ndefaults = false\n[keys]\n\"n\" = \"nav.next\"\n",  // an empty-start keymap of the user's, no generation
             "[view]\nbackground = \"pink\"\n",  // an error: the user's to fix
-            LegacyConfigFiles.releasedStarter + "[view\n",
+            starter + "[view\n",
             ConfigFile.defaultText,  // this generation
             ConfigFile.defaultText.replacingOccurrences(of: "generation = 1 ", with: "generation = 7 "),  // a newer version's
         ]
-        for text in cases { XCTAssertNil(ConfigStore.upgraded(text), text) }
+        for text in cases {
+            XCTAssertNotEqual(text, starter)
+            XCTAssertNil(ConfigStore.upgraded(text), text)
+        }
     }
 
     /// Through the store, as a second after launch: atomic, the link and the permissions kept, applied at once.

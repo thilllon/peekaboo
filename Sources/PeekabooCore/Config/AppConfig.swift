@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// Everything the user can configure. Every field has a built-in default; the
@@ -199,9 +200,9 @@ public final class ConfigStore {
     /// an untouched starter file of an earlier version becomes the full file, and a full file of an older generation
     /// gets the settings that later versions added, with their defaults, and their default bindings on the keys it
     /// leaves free; its generation is raised, so that a binding the user deleted never comes back. Any other file —
-    /// with an active line of the user's, an error, bytes that are not UTF-8 — is left as it is. The configuration in
-    /// effect does not change (the new text must load as the same one); the write is atomic. `completion` runs on the
-    /// main thread, after the new text is applied.
+    /// with an active line or a comment of the user's, an error, bytes that are not UTF-8 — is left as it is. The
+    /// configuration in effect does not change (the new text must load as the same one); the write is atomic.
+    /// `completion` runs on the main thread, after the new text is applied.
     public func upgradeFile(completion: ((Upgrade) -> Void)? = nil) {
         queue.async { [weak self] in
             guard let self else { return }
@@ -262,12 +263,32 @@ public final class ConfigStore {
         return before == after.config ? result : nil
     }
 
-    /// A starter file of an earlier version: it starts with the starter's first line and holds nothing but comments
-    /// and blank lines (no table, no setting: it changes nothing). A file of comments that does not start so — the
-    /// user's own notes — is not one.
+    /// An untouched starter file of an earlier version: one of the texts they wrote (every setting commented out, so it
+    /// changes nothing), byte for byte but for a byte order mark, CRLF line ends and the white space at its end. A file
+    /// of comments that differs in anything else (the user's notes, a commented-out line of theirs, a value changed in
+    /// a comment, a line deleted) is the user's.
     static func isStarter(_ text: String, _ document: TOMLDocument) -> Bool {
-        document.entries.isEmpty && document.tables.isEmpty
-            && text.unicodeScalars.drop(while: { $0 == "\u{FEFF}" }).starts(with: "# Peekaboo configuration".unicodeScalars)
+        document.entries.isEmpty && document.tables.isEmpty && starterDigests.contains(starterDigest(text))
+    }
+
+    /// The SHA-256 of each starter file a version of Peekaboo wrote, as `starterDigest` reads it: `SampleConfig.swift` at
+    /// f60b311 (every release up to 20261126-517cb0), d4f0032, e04e29e and a5ba1b6 (development builds), and the one
+    /// line of 9fbefc8. `ConfigFileTests` checks each against its text.
+    private static let starterDigests: Set<String> = [
+        "51310ba88711c0a4df68275dd13cc5b6574fc6e154b6028c5baa285696d1e031",
+        "a697a098a1c8b1f2d95420f300391b5d5a84c01885ddd8bb47e925b3ea3dbaed",
+        "21c3cf49826e935722e7df2b0d4d1a08efb24d1052d318ddaf04962d1add5240",
+        "4f10be92de9b71fa353d44e3fdde66dfa7035d289b98a1c8032b559e6d684bc2",
+        "2c37c51efa0e564193f8d269cc3307693a6295a3f0bf52a66b6c3dbb79489509",
+    ]
+
+    /// The SHA-256 (hex) of `text` without a byte order mark, with LF line ends and without the white space at its end.
+    private static func starterDigest(_ text: String) -> String {
+        var text = text
+        while text.unicodeScalars.first == "\u{FEFF}" { text.unicodeScalars.removeFirst() }
+        text = text.replacingOccurrences(of: "\r\n", with: "\n")
+        while text.last?.isWhitespace == true { text.removeLast() }
+        return SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     /// The value of `key` in `table` as the applied file writes it; nil when the file does not set it (the Settings
@@ -286,16 +307,20 @@ public final class ConfigStore {
     /// Change the file through `ConfigEditor` (minimal edits of its text; a missing file starts as the full file, and a
     /// file `upgradeFile` would bring up to date is brought up to date first), then write it and apply it. The result
     /// must load: an edit that would leave the file with an error — or one made while the file has one, or is not
-    /// UTF-8 — is not written, and `completion` gets the error, e.g. `config.toml:17: unknown action "nav.nxt"`. The
-    /// write is atomic and goes to the file a symbolic link points to, keeping the link and the file's permissions. Runs
-    /// on the store's queue (no file I/O on the main thread); `completion` runs on the main thread after the new
-    /// configuration is applied.
+    /// UTF-8 — is not written, and `completion` gets the error, e.g. `config.toml:17: unknown action "nav.nxt"`. A change
+    /// that changes nothing writes nothing; when it changes nothing in the full file standing in for the file, `change`
+    /// runs once more, on the file as it is, to tell (`changes`). The write is atomic and goes to the file a symbolic link
+    /// points to, keeping the link and the file's permissions. Runs on the store's queue (no file I/O on the main
+    /// thread); `completion` runs on the main thread after the new configuration is applied.
     public func edit(_ change: @escaping (inout ConfigEditor) throws -> Void, completion: ((Error?) -> Void)? = nil) {
         queue.async { [weak self] in
             guard let self else { return }
             let started = Trace.now()
             let result: Result<Outcome, Error> = Result {
                 let name = self.url.lastPathComponent
+                // The file as it is ("" for none), and the text the change is made on: the file, or the full file standing
+                // in for none or for one `upgradeFile` would bring up to date.
+                var current = ""
                 let original: String
                 if let existing = try? Data(contentsOf: self.url) {
                     let text = String(decoding: existing, as: UTF8.self)
@@ -304,6 +329,7 @@ public final class ConfigStore {
                     guard text.utf8.elementsEqual(existing) else {
                         throw ConfigEditError(line: nil, message: "\(name): not UTF-8 text (save it as UTF-8 to change it here)")
                     }
+                    current = text
                     original = Self.upgraded(text, schema: self.schema)?.text ?? text
                 } else {
                     original = self.fullText
@@ -316,8 +342,10 @@ public final class ConfigStore {
                     guard let line = error.line else { throw ConfigEditError(line: nil, message: "\(name): \(error.message)") }
                     throw ConfigError(fileName: name, errors: [TOMLError(line: line, column: 1, message: error.message)])
                 }
-                // A change that changes nothing writes nothing (and creates no file).
-                guard editor.text != original else { return .unchanged }
+                // A change that changes nothing writes nothing (and creates no file). The full file standing in for the file
+                // says `defaults = false` where no file and a starter file mean true: turning the built-in keymap off
+                // changes nothing in its text, but changes the file as it is.
+                guard editor.text != original || (original != current && self.changes(change, current)) else { return .unchanged }
                 _ = try AppConfig.read(toml: editor.text, fileName: name, schema: self.schema)
                 try self.write(Data(editor.text.utf8))
                 Trace.log("config edited in \(String(format: "%.2f", Trace.ms(since: started))) ms")
@@ -333,6 +361,15 @@ public final class ConfigStore {
                 }
             }
         }
+    }
+
+    /// `change` makes `text` load as another configuration (both loading; on `queue`).
+    private func changes(_ change: (inout ConfigEditor) throws -> Void, _ text: String) -> Bool {
+        var editor = ConfigEditor(text: text)
+        guard (try? change(&editor)) != nil, editor.text != text,
+              let before = try? AppConfig.read(toml: text, schema: schema).config,
+              let after = try? AppConfig.read(toml: editor.text, schema: schema).config else { return false }
+        return after != before
     }
 
     /// Replace the file's contents atomically (on `queue`).

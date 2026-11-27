@@ -216,9 +216,10 @@ viewers score 21–26 dB and alias 10–25× more.
   (`ConfigFile`, `Keymap.defaultGroups`): every setting active, the whole keymap (`[keymap] defaults = false`), and a
   generation number; a second after launch, off the main thread, an untouched starter file of an earlier version is
   rewritten and an older generation gets the later settings and default keys appended. Loading it at launch (read,
-  parse, apply, on the main thread; `peekaboo-bench config`) takes 0.23 ms in a fresh process and 0.11 ms warm, against
-  0.08 / 0.02 ms for the commented starter file it replaces. Decoder and trace switches are process-wide flags set
-  once per config apply, never looked up per decode.
+  parse, apply, on the main thread; `peekaboo-bench config`) takes 0.28 ms in a fresh process and 0.11 ms warm, against
+  0.08 / 0.02 ms for the commented starter file it replaces; the built-in keymap, built from the same table, takes
+  0.23 ms instead of 0.33, so the config work before the first frame went from 0.41 to 0.51 ms. Decoder and trace
+  switches are process-wide flags set once per config apply, never looked up per decode.
 - File actions: trash with ⌘Z undo, move/copy to slots with undo, reveal, copy path/name/image, open with;
   stars/labels/flags as Finder tags.
 - Picks (no database: the Finder tag `Pick` on the file): the folder's tags are read once per listing on a utility

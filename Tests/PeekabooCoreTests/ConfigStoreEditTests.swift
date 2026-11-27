@@ -61,6 +61,33 @@ final class ConfigStoreEditTests: XCTestCase {
         XCTAssertEqual(notified, 1)
     }
 
+    /// The full file an edit starts from without a file (or for a starter file) says `defaults = false`, while the file
+    /// in effect has the built-in keymap: turning it off (the Keyboard pane's first checkbox) is a change, and writes the
+    /// full file. Reset All, which changes nothing there, still writes nothing.
+    func testTurningTheBuiltInKeymapOffWritesTheFullFile() throws {
+        let url = directory.appendingPathComponent("config.toml")
+        let store = ConfigStore(url: url)
+        store.load()
+        XCTAssertTrue(store.config.keymapDefaults)
+        XCTAssertNil(edit(store) { try $0.resetBindings() })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path), "nothing to reset")
+        XCTAssertNil(edit(store) { try $0.set("defaults", in: "keymap", to: .bool(false)) })
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), ConfigFile.defaultText)
+        XCTAssertFalse(store.config.keymapDefaults)
+        XCTAssertEqual(store.config.keymap, Keymap.default)
+
+        let starter = LegacyConfigFiles.releasedStarter
+        try Data(starter.utf8).write(to: url)
+        store.load()
+        XCTAssertTrue(store.config.keymapDefaults)
+        XCTAssertNil(edit(store) { try $0.resetBindings() })
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), starter, "nothing to reset")
+        XCTAssertNil(edit(store) { try $0.set("defaults", in: "keymap", to: .bool(false)) })
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), ConfigFile.defaultText)
+        XCTAssertFalse(store.config.keymapDefaults)
+        XCTAssertEqual(store.config.keymap, Keymap.default)
+    }
+
     func testAnEditThatWouldBreakTheFileIsNotWritten() throws {
         let url = directory.appendingPathComponent("config.toml")
         let text = "[view]\nbackground = \"gray\"\n"

@@ -76,4 +76,28 @@ enum LegacyConfigFiles {
 
     /// The very first starter file (development builds before #21).
     static let firstStarter = "# Peekaboo configuration — every key is optional.\n"
+
+    /// The starter files of the development builds between the two, newest first (`SampleConfig.swift` at d4f0032,
+    /// e04e29e and a5ba1b6): the released one before `[decode]` and `[debug]`, then before `[updates]`, then with the
+    /// first header and an older comment. `ConfigFileTests` checks each against the digest Peekaboo knows it by.
+    static let developmentStarters: [String] = {
+        var lines = releasedStarter.components(separatedBy: "\n")
+        func remove(from first: String, to next: String) {
+            lines.removeSubrange(lines.firstIndex(of: first)!..<lines.firstIndex(of: next)!)
+        }
+        remove(from: "# [decode]", to: "# [updates]")
+        let d4f0032 = lines.joined(separator: "\n")
+        remove(from: "# [updates]", to: lines.first { $0.hasPrefix("# [slots] ") }!)
+        let e04e29e = lines.joined(separator: "\n")
+        let warnings = lines.firstIndex { $0.hasPrefix("# previous configuration stays active;") }!
+        lines.replaceSubrange(warnings...warnings + 1,
+                              with: ["# previous configuration stays active. Reference: docs/CONFIG.md in the Peekaboo repository."])
+        remove(from: "#", to: "")  // the planned settings
+        let a5ba1b6 = lines.joined(separator: "\n")
+            .replacingOccurrences(of: "{path} is passed safely quoted, also inside \"...\"", with: "{path} is substituted already shell-quoted")
+        return [d4f0032, e04e29e, a5ba1b6]
+    }()
+
+    /// Every starter file a version of Peekaboo wrote, exactly.
+    static var starters: [String] { [releasedStarter] + developmentStarters + [firstStarter] }
 }
