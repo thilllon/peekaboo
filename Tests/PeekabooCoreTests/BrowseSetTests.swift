@@ -202,6 +202,12 @@ final class BrowseSetTests: XCTestCase {
         // Rewritten in place (another size): another version of the same files.
         try Data([9, 9]).write(to: file(a, "a1.jpg"))
         XCTAssertFalse(BrowseSet.sameFiles(listing.files[0..<1], try listing.set.list(0).get()))
+        // A file opened before its folder listed it, stamped with its size and date but no file ID: the listing has more.
+        let listed = try listing.set.list(0).get()
+        let stamped = ImageFile(url: listed[0].url, name: listed[0].name, byteSize: listed[0].byteSize,
+                                modified: listed[0].modified, fileID: 0)
+        XCTAssertFalse(BrowseSet.sameFiles([stamped][...], listed))
+        XCTAssertTrue(BrowseSet.sameFiles(listed[...], listed))
     }
 
     /// A file that came with a folder Peekaboo could not list keeps its own place once the folder lists.
@@ -218,7 +224,7 @@ final class BrowseSetTests: XCTestCase {
         XCTAssertEqual(listing.set.item(of: file(locked, "l1.jpg")), 0)
     }
 
-    /// Before the listing: what the URLs name, from their shape alone.
+    /// Before the listing: what the URLs name, from their shape alone, and the image files that browse already.
     func testTheSetBeforeItIsListed() {
         let a = root.appendingPathComponent("A", isDirectory: true)
         let x = root.appendingPathComponent("Other/x.jpg", isDirectory: false)
@@ -229,5 +235,76 @@ final class BrowseSetTests: XCTestCase {
         XCTAssertTrue(set.spansFolders)
         XCTAssertEqual(BrowseSet.folderName(of: x), "Other")
         XCTAssertFalse(BrowseSet(unlisted: [x, root.appendingPathComponent("Other/y.jpg")]).spansFolders)
+        XCTAssertEqual(set.leadingFiles(), [], "a folder first: nothing browses before it is listed")
+
+        // The image files before the first folder, once each, in their order.
+        let y = root.appendingPathComponent("Other/y.png", isDirectory: false)
+        let notes = root.appendingPathComponent("Other/notes.txt", isDirectory: false)
+        let z = root.appendingPathComponent("Other/z.jpg", isDirectory: false)
+        let leading = BrowseSet(unlisted: [notes, x, y, x, a, z]).leadingFiles()
+        XCTAssertEqual(leading.map(\.url), [x, y])
+        XCTAssertEqual(leading.map(\.version), ["0-0.0", "0-0.0"], "placeholders: the listing brings sizes and dates")
+    }
+
+    /// A folder reached through another path (a symbolic link, another letter case) is listed once, and found under
+    /// each of its paths: a file opened through one keeps its place, and so does a file Finder opens by the real path.
+    func testAFolderIsFoundUnderItsOtherPaths() throws {
+        let a = try folder("A", ["a1.jpg", "a2.jpg", "a3.jpg"])
+        let b = try folder("B", ["b1.jpg"])
+        let link = root.appendingPathComponent("Link", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: a)
+        let real = try XCTUnwrap(realpath(a.path, nil).map { path -> URL in
+            defer { free(path) }
+            return URL(fileURLWithPath: String(cString: path), isDirectory: true)
+        })
+
+        // A file opened first through the link: found at its place in the folder opened with it.
+        let fileFirst = BrowseSet.list([file(link, "a2.jpg"), a])
+        XCTAssertEqual(places(fileFirst.files), ["A/a1.jpg", "A/a2.jpg", "A/a3.jpg"])
+        XCTAssertEqual(fileFirst.set.index(of: file(link, "a2.jpg"), in: fileFirst.files), 1)
+        XCTAssertFalse(fileFirst.set.spansFolders, "one folder under two paths is one folder")
+
+        // The folder opened through the link: its files are found by the path Finder gives (links resolved), with or
+        // without /private, and under the folder's own path when that came second.
+        let throughLink = BrowseSet.list([link, b])
+        XCTAssertEqual(places(throughLink.files), ["Link/a1.jpg", "Link/a2.jpg", "Link/a3.jpg", "B/b1.jpg"])
+        XCTAssertEqual(throughLink.set.index(of: file(real, "a3.jpg"), in: throughLink.files), 2)
+        XCTAssertEqual(throughLink.set.index(of: file(a, "a3.jpg"), in: throughLink.files), 2)
+        XCTAssertEqual(throughLink.set.item(of: file(real, "new.jpg")), 0, "a file not listed yet")
+        let twice = BrowseSet.list([a, link, b])
+        XCTAssertEqual(twice.set.items, [.folder(a), .folder(b)])
+        XCTAssertEqual(twice.set.index(of: file(link, "a2.jpg"), in: twice.files), 1)
+
+        // Another letter case, where the volume ignores it.
+        let otherCase = root.appendingPathComponent("a", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: otherCase.path) else { return }
+        let cased = BrowseSet.list([file(otherCase, "a3.jpg"), b, a])
+        XCTAssertEqual(places(cased.files), ["B/b1.jpg", "A/a1.jpg", "A/a2.jpg", "A/a3.jpg"])
+        XCTAssertEqual(cased.set.index(of: file(otherCase, "a3.jpg"), in: cased.files), 3)
+        let folderCased = BrowseSet.list([otherCase, b])
+        XCTAssertEqual(folderCased.set.index(of: file(real, "a1.jpg"), in: folderCased.files), 0)
+    }
+
+    /// A file that left its folder's listing: in another folder of the set when it was moved there (found by its file
+    /// ID), else nowhere.
+    func testAFileMovedToAnotherFolderOfTheSetIsFound() throws {
+        let a = try folder("A", ["a1.jpg", "a2.jpg", "a3.jpg"])
+        let b = try folder("B", ["b1.jpg"])
+        let elsewhere = try folder("Elsewhere")
+        let listing = BrowseSet.list([a, b])
+        let set = listing.set
+        let a2 = listing.files[1]
+        let a3 = listing.files[2]
+        XCTAssertNil(set.folder(whereMoved: a2, from: try set.list(0).get()), "still in its folder")
+        XCTAssertEqual(rename(a2.url.path, file(a, "a2 renamed.jpg").path), 0)
+        XCTAssertNil(set.folder(whereMoved: a2, from: try set.list(0).get()), "renamed in its folder")
+        XCTAssertEqual(rename(file(a, "a2 renamed.jpg").path, file(b, "a2.jpg").path), 0)
+        XCTAssertEqual(set.folder(whereMoved: a2, from: try set.list(0).get()), 1, "moved to the other folder")
+        XCTAssertEqual(rename(a3.url.path, file(elsewhere, "a3.jpg").path), 0)
+        XCTAssertNil(set.folder(whereMoved: a3, from: try set.list(0).get()), "moved out of the set")
+        try FileManager.default.removeItem(at: file(b, "a2.jpg"))
+        XCTAssertNil(set.folder(whereMoved: a2, from: try set.list(0).get()), "gone")
+        let placeholder = ImageFile(url: file(a, "a1.jpg"), name: "a1.jpg", byteSize: 0, modified: 0, fileID: 0)
+        XCTAssertNil(set.folder(whereMoved: placeholder, from: []), "no file ID to follow")
     }
 }

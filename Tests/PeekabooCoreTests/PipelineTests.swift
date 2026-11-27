@@ -299,6 +299,21 @@ final class PipelineTests: PipelineTestCase {
         XCTAssertTrue(spin { self.has(pipeline, changed, .screen) })
     }
 
+    /// What replacing the set may free, collected from the cached files alone: the best tier of every file that has
+    /// pixels, as looking each file of the set up gives it.
+    func testCachedBestIsTheBestTierOfEveryCachedFile() {
+        let pipeline = makePipeline(FakeDecoder())
+        let files = makeFiles(40)
+        pipeline.setFiles(files, index: 0)
+        XCTAssertTrue(spin { self.has(pipeline, files[0], .screen) && self.has(pipeline, files[1], .screen) })
+        let looked = files.compactMap { pipeline.best(for: $0) }.map { ObjectIdentifier($0.pixels) }
+        XCTAssertGreaterThan(looked.count, 1)
+        XCTAssertEqual(Set(pipeline.cachedBest.map { ObjectIdentifier($0.pixels) }), Set(looked))
+        XCTAssertEqual(pipeline.cachedBest.count, looked.count)
+        pipeline.setFiles([], index: 0)
+        XCTAssertTrue(pipeline.cachedBest.isEmpty)
+    }
+
     /// Files are indexed by name (unique within a folder); a set opened from several folders may repeat a name, and
     /// each file still keeps its own tiers.
     func testFilesWithTheSameNameInDifferentFoldersStayApart() {

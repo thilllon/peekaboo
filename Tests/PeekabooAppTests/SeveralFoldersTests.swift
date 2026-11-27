@@ -98,11 +98,58 @@ final class SeveralFoldersTests: ViewerTestCase {
         viewer.presentsSynchronously = true
         viewer.open([directory("Trip"), directory("Home")])
         viewer.presentsSynchronously = false
+        XCTAssertEqual(viewer.displayedFile?.url, trip[0], "the first image was not presented in the launch's turn")
+        XCTAssertNotNil(viewer.shownTierForTests)
         XCTAssertEqual(places(viewer), ["Trip/img00.jpg", "Trip/img01.jpg"], "the first folder was not listed in this turn")
         XCTAssertTrue(viewer.isListingPendingForTests, "the rest was listed on the main thread")
         XCTAssertEqual(viewer.pipeline.currentFile?.url, trip[0])
         XCTAssertTrue(spin(10) { !viewer.isListingPendingForTests && viewer.displayedFile?.url == trip[0] })
         XCTAssertEqual(viewer.pipeline.files.count, 5)
+    }
+
+    /// At launch the first image file before any folder is presented in the launch's turn, also when something else
+    /// comes before it (a video of a camera folder, a sidecar, a document).
+    func testAtLaunchTheFirstImageFileIsPresentedInTheLaunchsTurn() throws {
+        let trip = writeSequence(2, in: directory("Trip"), prefix: "t")
+        let desk = writeSequence(2, in: directory("Desk"), prefix: "d")
+        let notes = directory("Desk").appendingPathComponent("notes.txt")
+        try Data("x".utf8).write(to: notes)
+        for (urls, first) in [([desk[0], directory("Trip")], desk[0]), ([notes, desk[1], directory("Trip")], desk[1])] {
+            let viewer = try makeViewer()  // launched: nothing on screen yet
+            viewer.presentsSynchronously = true
+            viewer.open(urls)
+            viewer.presentsSynchronously = false
+            XCTAssertEqual(viewer.displayedFile?.url, first, "not presented in the launch's turn")
+            XCTAssertNotNil(viewer.shownTierForTests)
+            XCTAssertTrue(spin(10) { !viewer.isListingPendingForTests })
+            XCTAssertEqual(viewer.pipeline.currentFile?.url, first, "the listing took another image on screen")
+            XCTAssertEqual(viewer.pipeline.files.map(\.url), [first] + trip)
+            viewer.window?.close()
+        }
+    }
+
+    /// The first image file decodes before anything is listed when something that is not an image comes before it, and
+    /// several files browse before they are all stat'ed (one `stat` each, which a network volume makes slow).
+    func testTheFirstImageFileShowsFirstAndSeveralFilesBrowseBeforeTheyAreListed() throws {
+        let viewer = try makeViewer()
+        let desk = directory("Desk")
+        let shown = writeSequence(1, in: desk, prefix: "a")[0]
+        let notes = desk.appendingPathComponent("notes.txt")
+        try Data("x".utf8).write(to: notes)
+        let others = (0..<8_000).map { desk.appendingPathComponent(String(format: "x%05d.jpg", $0)) }
+        for url in others { FileManager.default.createFile(atPath: url.path, contents: nil) }
+        viewer.open([notes, shown] + others)
+        XCTAssertEqual(viewer.pipeline.currentFile?.url, shown, "the first image waits for the listing")
+        var browsedWhileListing = false
+        let done = spin(30) {
+            if viewer.isListingPendingForTests, viewer.pipeline.files.count == 8_001 { browsedWhileListing = true }
+            return !viewer.isListingPendingForTests && viewer.displayedFile?.url == shown
+        }
+        XCTAssertTrue(done, "\(viewer.displayedFile?.name ?? "nothing") on screen")
+        XCTAssertTrue(browsedWhileListing, "the files waited for the whole listing")
+        XCTAssertEqual(viewer.pipeline.files.count, 8_001)
+        XCTAssertEqual(viewer.pipeline.index, 0)
+        XCTAssertNotEqual(viewer.pipeline.files[0].fileID, 0, "the listing's sizes, dates and inodes")
     }
 
     /// A file moved away while the rest of the set is listed does not come back with that listing, and the image on
@@ -240,6 +287,129 @@ final class SeveralFoldersTests: ViewerTestCase {
         XCTAssertTrue(spin(30) { !self.places(viewer).contains("Trip/t02.jpg") }, "\(places(viewer))")
         XCTAssertEqual(viewer.pipeline.currentFile?.url, trip[1])
         hudStarts(viewer, ["Trip › t01.jpg", "2/6"])
+    }
+
+    /// A change lists only its folder, and a rescan that finds a folder's files unchanged leaves the set alone (64 folders
+    /// of 2,000 photos: merging every folder at each change, or setting the pipeline's 128,000 files again for nothing,
+    /// would cost the main thread milliseconds each time).
+    func testAChangeListsOnlyItsFolderAndAnUnchangedFolderLeavesTheSetAlone() throws {
+        let viewer = try makeViewer()
+        writeSequence(3, in: directory("Trip"), prefix: "t")
+        writeSequence(2, in: directory("Home"), prefix: "h")
+        openAndWait(viewer, [directory("Trip"), directory("Home")], file: "t00.jpg")
+        let before = viewer.lastSetRescan.serial
+        writeImage(directory("Home").appendingPathComponent("h02.jpg"), width: 900, height: 600, gray: 0.7)
+        XCTAssertTrue(spin(30) { self.places(viewer).contains("Home/h02.jpg") }, "no rescan (utility queue)")
+        XCTAssertEqual(viewer.lastSetRescan.listed, [1], "a change in Home listed \(viewer.lastSetRescan.listed)")
+        XCTAssertEqual(viewer.lastSetRescan.replaced, [1])
+        XCTAssertGreaterThan(viewer.lastSetRescan.serial, before)
+
+        // Something that is no image changes Home: listed again, nothing to replace, the pipeline's set untouched.
+        let listedAt: UInt64 = try XCTUnwrap(property(viewer.pipeline, "listedAt"))
+        let serial = viewer.lastSetRescan.serial
+        try Data("x".utf8).write(to: directory("Home").appendingPathComponent("notes.txt"))
+        XCTAssertTrue(spin(30) { viewer.lastSetRescan.serial > serial }, "no rescan (utility queue)")
+        XCTAssertEqual(viewer.lastSetRescan, .init(serial: viewer.lastSetRescan.serial, listed: [1], replaced: []))
+        XCTAssertEqual(property(viewer.pipeline, "listedAt"), listedAt, "an unchanged folder set the pipeline's files again")
+        XCTAssertEqual(places(viewer).count, 6)
+    }
+
+    /// Finder moves the photo on screen to another folder of the set (one rename, which both folders' watchers see, in
+    /// either order): it stays on screen, at its new place, as a rename within one folder keeps it.
+    func testAPhotoMovedToAnotherFolderOfTheSetStaysOnScreen() throws {
+        let viewer = try makeViewer()
+        let a = writeSequence(3, in: directory("A"), prefix: "a")
+        let b = writeSequence(3, in: directory("B"), prefix: "b")
+        openAndWait(viewer, [directory("A"), directory("B")], file: "a00.jpg")
+        for (photo, index, to, expected) in [(a[1], 1, directory("B"), ["A/a00.jpg", "A/a02.jpg", "B/a01.jpg", "B/b00.jpg",
+                                                                    "B/b01.jpg", "B/b02.jpg"]),
+                                             (b[1], 4, directory("A"), ["A/a00.jpg", "A/a02.jpg", "A/b01.jpg", "B/a01.jpg",
+                                                                    "B/b00.jpg", "B/b02.jpg"])] {
+            viewer.perform(.first)
+            viewer.perform(.jump(index))
+            XCTAssertEqual(viewer.pipeline.currentFile?.url, photo)
+            XCTAssertTrue(spin(1) { viewer.displayedFile?.url == photo })
+            let moved = to.appendingPathComponent(photo.lastPathComponent)
+            XCTAssertEqual(rename(photo.path, moved.path), 0)
+            XCTAssertTrue(spin(30) { self.places(viewer) == expected }, "\(places(viewer))")
+            spin(0.3)  // the other folder's rescan too
+            XCTAssertEqual(viewer.pipeline.currentFile?.url, moved, "the photo on screen did not follow its move")
+            XCTAssertEqual(places(viewer), expected)
+        }
+    }
+
+    /// Finder opens a file of the set that the set has not listed: saved into one of its folders just before (its
+    /// watcher has not fired yet), into a folder past the watched ones, or a hidden one. It shows within the set, at its
+    /// place, and the set stays.
+    func testOpeningAFileTheSetHasNotListedKeepsTheSet() throws {
+        let viewer = try makeViewer()
+        writeSequence(3, in: directory("A"), prefix: "a")
+        writeSequence(3, in: directory("B"), prefix: "b")
+        openAndWait(viewer, [directory("A"), directory("B")], file: "a00.jpg")
+        let new = writeImage(directory("B").appendingPathComponent("b01b.jpg"), width: 900, height: 600, gray: 0.4)
+        viewer.open([new])
+        XCTAssertEqual(viewer.pipeline.currentFile?.url, new)
+        XCTAssertEqual(places(viewer), ["A/a00.jpg", "A/a01.jpg", "A/a02.jpg", "B/b00.jpg", "B/b01.jpg", "B/b01b.jpg", "B/b02.jpg"])
+        XCTAssertFalse(viewer.isListingPendingForTests)
+        XCTAssertTrue(spin(30) { viewer.displayedFile?.url == new && viewer.pipeline.currentFile?.fileID != 0 },
+                      "B was not listed again")
+        hudStarts(viewer, ["B › b01b.jpg", "6/7"])
+
+        // A hidden file stays while it is on screen, as in one folder, among its folder's files (sorted by name with the
+        // whole set, it would go before A's).
+        let hidden = writeImage(directory("B").appendingPathComponent(".b01h.jpg"), width: 900, height: 600, gray: 0.6)
+        let serial = viewer.lastSetRescan.serial
+        viewer.open([hidden])
+        XCTAssertTrue(spin(10) { viewer.displayedFile?.url == hidden }, "\(viewer.displayedFile?.name ?? "nothing")")
+        XCTAssertTrue(spin(30) { viewer.lastSetRescan.serial > serial }, "B was not listed again")
+        spin(0.2)  // its watcher's rescan too
+        XCTAssertEqual(viewer.pipeline.currentFile?.url, hidden)
+        XCTAssertEqual(places(viewer).count, 8)
+        XCTAssertEqual(Array(places(viewer).prefix(3)), ["A/a00.jpg", "A/a01.jpg", "A/a02.jpg"])
+        XCTAssertTrue(places(viewer).contains("B/.b01h.jpg"), "\(places(viewer))")
+
+        // More folders than are watched: a photo saved into one that is not, then opened from Finder.
+        var folders: [URL] = []
+        for i in 0..<(ViewerWindowController.maximumWatchedFolders + 2) {
+            folders.append(directory(String(format: "F%02d", i)))
+            writeSequence(1, in: folders[i], prefix: String(format: "f%02d_", i), width: 64, height: 48)
+        }
+        openAndWait(viewer, folders, file: "f00_00.jpg")
+        let unwatched = writeImage(folders[folders.count - 1].appendingPathComponent("new.jpg"), width: 64, height: 48,
+                                   gray: 0.4)
+        viewer.open([unwatched])
+        XCTAssertEqual(viewer.pipeline.currentFile?.url, unwatched)
+        XCTAssertEqual(viewer.pipeline.files.count, folders.count + 1, "the set was replaced by the photo's folder")
+        XCTAssertTrue(spin(30) { viewer.pipeline.currentFile?.fileID != 0 }, "its folder was not listed again")
+        XCTAssertEqual(viewer.pipeline.index, folders.count, "\(places(viewer).suffix(3))")
+    }
+
+    /// A folder opened through a symbolic link, or with a file reached through one: the set finds its files under each
+    /// path. The file opened first stays on screen, and Finder opening one of the folder's photos by its real path keeps
+    /// the set.
+    func testAFolderOpenedThroughALinkKeepsItsPhotos() throws {
+        let viewer = try makeViewer()
+        let a = writeSequence(3, in: directory("A"), prefix: "a")
+        writeSequence(2, in: directory("B"), prefix: "b")
+        let link = root.appendingPathComponent("Link", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: directory("A"))
+        let throughLink = link.appendingPathComponent("a02.jpg", isDirectory: false)
+        viewer.open([throughLink, directory("A")])
+        XCTAssertTrue(spin(10) { !viewer.isListingPendingForTests && viewer.shownTierForTests != nil })
+        XCTAssertEqual(places(viewer), ["A/a00.jpg", "A/a01.jpg", "A/a02.jpg"])
+        XCTAssertEqual(viewer.pipeline.currentFile?.name, "a02.jpg", "the file opened first left the screen")
+
+        openAndWait(viewer, [link, directory("B")], file: "a00.jpg")
+        let real = try XCTUnwrap(realpath(a[2].path, nil).map { path -> URL in
+            defer { free(path) }
+            return URL(fileURLWithPath: String(cString: path), isDirectory: false)
+        })
+        for url in [real, a[2]] {  // as Finder gives it (links resolved), and without /private
+            viewer.open([url])
+            XCTAssertEqual(viewer.pipeline.files.count, 5, "the set was replaced")
+            XCTAssertEqual(viewer.pipeline.currentFile?.name, "a02.jpg")
+            viewer.perform(.first)
+        }
     }
 
     /// Several files alone (no folder): that set, in its order, also across folders; an undo puts a file back at its

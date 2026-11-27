@@ -328,6 +328,12 @@ public final class ImagePipeline {
         return slots[i].full ?? slots[i].screen ?? slots[i].preview
     }
 
+    /// The best tier of every file that has pixels, found from the cached slots alone (a few dozen), not by looking up
+    /// every file of the set (3,000 files: 2.5 ms).
+    public var cachedBest: [DecodedImage] {
+        cachedIndices.compactMap { slots[$0].full ?? slots[$0].screen ?? slots[$0].preview }
+    }
+
     /// Metadata of `file`, probed with its first decode (nil until that decode is delivered).
     public func info(for file: ImageFile) -> ImageInfo? {
         guard let i = slotIndex(of: file) else { return nil }

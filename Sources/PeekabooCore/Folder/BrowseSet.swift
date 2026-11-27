@@ -7,9 +7,10 @@ import Foundation
 /// Every file has one place. A folder reached again (under any path: the same device and inode) is listed once, at its
 /// first place. A file inside one of the folders is browsed with that folder, in its order and under its rules (a
 /// hidden file stays out); any other file at its own place, once. The set lists item after item, so the item of a file
-/// follows from its URL alone (`item(of:)`, a dictionary lookup of its path) and an item's files from two binary
-/// searches: a rescan of one folder replaces that folder's files only, and an undo finds where a file goes back without
-/// sorting the whole set again.
+/// follows from its URL alone (`item(of:)`, a dictionary lookup of its path, which knows each folder under the other
+/// paths the listing met it by and its resolved ones) and an item's files from two binary searches: a rescan of one
+/// folder replaces that folder's files only, and an undo finds where a file goes back without sorting the whole set
+/// again.
 public struct BrowseSet: Sendable {
     /// One opened URL.
     public enum Item: Sendable, Equatable {
@@ -31,30 +32,42 @@ public struct BrowseSet: Sendable {
     public var refused: [Int]
     /// The images come from more than one folder: the viewer names the folder of the image on screen.
     public let spansFolders: Bool
-    /// The item of each folder and of each file item, by path (`URL.path`, as the URLs of the set spell it).
+    /// The item of each folder and of each file item, by path (`URL.path`, as the URLs of the set spell it). A folder is
+    /// also found under the other paths the listing met it by (`aliases`).
     private let folderItems: [String: Int]
     private let fileItems: [String: Int]
     /// Names a folder item leaves to file items of their own: files that came with a folder that could not be listed
     /// then (they keep their place when it lists).
     private let ownFiles: [Int: Set<String>]
 
-    public init(items: [Item], refused: [Int] = []) {
+    /// `aliases`: other paths of folder items (a symbolic link, another letter case), by path.
+    public init(items: [Item], refused: [Int] = [], aliases: [String: Int] = [:]) {
         self.items = items
         self.refused = refused
         var folders: [String: Int] = [:]
         var files: [String: Int] = [:]
+        var filePaths: [(item: Int, path: String)] = []
         for (k, item) in items.enumerated() {
+            let path = item.url.path
             switch item {
-            case .folder(let url): folders[url.path] = folders[url.path] ?? k
-            case .file(let url): files[url.path] = files[url.path] ?? k
+            case .folder:
+                if folders[path] == nil { folders[path] = k }
+            case .file:
+                if files[path] == nil { files[path] = k }
+                filePaths.append((k, path))
             }
         }
-        var own: [Int: Set<String>] = [:]
         var places = Set(folders.keys)
-        for case .file(let url) in items {
-            let parent = Self.parent(url.path)
-            places.insert(parent)
-            if let folder = folders[parent] { own[folder, default: []].insert(url.lastPathComponent) }
+        for (alias, k) in aliases where folders[alias] == nil { folders[alias] = k }
+        var own: [Int: Set<String>] = [:]
+        for (k, path) in filePaths {
+            let parent = Self.parent(path)
+            guard let folder = folders[parent] else {
+                places.insert(parent)
+                continue
+            }
+            places.insert(items[folder].url.path)  // its folder, under any of its paths
+            own[folder, default: []].insert(items[k].url.lastPathComponent)
         }
         folderItems = folders
         fileItems = files
@@ -62,9 +75,23 @@ public struct BrowseSet: Sendable {
         spansFolders = places.count > 1
     }
 
-    /// What `urls` name before anything is listed (no file-system access): a directory path is a folder.
+    /// What `urls` name before anything is listed (no file-system access): a directory path is a folder. Linear in the
+    /// URLs: off the main thread.
     public init(unlisted urls: [URL]) {
         self.init(items: urls.map { $0.hasDirectoryPath ? .folder($0) : .file($0) })
+    }
+
+    /// What a set of `init(unlisted:)` can browse before it is listed: its image files before the first folder, once
+    /// each, as placeholders (the listing brings their sizes, dates and inodes). Linear in them: off the main thread.
+    public func leadingFiles() -> [ImageFile] {
+        var files: [ImageFile] = []
+        for (k, item) in items.enumerated() {
+            guard case .file(let url) = item else { break }
+            let name = url.lastPathComponent
+            guard FolderScanner.isSupported(name: name), fileItems[url.path] == k else { continue }
+            files.append(ImageFile(url: url, name: name, byteSize: 0, modified: 0, fileID: 0))
+        }
+        return files
     }
 
     /// The folder items, by item.
@@ -133,10 +160,28 @@ public struct BrowseSet: Sendable {
         return listed.filter { !own.contains($0.name) }
     }
 
-    /// `a` and `b` list the same files in the same versions (path, size and modification time), in the same order.
+    /// The folder item `file` is in now, when the new `listing` of its folder no longer has it (not even renamed): it was
+    /// moved to another folder of the set (a Finder move is one rename, which both folders see), found by its file ID.
+    /// nil when it is still in its folder, gone, out of the set, or has no file ID. File-system access (`statfs`,
+    /// `fsgetpath`): never on the main thread.
+    public func folder(whereMoved file: ImageFile, from listing: [ImageFile]) -> Int? {
+        guard file.fileID != 0, !listing.contains(where: { $0.fileID == file.fileID }) else { return nil }
+        var volume = statfs()
+        guard statfs(Self.parent(file.url.path), &volume) == 0 else { return nil }
+        var path = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        guard fsgetpath(&path, path.count, &volume.f_fsid, file.fileID) > 0 else { return nil }
+        let moved = URL(fileURLWithPath: String(cString: path), isDirectory: false)
+        guard let k = item(of: moved), case .folder = items[k] else { return nil }
+        return k
+    }
+
+    /// `a` and `b` list the same files in the same versions (path, size, modification time and file ID), in the same
+    /// order. A file opened before its folder listed it has no file ID: the pipeline stamps it with its size and date
+    /// when it decodes it, and the listing brings the rest.
     public static func sameFiles(_ a: ArraySlice<ImageFile>, _ b: [ImageFile]) -> Bool {
         a.count == b.count && zip(a, b).allSatisfy { x, y in
-            x.byteSize == y.byteSize && x.modified == y.modified && x.name == y.name && x.url == y.url
+            x.byteSize == y.byteSize && x.modified == y.modified && x.fileID == y.fileID && x.name == y.name
+                && x.url == y.url
         }
     }
 
@@ -194,8 +239,10 @@ extension BrowseSet {
         fileprivate enum Kind {
             /// A folder seen for the first time (its identity is nil when it cannot even be stat'ed).
             case folder(Identity?)
+            /// A folder seen before, under this path or another (a symbolic link, another letter case).
+            case folderAgain(Identity?)
             case file(ImageFile)
-            /// A folder seen before, a file that is not an image, nothing there.
+            /// A file that is not an image, nothing there.
             case skipped
         }
 
@@ -212,7 +259,7 @@ extension BrowseSet {
                 switch kind {
                 case .folder:
                     if case .success(let files) = list(i), !files.isEmpty { return files }
-                case .skipped:
+                case .folderAgain, .skipped:
                     continue
                 case .file:
                     return nil
@@ -236,21 +283,45 @@ extension BrowseSet {
             var seenFiles = Set<String>()
             var items: [Item] = []
             var sources: [Int] = []
+            // The other paths each folder came by (a folder opened again through a link, a file dropped through one):
+            // the set finds the folder under them too, as `item(of:)` looks up paths, not identities.
+            var folderByIdentity: [Identity: Int] = [:]
+            var folderByPath: [String: Int] = [:]
+            var otherPaths: [(path: String, identity: Identity?, standardized: String?)] = []
             for (i, kind) in kinds.enumerated() {
                 switch kind {
-                case .folder:
+                case .folder(let identity):
+                    let k = items.count
+                    if let identity, folderByIdentity[identity] == nil { folderByIdentity[identity] = k }
+                    let standardized = urls[i].standardizedFileURL.path
+                    if folderByPath[standardized] == nil { folderByPath[standardized] = k }
                     items.append(.folder(urls[i]))
                     sources.append(i)
+                case .folderAgain(let identity):
+                    otherPaths.append((urls[i].path, identity, urls[i].standardizedFileURL.path))
                 case .file(let file):
-                    if !listed.isEmpty, let parent = Self.parentIdentity(file.url, cache: &parents), listed.contains(parent) {
+                    let path = file.url.path
+                    if !listed.isEmpty, let parent = Self.parentIdentity(of: path, cache: &parents), listed.contains(parent) {
+                        otherPaths.append((BrowseSet.parent(path), parent, nil))
                         continue
                     }
-                    guard seenFiles.insert(file.url.standardizedFileURL.path).inserted else { continue }
+                    guard seenFiles.insert(Self.standardized(path, of: file.url)).inserted else { continue }
                     items.append(.file(file.url))
                     sources.append(i)
                 case .skipped:
                     continue
                 }
+            }
+            var aliases: [String: Int] = [:]
+            for other in otherPaths {
+                let byIdentity = other.identity.flatMap { folderByIdentity[$0] }
+                guard let k = byIdentity ?? other.standardized.flatMap({ folderByPath[$0] }) else { continue }
+                if aliases[other.path] == nil { aliases[other.path] = k }
+            }
+            // Each folder under its resolved paths too: the ones Finder and the shell open its files by.
+            for (k, item) in items.enumerated() {
+                guard case .folder(let url) = item else { continue }
+                for path in Self.resolvedPaths(url) where aliases[path] == nil { aliases[path] = k }
             }
             var refused: [Int] = []
             var failures: [Failure] = []
@@ -259,7 +330,7 @@ extension BrowseSet {
                 failures.append(Failure(item: k, folder: urls[i], error: error))
                 if let code = FolderScanner.posixCode(error), code == EPERM || code == EACCES { refused.append(k) }
             }
-            let set = BrowseSet(items: items, refused: refused)
+            let set = BrowseSet(items: items, refused: refused, aliases: aliases)
             var files: [ImageFile] = []
             files.reserveCapacity(sources.reduce(0) { total, i in
                 guard case .success(let listed)? = listings[i] else { return total + 1 }
@@ -284,7 +355,7 @@ extension BrowseSet {
                 // Not reachable (privacy protection refuses even a `stat` in a protected folder; gone): what the URL says.
                 // A folder is listed, which says why it cannot be; a file shows its error when it is reached.
                 if url.hasDirectoryPath {
-                    return seenFolderPaths.insert(url.standardizedFileURL.path).inserted ? .folder(nil) : .skipped
+                    return seenFolderPaths.insert(url.standardizedFileURL.path).inserted ? .folder(nil) : .folderAgain(nil)
                 }
                 return FolderScanner.isSupported(url) ? .file(Self.placeholder(url)) : .skipped
             }
@@ -293,10 +364,11 @@ extension BrowseSet {
                 // The same folder under another path (a symbolic link, another letter case) is the same folder.
                 let identity = Identity(device: Int64(info.st_dev), inode: UInt64(info.st_ino))
                 let freshPath = seenFolderPaths.insert(url.standardizedFileURL.path).inserted
-                return seenFolders.insert(identity).inserted && freshPath ? .folder(identity) : .skipped
+                return seenFolders.insert(identity).inserted && freshPath ? .folder(identity) : .folderAgain(identity)
             case S_IFREG:
-                guard FolderScanner.isSupported(url) else { return .skipped }
-                return .file(ImageFile(url: url, name: url.lastPathComponent, byteSize: Int64(info.st_size),
+                let name = url.lastPathComponent
+                guard FolderScanner.isSupported(name: name) else { return .skipped }
+                return .file(ImageFile(url: url, name: name, byteSize: Int64(info.st_size),
                                        modified: FolderScanner.seconds(info.st_mtimespec), fileID: UInt64(info.st_ino)))
             default:
                 return .skipped
@@ -314,15 +386,34 @@ extension BrowseSet {
             ImageFile(url: url, name: url.lastPathComponent, byteSize: 0, modified: 0, fileID: 0)
         }
 
-        /// Identity of the folder `url` is in (one `stat` per folder, cached by path).
-        private static func parentIdentity(_ url: URL, cache: inout [String: Identity?]) -> Identity? {
-            let folder = url.deletingLastPathComponent()
-            if let known = cache[folder.path] { return known }
+        /// The paths of folder `url` with its symbolic links resolved (~25 µs): with each name as the disk spells it
+        /// (`realpath`, `/private/tmp/…`: what Finder and `fsgetpath` give), and without `/private` (`/tmp/…`).
+        private static func resolvedPaths(_ url: URL) -> [String] {
+            var paths = [url.resolvingSymlinksInPath().path]
+            if let real = realpath(url.path, nil) {
+                paths.append(String(cString: real))
+                free(real)
+            }
+            return paths
+        }
+
+        /// Identity of the folder the file at `path` is in (one `stat` per folder, cached by its path).
+        private static func parentIdentity(of path: String, cache: inout [String: Identity?]) -> Identity? {
+            let folder = BrowseSet.parent(path)
+            if let known = cache[folder] { return known }
             var info = stat()
-            let found = folder.withUnsafeFileSystemRepresentation { path in path.map { stat($0, &info) == 0 } ?? false }
+            let found = URL(fileURLWithPath: folder, isDirectory: true).withUnsafeFileSystemRepresentation { path in
+                path.map { stat($0, &info) == 0 } ?? false
+            }
             let identity = found ? Identity(device: Int64(info.st_dev), inode: UInt64(info.st_ino)) : nil
-            cache[folder.path] = .some(identity)
+            cache[folder] = .some(identity)
             return identity
+        }
+
+        /// `url.standardizedFileURL.path`, where `path` is `url`'s: without building another URL when the path has no
+        /// `.` or `..` to remove (Finder's never has).
+        private static func standardized(_ path: String, of url: URL) -> String {
+            path.contains("/.") ? url.standardizedFileURL.path : path
         }
     }
 }
