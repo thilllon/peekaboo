@@ -65,6 +65,9 @@ Everything below was measured on a MacBook Pro M4 Pro (see [docs/research.md](do
 - Culling keys borrowed from Lightroom: 0–5 stars, 6–9 colour labels, P / X / U flags, Shift to act and advance — stored as
   Finder tags. A pick counter in the HUD, a picks-only view (`v`) and one key to copy every pick to a folder (`shift+c`,
   never overwriting) take a 5,000-photo shoot down to its keepers.
+- An image list at the right edge (`t`): the thumbnail and name of every image, picks flagged, the image on screen
+  selected; a click shows another. With it open, a change of image only selects one row and scrolls it into view;
+  thumbnails come from the viewer's own previews or the files' embedded ones, in the background, for the rows on screen.
 - Trash with undo, move/copy to configurable slots, reveal, copy path or image, open with your editor, shell templates.
 - Instant (non-animated) full screen that respects the notch; HDR/EDR photos on XDR displays.
 - Pinch/scroll zoom around the pointer, pixel-exact 100 %, pixel grid when you zoom far in.
@@ -113,6 +116,7 @@ Opening one image browses its whole folder.
 | `k` · `,` `.` | play / pause an animation · previous / next frame |
 | `0`–`5` · `6`–`9` · `p` `x` `u` (+Shift = and advance) | stars · colour labels · pick / reject / clear |
 | `v` · ⇧C | picks only (and back) · copy every pick to a folder |
+| `t` | image list at the right edge (a click shows that image) |
 | ⌘⌫ · ⌘Z | move to Trash · undo |
 | `m` · `c` · ⌥1–9 | move / copy to a slot |
 | ⌘C · ⌥⌘C · ⇧⌘R · `e` | copy image · copy path · reveal in Finder · open in editor |
@@ -138,7 +142,7 @@ mise run deps             # static libjpeg-turbo and libwebp (pinned, checksum-v
 mise run install          # build the release app into /Applications (replacing the copy there)
 ```
 
-`swift build`, `swift test`, `mise run app`, `mise run dmg`, `peekaboo-bench <anim|decode|picks|pipeline|render>`. Releases:
+`swift build`, `swift test`, `mise run app`, `mise run dmg`, `peekaboo-bench <anim|decode|picks|pipeline|render|thumbs>`. Releases:
 `mise run release` (see [AGENTS.md](AGENTS.md#releases)).
 
 ## How it works

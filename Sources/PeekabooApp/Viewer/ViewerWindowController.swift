@@ -182,6 +182,16 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// In front and key, or out of sight for tests (`.headless`).
     let presentation: Presentation
 
+    // Image list
+    /// Window state kept across launches (whether the image list is open): the app's defaults, in memory for tests.
+    private let uiState: ViewerUIState
+    private var imageListOpen: Bool
+    /// Built the first time the list opens, never at launch (`syncImageList`).
+    private var imageList: ImageListPanel?
+    private var imageListBuildScheduled = false
+    /// Makes the list's thumbnails, off the main thread (tests pass their own).
+    nonisolated private let makeThumbnail: ThumbnailLoader.Make
+
     // Full screen and chrome
     private var instantFullscreen: (frame: NSRect, style: NSWindow.StyleMask)?
     private var lastPointerMove: UInt64 = 0
@@ -212,9 +222,15 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private var lastTitle = ""
     private var pendingTitle: String?
 
-    init(configStore: ConfigStore, presentation: Presentation = .interactive) {
+    /// `uiState`: where window state is kept across launches; by default the app's defaults, in memory when headless.
+    /// `makeThumbnail`: how the image list makes its thumbnails (tests pass their own).
+    init(configStore: ConfigStore, presentation: Presentation = .interactive, uiState: ViewerUIState? = nil,
+         makeThumbnail: @escaping ThumbnailLoader.Make = ThumbnailLoader.standardMake) {
         self.configStore = configStore
         self.presentation = presentation
+        self.uiState = uiState ?? (presentation == .headless ? .inMemory() : .standard)
+        self.makeThumbnail = makeThumbnail
+        imageListOpen = self.uiState.isImageListOpen()
         NSWindow.allowsAutomaticWindowTabbing = false
         let window = ViewerWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1280, height: 820),
@@ -233,6 +249,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         window.staysOffScreen = presentation == .headless
 
         rootView = ViewerRootView(frame: NSRect(origin: .zero, size: window.contentLayoutRect.size))
+        // Open at the last quit: the first frame already fits beside the list, which is built after it.
+        if imageListOpen { rootView.sidebarWidth = ImageListPanel.width }
         viewerView = rootView.viewerView
         window.contentView = rootView
         renderer = Renderer(layer: viewerView.metalLayer)
@@ -869,6 +887,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     // MARK: HUD
 
     private func updateHUD() {
+        // The image list follows in the same turn (the same frame).
+        defer { syncImageList() }
         guard let file = pipeline.currentFile else {
             hud.setContent(HUDContent())
             setTitle("Peekaboo")
@@ -1349,7 +1369,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         switch action {
         case .open, .quit, .config, .configFile, .reloadConfig, .makeDefault, .help, .hud, .hudHide, .undo, .redo, .background:
             return true
-        case .fullscreen, .fullscreenNative, .close, .escape:
+        case .fullscreen, .fullscreenNative, .close, .escape, .imageList:
             return window?.isVisible == true
         default:
             return pipeline.currentFile != nil
@@ -1409,6 +1429,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         case .frameNext: stepFrame(1)
         case .framePrevious: stepFrame(-1)
         case .picksOnly: togglePicksOnly()
+        case .imageList: toggleImageList()
         case .copyPicks(let target): copyPicks(target)
         case .background:
             let all = Background.allCases
@@ -1886,6 +1907,74 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         if instantFullscreen != nil { toggleInstantFullscreen() }
         // A Space of its own on a screen: never for a headless window.
         if presentation == .interactive { window?.toggleFullScreen(nil) }
+    }
+
+    // MARK: Image list
+
+    /// The image list is open (the View menu's check mark).
+    var isImageListOpen: Bool { imageListOpen }
+
+    /// `view.image_list`: open or close the list at the right edge. The viewer view gives it its width and the image
+    /// refits (`viewerViewDidResize`), drawn again from the tier on screen: nothing is decoded again. Built the first time
+    /// it opens; whether it is open is kept across launches.
+    private func toggleImageList() {
+        let started = Trace.now()
+        let building = imageList == nil
+        imageListOpen.toggle()
+        uiState.setImageListOpen(imageListOpen)
+        if imageListOpen {
+            buildImageList()
+            rootView.sidebarWidth = ImageListPanel.width
+            imageList?.opened()
+            syncImageList()
+        } else {
+            imageList?.closed()
+            rootView.sidebarWidth = 0
+        }
+        Trace.log(String(format: "image list %@ in %.2f ms", imageListOpen ? (building ? "built and opened" : "opened") : "closed",
+                         Trace.ms(since: started)))
+    }
+
+    private func buildImageList() {
+        guard imageList == nil else { return }
+        let panel = ImageListPanel(thumbnails: ThumbnailLoader(maxPixelSize: ImageListPanel.thumbnailPixels,
+                                                               make: makeThumbnail))
+        // The rows are `pipeline.files`: a row is a position in the browsing set.
+        panel.onSelect = { [weak self] row in self?.navigate(to: row, isRepeat: false) }
+        panel.isPick = { [weak self] file in self?.picks.contains(file) ?? false }
+        // A preview the pipeline holds (its sweep decodes them around the image on screen) makes the row's thumbnail
+        // without reading the file again.
+        panel.thumbnails.preview = { [weak self] file in self?.pipeline.preview(for: file) }
+        imageList = panel
+        rootView.sidebar = panel
+    }
+
+    /// The list follows the browsing set, the image on screen and the picks. `updateHUD` calls it, so it changes in the
+    /// frame of the change; closed, it costs a branch.
+    private func syncImageList() {
+        guard imageListOpen else { return }
+        guard let imageList else {
+            // Open since the last launch: its width was kept for the first frame, and it is built in a main-queue turn of
+            // its own once the image on screen is sharp (or failed, or there is none), never before.
+            guard !imageListBuildScheduled, !isDecodingCurrent else { return }
+            imageListBuildScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.imageListOpen, self.imageList == nil else { return }
+                let started = Trace.now()
+                self.buildImageList()
+                self.syncImageList()
+                Trace.log(String(format: "image list built after launch in %.2f ms", Trace.ms(since: started)))
+            }
+            return
+        }
+        imageList.update(files: pipeline.files, index: pipeline.index, viewerBusy: isDecodingCurrent)
+    }
+
+    /// The viewer is decoding the image on screen (no exact sharp tier shown yet, and no error): the list starts no
+    /// thumbnail meanwhile.
+    private var isDecodingCurrent: Bool {
+        guard let file = pipeline.currentFile else { return false }
+        return !currentIsSharp && failureReason(for: file) == nil
     }
 
     // MARK: Cursor & chrome auto-hide

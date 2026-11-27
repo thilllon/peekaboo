@@ -19,6 +19,9 @@ final class ActionTests: XCTestCase {
         XCTAssertEqual(Action(id: "file.copy_picks:ask"), .copyPicks("ask"))
         XCTAssertEqual(Action(id: "file.copy_picks:./_selects"), .copyPicks("./_selects"))
         XCTAssertEqual(Action(id: "view.picks_only"), .picksOnly)
+        XCTAssertEqual(Action(id: "view.image_list"), .imageList)
+        XCTAssertEqual(Action.imageList.id, "view.image_list")
+        XCTAssertEqual(Action.imageList.namespace, "view")
         XCTAssertEqual(Action(id: "file.open_with:com.apple.Preview"), .openWith("com.apple.Preview"))
         XCTAssertEqual(Action(id: "meta.rate:3"), .rate(3))
         XCTAssertEqual(Action(id: "meta.label:red"), .label("red"))
@@ -32,7 +35,7 @@ final class ActionTests: XCTestCase {
 
     func testRejectsInvalidIDs() {
         for bad in ["bogus", "nav.jump:0", "nav.jump:x", "zoom.set:-1", "zoom.set:0", "file.move:", "file.copy_picks:",
-                    "view.picks_only:all", "meta.rate:6",
+                    "view.picks_only:all", "view.image_list:open", "meta.rate:6",
                     "meta.label:pink", "meta.flag:maybe", "pan.edge:middle", "exec:", "exec:   "] {
             XCTAssertNil(Action(id: bad), bad)
         }

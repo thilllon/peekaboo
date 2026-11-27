@@ -346,6 +346,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let plain = !item.keyEquivalent.isEmpty && item.keyEquivalentModifierMask.isDisjoint(with: [.command, .control])
         guard let viewer else { return action == .open || action == .quit }
         if action == .picksOnly { item.state = viewer.isPicksOnly ? .on : .off }
+        if action == .imageList { item.state = viewer.isImageListOpen ? .on : .off }
         return viewer.canPerform(action, plainKeyEquivalent: plain)
     }
 }

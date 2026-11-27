@@ -53,13 +53,16 @@ class ViewerTestCase: XCTestCase {
         super.tearDown()
     }
 
-    /// A headless viewer with the default configuration, or `toml` as its config file.
-    func makeViewer(toml: String? = nil) throws -> ViewerWindowController {
+    /// A headless viewer with the default configuration, or `toml` as its config file. Window state (`uiState`) is kept
+    /// in memory, never in the defaults; `makeThumbnail` makes the image list's thumbnails.
+    func makeViewer(toml: String? = nil, uiState: ViewerUIState = .inMemory(),
+                    makeThumbnail: @escaping ThumbnailLoader.Make = ThumbnailLoader.standardMake) throws -> ViewerWindowController {
         let configURL = root.appendingPathComponent("config.toml")
         if let toml { try Data(toml.utf8).write(to: configURL) }
         let store = ConfigStore(url: configURL)
         store.load()
-        let viewer = ViewerWindowController(configStore: store, presentation: .headless)
+        let viewer = ViewerWindowController(configStore: store, presentation: .headless, uiState: uiState,
+                                            makeThumbnail: makeThumbnail)
         self.viewer = viewer
         objc_setAssociatedObject(viewer, &Self.storeKey, store, .OBJC_ASSOCIATION_RETAIN)
         return viewer

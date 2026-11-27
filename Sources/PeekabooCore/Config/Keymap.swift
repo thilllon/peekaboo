@@ -162,6 +162,8 @@ public struct Keymap: Sendable, Equatable {
             // Then the picks alone: browse only them, copy them all to a folder.
             normal(.picksOnly, "v")
             normal(.copyPicks("ask"), "shift+c")
+            // The image list at the right edge (t is free in every layer: defaults, vim, auto-advance, zoomed).
+            normal(.imageList, "t")
             normal(.config, "cmd+,")
             normal(.help, "?", "cmd+/")
             normal(.close, "cmd+w", "q")

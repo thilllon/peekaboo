@@ -122,6 +122,7 @@ enum KeyLabels {
         case .frameNext: return "Next Frame"
         case .framePrevious: return "Previous Frame"
         case .picksOnly: return "Show Picks Only"
+        case .imageList: return "Show Image List"
         case .trash: return "Move to Trash"
         case .delete: return "Delete Immediately"
         case .reveal: return "Reveal in Finder"
@@ -164,7 +165,7 @@ enum KeyLabels {
         case .pan, .panEdge, .panCenter: return 2
         case .fullscreen, .fullscreenNative, .hud, .hudHide, .background, .help,
              .rotateClockwise, .rotateCounterClockwise, .flipHorizontal, .flipVertical,
-             .playPause, .frameNext, .framePrevious: return 3
+             .playPause, .frameNext, .framePrevious, .imageList: return 3
         case .trash, .delete, .reveal, .copyPath, .copyName, .copyImage, .openWithChooser, .move, .copy, .openWith, .exec: return 4
         case .rate, .label, .flag, .picksOnly, .copyPicks: return 5
         default: return 6

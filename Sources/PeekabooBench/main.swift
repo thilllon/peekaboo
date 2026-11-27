@@ -8,6 +8,7 @@ let suites: [String: (ArraySlice<String>) throws -> Void] = [
     "picks": runPicksBench,
     "pipeline": runPipelineBench,
     "render": runRenderBench,
+    "thumbs": runThumbsBench,
 ]
 
 let args = CommandLine.arguments.dropFirst()

@@ -226,6 +226,27 @@ viewers score 21–26 dB and alias 10–25× more.
   lists are freed on a utility queue (their last release is 0.65 ms per 5,000 files on the main thread). Copying
   every pick reads the tags again, then copies on a utility queue through the same never-overwrite placement as
   `file.copy`.
+- Image list (`view.image_list`, `t`): a view-based `NSTableView` at the right edge (240 pt), built the first time it
+  opens (first open on 5,000 images 11–21 ms, half of it committing the new layer tree). When it was open at the last
+  quit (`PeekabooImageListOpen` in the app's defaults, one flag read when the viewer is built), the viewer view keeps
+  its width for the first frame and the list is built in a main-queue turn of its own once the image on screen is
+  sharp. Rows have a fixed height and are layers (thumbnail, name, ⚑), so only the rows on screen exist and are reused
+  (18 row views for 5,000 images). The list follows the viewer from `updateHUD`: a new browsing set is told from the
+  one shown by its array's storage (two pointers; the list keeps the array it shows, so that storage is never reused for
+  another) and reloads the rows on screen; a change of image selects one row and scrolls it into view (0.06–0.09 ms
+  within a navigation, display pass +0.002 ms, commit +0.03 ms). AppKit's selection rendering is off
+  (`selectionHighlightStyle = .none`, the row's own layer shows it): with it, every change of image cost the display
+  pass 0.13–0.17 ms and the commit 0.2–0.7 ms more. The table never takes the keyboard focus and handles a click itself
+  (it navigates at mouse-down; no selection tracking, no type-select). Opening or closing it resizes the viewer view,
+  and the image refits from the tier on screen (a toggle 2 ms; nothing is decoded again). Thumbnails (`ThumbnailLoader`,
+  `Thumbnail`, 96 px: twice the row height): from the pipeline's cached `.preview` tier when it holds one (no file read,
+  0.04–3.9 ms), else ImageIO's thumbnail, which takes the embedded preview (JPEG EXIF thumbnail 0.3–3 ms, its letterbox
+  trimmed; HEIC thumbnail item 1–3 ms; RAW preview 11–33 ms; a CR3's container rendition 13 ms) or decodes the image
+  (24 MP JPEG 34–69 ms, PNG 119–288 ms, WebP 327–386 ms); the source is chosen when the job starts, so a preview the
+  sweep made meanwhile counts (a screenful of the corpus's `nav/` rows: 26 ms from previews, 636 ms from the files). Two
+  jobs at a time on a utility queue, only for the rows on screen (a waiting job leaves with its row), none started while
+  the image on screen decodes; cached by file version (`NSCache`, 32 MB); 8-bit BGRA Display P3, which Core Animation
+  composites as it is.
 - HUD as `CATextLayer`s above the Metal layer (no blur views), updated only on state changes; toasts.
 - Full screen: instant borderless (notch-aware) by default; native as an option.
 - Updates (no Sparkle): `latest.json` of the latest GitHub release, read 11 s after launch (the updater is set up 1 s
