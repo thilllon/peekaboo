@@ -339,6 +339,53 @@ final class SettingsWindowTests: ViewerTestCase {
         XCTAssertTrue(fileText().contains("\"tab\" = \"none\"\n"), fileText())
     }
 
+    /// The file Peekaboo writes lists the keymap: its untouched lines are not "changed", removing a key deletes it from
+    /// its line, Change… puts the new key in the old one's place, ↺ and Reset All write the default lines back.
+    func testTheShortcutEditorEditsAFileThatListsTheKeymapInPlace() throws {
+        let controller = try makeController(toml: ConfigFile.defaultText)
+        let pane = shortcuts(controller)
+        XCTAssertEqual(pane.rows().filter(\.modified).map(\.id), [], "the defaults as written are the built-in keys")
+        let hide = try XCTUnwrap(pane.rows().first { $0.actions == [.hudHide] })
+        pane.remove([KeyChord(key: "tab")], from: hide)
+        XCTAssertTrue(spin(3) { self.store.config.keymap.resolve([KeyChord(key: "tab")], context: .normal) == .unbound })
+        XCTAssertEqual(fileText(), ConfigFile.defaultText.replacingOccurrences(of: "\"view.hud_hide\" = \"tab\"\n", with: ""))
+        XCTAssertTrue(try XCTUnwrap(pane.rows().first { $0.actions == [.hudHide] }).modified)
+
+        pane.record([.fullscreen], replacing: [KeyChord(key: "f")])
+        pane.recorded(key(controller.window, kVK_ANSI_G, "g"))
+        XCTAssertTrue(spin(3) { self.store.config.keymap.resolve([KeyChord(key: "g")], context: .normal) == .actions([.fullscreen]) })
+        XCTAssertTrue(fileText().contains("\"view.fullscreen\" = [\"g\", \"return\", \"ctrl+cmd+f\"]\n"), fileText())
+        XCTAssertEqual(store.config.keymap.resolve([KeyChord(key: "f")], context: .normal), .unbound)
+
+        pane.reset(try XCTUnwrap(pane.rows().first { $0.actions == [.fullscreen] }))
+        XCTAssertTrue(spin(3) { self.fileText().contains("\"view.fullscreen\" = [\"f\", \"return\", \"ctrl+cmd+f\"]\n") }, fileText())
+        controller.model.edit { try $0.resetBindings() }
+        XCTAssertTrue(spin(3) { self.fileText() == ConfigFile.defaultText && self.store.config.keymap == Keymap.default }, fileText())
+    }
+
+    /// With `auto_advance` and the built-in shortcuts under the file Peekaboo writes, its culling keys advance as the
+    /// built-in ones do: no row is "changed".
+    func testAFullFileWithBuiltInShortcutsAndAutoAdvanceChangesNoRow() throws {
+        var editor = ConfigEditor(text: ConfigFile.defaultText)
+        try editor.set("auto_advance", in: "rating", to: .bool(true))
+        try editor.set("defaults", in: "keymap", to: .bool(true))
+        let pane = shortcuts(try makeController(toml: editor.text))
+        XCTAssertEqual(store.config.keymap.resolve([KeyChord(key: "3")], context: .normal), .actions([.rate(3), .next]))
+        XCTAssertEqual(pane.rows().filter(\.modified).map(\.id), [])
+    }
+
+    /// Without a file the built-in shortcuts are on; unticking them writes the full file, whose keys are the keymap.
+    func testTurningTheBuiltInShortcutsOffWithoutAFileWritesTheFullFile() throws {
+        let pane = shortcuts(try makeController())
+        let box = try checkbox("Add built-in shortcuts config.toml does not list", in: pane.view)
+        XCTAssertEqual(box.state, .on)
+        box.performClick(nil)
+        XCTAssertTrue(spin(3) { !self.store.config.keymapDefaults }, "written and applied")
+        XCTAssertEqual(fileText(), ConfigFile.defaultText)
+        XCTAssertEqual(store.config.keymap, Keymap.default)
+        XCTAssertTrue(spin(1) { box.state == .off })
+    }
+
     /// Rows are every parameterless action plus whatever the keymap binds (parameterized ones, action lists), so new
     /// actions appear without a hard-coded list.
     func testRowsListEveryActionDynamically() throws {

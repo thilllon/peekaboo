@@ -1,12 +1,16 @@
 # Configuring Peekaboo
 
-Peekaboo reads one TOML file. Every setting is optional: a missing key keeps its built-in default, and
-an empty or missing file means "all defaults". Press **⌘,** (`app.config`) for the
-[Settings window](#the-settings-window), which changes every setting below and writes this file for you.
-Peekaboo › Open config.toml (`app.config_file`) creates a starter file with every setting commented
-out and opens it in your default editor.
+Peekaboo reads one TOML file. The file Peekaboo writes shows the whole configuration: every setting
+below, active, at its built-in default and with a comment, and the whole [default keymap](#default-keymap)
+in `[keys]` and `[keys.zoomed]`. It is generated from the code's defaults, so the two never disagree.
+Change a value in place; a setting you delete keeps its built-in default, and a key you delete from
+`[keys]` is unbound (an empty or missing file still means "all defaults"). Press **⌘,** (`app.config`)
+for the [Settings window](#the-settings-window), which changes every setting below and writes this file
+for you. Peekaboo › Open config.toml (`app.config_file`) creates the file if there is none and opens it
+in your default editor.
 
 - [Where the file lives](#where-the-file-lives)
+- [Later versions](#later-versions)
 - [Reloading and errors](#reloading-and-errors)
 - [The Settings window](#the-settings-window)
 - [Settings](#settings)
@@ -25,9 +29,37 @@ The first of these that is set wins:
 2. `$XDG_CONFIG_HOME/peekaboo/config.toml`
 3. `~/.config/peekaboo/config.toml`
 
-Peekaboo never writes the file on its own. It writes it when you change something in the Settings
-window, and `app.config_file` creates it when it does not exist yet. A symbolic link stays a link (the
-file it points to is written, with its permissions).
+Peekaboo writes the file when you change something in the Settings window, and `app.config_file`
+creates it when it does not exist yet. On its own it only brings a file it wrote up to date, a second
+after launch (never before the first image is on screen, never on the main thread), as
+[below](#later-versions); every other file is left as it is. A symbolic link stays a link (the file it
+points to is written, with its permissions), and every write is atomic.
+
+## Later versions
+
+Every setting and default key binding belongs to a **generation** of the file; the file records its
+own in `[keymap] generation`. When a later version adds settings or default keys (a new action's key),
+it raises the generation, and when it finds a file of an older one it appends, once:
+
+- each new setting the file does not have, with its default and comment;
+- each new default binding, unless the file already uses its key (in either table, `"none"` included)
+  or the key starts a sequence of the file or is the start of one (the vim layer's included, when it
+  is on). Until the file is written, the new binding applies already.
+
+The generation is then raised, so a binding you deleted never comes back, and nothing changes in
+effect: the file must load as the same configuration, or it is not written. A file whose values you
+changed keeps them, also when a later version changes a default: the file lists every value, so the
+value it lists is the one in effect.
+
+A starter file of an earlier version (every setting commented out, so it changes nothing) is
+rewritten as the full file, if it is exactly as that version wrote it (a byte order mark, CRLF line
+ends and blank lines at the end aside). Anything of yours keeps the file as it is: an active line, a
+comment you added, a commented-out value you changed, a line you deleted; and so does an error, or
+text that is not UTF-8. A file without a generation (a file of overrides of an earlier version, or one
+you wrote) gets nothing appended: the built-in keymap and the built-in defaults of a later version
+reach it as before. A full file with `[keymap] defaults = true` gets the same as one with `false`: its
+new keys work through the built-in keymap until then, and the file still lists every default key when
+you turn `defaults` off.
 
 ## Reloading and errors
 
@@ -52,8 +84,8 @@ skipped, the rest of the file is applied, and a toast names them with their line
 config.toml:3: ignored unknown key "view.fit" (+1 more)
 ```
 
-The starter file names the settings that are planned but not read yet (such as `[general]` `sort`)
-only in a comment, so uncommenting its settings never produces a warning.
+The file names the settings that are planned but not read yet (such as `[general]` `sort`) only in
+a comment, so it loads without a warning, and so does every example in it uncommented.
 
 ### TOML subset
 
@@ -73,9 +105,10 @@ Files (move/copy slots, open-with apps, ratings), Performance (memory, HDR decod
 trace logging) and Updates (`[updates]`, **Check Now** and the updater's status line, the version).
 
 The file stays the single source of truth. A change in the window is written at once as a minimal edit:
-only the changed line moves, your comments, order and spacing stay, and in the starter file the
-commented-out line of the setting is uncommented in place (`# background = "black"` becomes
-`background = "gray"`, its comment kept). A change that would leave the file with an error is not
+only the changed line moves, your comments, order and spacing stay, and the value is replaced in place,
+its comment kept (`background = "black"` becomes `background = "gray"`). An untouched starter file of an
+earlier version first becomes the full file; in a file of yours where a setting's line is commented out,
+that line is uncommented in place. A change that would leave the file with an error is not
 written, and while the file has an error (from an edit in your editor) the window shows it and waits
 until it is fixed; a file that is not UTF-8 text is never rewritten. Saving the file in an editor
 updates the window.
@@ -83,10 +116,23 @@ updates the window.
 **Keyboard.** Every action is listed with its keys, for the normal and the zoomed-in context. Click **+**
 and press the new keys (Esc cancels); recording matches the physical key like the viewer, so it works
 under any input method. A key another action uses is named (`F is used by “Full Screen”`); press it again
-(or click Move) to move it, which writes `"f" = "file.copy_name"`. A key that starts a sequence, or a
-sequence it starts, is freed the same way. A key's menu changes or removes it: removing a built-in key
-writes `"tab" = "none"`, removing your own deletes its entry. ↺ resets an action to its built-in keys and
-Reset All removes every entry of `[keys]` and `[keys.zoomed]`. Actions with an argument
+(or click Move) to move it. A key that starts a sequence, or a sequence it starts, is freed the same way.
+A key's menu changes or removes it, ↺ resets an action to its built-in keys, and Reset All resets them
+all. How the file changes depends on its [form](#key-bindings):
+
+- In the file Peekaboo writes, which lists the keymap: a new key joins its action's line
+  (`"view.fullscreen" = ["f", "return", "ctrl+cmd+f", "g"]`, or a new line for an action that has none),
+  removing a key deletes it from its line (the line too, when it was the last one), Change… puts the new
+  key in the old one's place, ↺ writes the action's default line back, and Reset All writes `[keys]` and
+  `[keys.zoomed]` anew with the default lines. A key the vim layer adds is removed with `"h" = "none"`;
+  where a line of the file holds a key of the vim layer (`"view.play_pause" = "k"`), removing or moving it
+  gives the key to the vim layer, as deleting it in an editor does.
+- In an older file of overrides (`defaults = true`): moving a key writes `"f" = "file.copy_name"`,
+  removing a built-in key writes `"tab" = "none"`, removing your own deletes its entry, and Reset All
+  removes every entry of `[keys]` and `[keys.zoomed]`.
+
+The first checkbox is `[keymap] defaults`: off (as Peekaboo writes the file), config.toml's keys are the
+whole keymap; on, the built-in shortcuts it does not list apply too. Actions with an argument
 (`file.move:keep`, `meta.rate:4`, `nav.jump:+5`, `exec:…`) are added by typing their id. Sequences
 (`"g g"`) are shown and can be removed, but are written in the file.
 
@@ -104,9 +150,10 @@ Reset All removes every entry of `[keys]` and `[keys.zoomed]`. Actions with an a
 | `[cache]` `memory_mb` | `"auto"` | decoded-image memory budget in MB (64–1048576), or `"auto"` to derive it from installed memory |
 | `[rating]` `storage` | `"finder-tags"` | `"finder-tags"` or `"none"` (turns `meta.*` actions and [picks](#picks) off) |
 | `[rating]` `star` | `"★"` | the character a rating is spelled with: 3 stars is the Finder tag `★★★` |
-| `[rating]` `auto_advance` | `false` | `true`: plain `0`–`9`, `p`, `x`, `u` also go to the next image (`shift+` always does) |
-| `[keymap]` `defaults` | `true` | `false` starts from an empty keymap: only your `[keys]` (and the vim layer, if on) apply |
-| `[keymap]` `vim` | `false` | add the [vim layer](#vim-layer) on top of the defaults |
+| `[rating]` `auto_advance` | `false` | `true`: plain `0`–`9`, `p`, `x`, `u` also go to the next image (`shift+` always does); in a file that lists the keymap (`defaults = false`) or that Peekaboo wrote (it has a `generation`), the file's own bindings of those keys to a rating, label or flag |
+| `[keymap]` `defaults` | `true` (`false` in the file Peekaboo writes) | `false`: the file's `[keys]` and `[keys.zoomed]` are the whole keymap (and the vim layer, if on); `true`: the built-in keymap, with `[keys]` on top (see [key bindings](#key-bindings)) |
+| `[keymap]` `vim` | `false` | add the [vim layer](#vim-layer): with `defaults = false` on the keys the file leaves free, with `true` on top of the built-in keymap |
+| `[keymap]` `generation` | none (`1` in the file Peekaboo writes) | which settings and default keys of later versions the file has; Peekaboo raises it when it appends them ([later versions](#later-versions)). Leave it as it is |
 | `[decode]` `hdr` | `false` | decode gain-map photos (iPhone HDR, Apple gain-map JPEG/HEIC) and PQ / HLG images (10-bit HDR HEIF from cameras, HDR AVIF and PNG) to HDR for EDR displays; 10–15× the decode time of the SDR picture. Off, PQ / HLG images show ImageIO's tone-mapped SDR rendition. Turning it on or off decodes the image on screen again. `PEEKABOO_HDR=1` turns it on regardless |
 | `[decode]` `fast_path` | `true` | decode through ImageIO's private IOSurface entry point (zero-copy, both hardware JPEG engines, native YCbCr for HEIF / AVIF); `false` uses the public path only, to compare or work around a decoding problem. `PEEKABOO_NO_IOSURFACE_SPI=1` turns it off regardless |
 | `[debug]` `trace` | `false` | timestamped trace lines on stderr (decode paths and times, scheduling, frames). `PEEKABOO_TRACE=1` turns it on regardless, from the first line of the launch |
@@ -115,8 +162,9 @@ Reset All removes every entry of `[keys]` and `[keys.zoomed]`. Actions with an a
 | `[slots]` *name* | none | a folder for `file.move:<name>` / `file.copy:<name>` (see [destinations](#move-and-copy)) |
 | `[apps]` *name* | none | an app for `file.open_with:<name>`: a bundle id, an app name or a path |
 
-`[slots]` named `1`…`9` are what `opt+1`…`opt+9` (move) and `opt+shift+1`…`opt+shift+9` (copy) use.
-`[apps] editor` is what `e` opens.
+`[slots]` named `1`…`9` are what `opt+1`…`opt+9` (move) and `opt+shift+1`…`opt+shift+9` (copy) use;
+a binding may name them whether they are set or not (unset, using one says so). `[apps] editor` is
+what `e` opens.
 
 ### Updates
 
@@ -151,10 +199,20 @@ Bindings live in two tables:
   `[keys]`. (`[keys.normal]` is accepted as another name for `[keys]`.)
 
 Each entry is `"chord" = "action"` or `"chord" = ["action", "action", …]`; a list runs its actions in
-order, so `"shift+3" = ["meta.rate:3", "nav.next"]` rates and advances. Your entries are applied on top
-of the default keymap: binding a chord the defaults use replaces it, and `"none"` removes a binding
-(`"tab" = "none"`). In `[keys.zoomed]`, `"none"` removes the zoomed binding, so the key falls back to
-`[keys]`.
+order, so `"shift+3" = ["meta.rate:3", "nav.next"]` rates and advances. `[keymap] defaults` says what
+the entries go on:
+
+- **`defaults = false`: the file is the whole keymap.** This is the file Peekaboo writes: every default
+  binding is a line of `[keys]` or `[keys.zoomed]`, grouped under short headings. Delete a line (or a key
+  from its list) to unbind it, change a key to move the binding, add a line for a new one. Nothing comes
+  from the code but the [vim layer](#vim-layer) when it is on, which goes on the keys the file leaves free,
+  and the default keys of [later versions](#later-versions).
+- **`defaults = true`: the built-in keymap, with your entries on top.** Binding a chord the defaults use
+  replaces it, and `"none"` removes a binding (`"tab" = "none"`). Files of earlier versions are read this
+  way (a file that does not set `defaults`), and so is a file you write from scratch.
+
+In `[keys.zoomed]`, a key that is not bound there falls back to `[keys]`; with `defaults = true`,
+`"none"` removes the zoomed binding, so the key falls back.
 
 **One action, several keys.** An entry may also be written the other way round, with the action as the
 key and one chord or a list of chords as the value:
@@ -275,6 +333,9 @@ Ids are `namespace.verb`, optionally followed by `:argument`.
 
 ## Default keymap
 
+The file Peekaboo writes lists exactly these, in `[keys]` and `[keys.zoomed]` (one line per action,
+`"nav.next" = ["right", "down", "space", "pagedown"]`, and one per key of an action list).
+
 | Action | Keys |
 |---|---|
 | `nav.next` | `right` `down` `space` `pagedown` |
@@ -333,7 +394,7 @@ keys for them if you use them:
 
 ### Vim layer
 
-`[keymap] vim = true` adds these on top of the defaults:
+`[keymap] vim = true` adds these keys; it stays a switch, never written out in the file:
 
 | Action | Keys |
 |---|---|
@@ -346,7 +407,12 @@ keys for them if you use them:
 | zoomed: `pan.left` `pan.down` `pan.up` `pan.right` | `h` `j` `k` `l` |
 | zoomed: `pan.edge:left` `bottom` `top` `right` | `H` `J` `K` `L` |
 
-The vim layer's `k` replaces `view.play_pause`; bind another key for it if you use both (`"s" = "view.play_pause"`).
+With `defaults = true` the vim layer goes on top of the built-in keymap, so its `k` replaces
+`view.play_pause`; bind another key for that if you use both (`"s" = "view.play_pause"`). In a file
+that lists the keymap (`defaults = false`) the vim layer goes under the file's lines: where the file
+binds a key, its line wins, so `"view.play_pause" = "k"` keeps `k`. Delete that line (or move the key,
+`"view.play_pause" = "s"`) to give `k` to the previous image, and write `"d d" = "none"` to remove a
+key of the vim layer.
 
 ## File actions in detail
 
@@ -498,6 +564,11 @@ default for one type or all of them; `app.make_default` (Peekaboo menu, or bind 
 of them, and so does Finder › Get Info › Open with › Change All….
 
 ## Examples
+
+Each example is a whole file on its own: what it does not set keeps its built-in default (no
+`[keymap] defaults`, so the built-in keymap is under its `[keys]`). In the file Peekaboo writes, change
+the same values in place instead, and add the bindings to its `[keys]`, where a key is bound once (move
+`"view.play_pause" = "k"` before binding `k` to something else).
 
 A culling setup: keepers and rejects next to the photos, one-key keep, rate-and-advance on plain keys.
 

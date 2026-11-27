@@ -126,8 +126,9 @@ Command line: `peekaboo <image-or-folder> …`, `peekaboo --version` (installed 
 Press ⌘, for Settings: every option (viewer, keyboard shortcuts, move/copy slots, apps, ratings, memory, HDR decoding,
 updates) and the default-viewer switch per image type. Settings writes `~/.config/peekaboo/config.toml`, changing only
 the lines it must and keeping your comments; the file is the single source of truth, so edits in your editor apply
-live and show in Settings too (Peekaboo › Open config.toml). See [docs/CONFIG.md](docs/CONFIG.md) for every option
-and action.
+live and show in Settings too (Peekaboo › Open config.toml). The file lists every setting at its default and the
+whole keymap, nothing hidden in the code; later versions append what they add. See [docs/CONFIG.md](docs/CONFIG.md)
+for every option and action.
 
 ## Build from source
 

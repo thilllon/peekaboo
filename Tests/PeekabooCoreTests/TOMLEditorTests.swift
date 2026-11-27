@@ -56,7 +56,7 @@ final class TOMLEditorTests: XCTestCase {
     }
 
     func testStarterFileGetsItsCommentedLinesUncommented() throws {
-        let starter = ConfigStore.sampleConfig
+        let starter = LegacyConfigFiles.releasedStarter
         let edited = try set(starter, "view", "background", .string("gray"))
         let change = changedLines(starter, edited)
         XCTAssertEqual(change.removed, ["# [view]", "# background = \"black\"          # black | gray | checker   (cycle with b)"])
@@ -105,7 +105,7 @@ final class TOMLEditorTests: XCTestCase {
             ("slots", "5", .string("~/Desktop/Five"), { $0.slots == ["5": "~/Desktop/Five"] }),
             ("apps", "viewer", .string("com.apple.Preview"), { $0.apps == ["viewer": "com.apple.Preview"] }),
         ]
-        let starter = ConfigStore.sampleConfig
+        let starter = LegacyConfigFiles.releasedStarter
         for (table, key, value, check) in cases {
             let edited = try set(starter, table, key, value)
             let config = try AppConfig(toml: edited)
@@ -202,7 +202,7 @@ final class TOMLEditorTests: XCTestCase {
     /// Example entries of `[slots]`, `[apps]` and `[keys]` describe their example value: a new entry never takes over
     /// such a line (or its comment); only the table header is uncommented.
     func testExampleLinesOfOpenTablesAreNotReused() throws {
-        let starter = ConfigStore.sampleConfig
+        let starter = LegacyConfigFiles.releasedStarter
         let edited = try set(starter, "slots", "3", .string("~/Desktop"))
         let change = changedLines(starter, edited)
         XCTAssertEqual(change.removed, ["# [slots]                       # destinations for file.move:<slot> / file.copy:<slot>; opt+N moves, opt+shift+N copies"])

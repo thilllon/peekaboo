@@ -25,40 +25,42 @@ extension KeyChord {
     public static func parseSequence(_ spec: String) throws -> [KeyChord] {
         // A lone space means the space bar.
         if spec == " " { return [KeyChord(key: "space")] }
-        let parts = spec.split(whereSeparator: { $0 == " " || $0 == "\t" })
+        // Split on the UTF-8 bytes of space and tab (they never occur inside another character's bytes): the config
+        // parses a hundred of these at launch, nearly all of them one chord.
+        if !spec.isEmpty, !spec.utf8.contains(where: { $0 == 0x20 || $0 == 0x09 }) { return [try parse(spec)] }
+        let parts = spec.utf8.split(whereSeparator: { $0 == 0x20 || $0 == 0x09 })
         guard !parts.isEmpty else { throw KeySpecError("empty key") }
-        return try parts.map { try parse(String($0)) }
+        return try parts.map { try parse(String(decoding: $0, as: UTF8.self)) }
     }
 
-    /// Parse one chord, with a descriptive error.
+    /// Parse one chord, with a descriptive error. Works on UTF-8 bytes (no lowercased copies, no grapheme counting).
     public static func parse(_ raw: String) throws -> KeyChord {
-        var rest = Substring(raw)
+        var rest = raw
         var modifiers: KeyModifiers = []
-        // Peel `mod+` prefixes; whatever remains (even "+" or "kp+") is the key.
+        // Peel `mod+` prefixes (ASCII names in any case); whatever remains (even "+" or "kp+") is the key.
         peel: while true {
-            for (name, modifier) in modifierNames {
-                let prefix = name + "+"
-                if rest.count > prefix.count, rest.lowercased().hasPrefix(prefix) {
-                    modifiers.insert(modifier)
-                    rest = rest.dropFirst(prefix.count)
-                    continue peel
-                }
+            let bytes = rest.utf8
+            for (prefix, modifier) in modifierPrefixes where bytes.count > prefix.count && hasPrefix(bytes, prefix) {
+                modifiers.insert(modifier)
+                rest = String(decoding: bytes.dropFirst(prefix.count), as: UTF8.self)
+                continue peel
             }
             break
         }
-        let token = String(rest)
+        let token = rest
         guard !token.isEmpty else { throw KeySpecError("empty key") }
-        if token.count == 1, let character = token.first, character.isASCII {
-            if character.isUppercase {
-                return KeyChord(key: character.lowercased(), modifiers: modifiers.union(.shift))
+        if token.utf8.count == 1, let byte = token.utf8.first, byte < 0x80 {
+            if byte >= 0x41, byte <= 0x5A {  // A–Z
+                return KeyChord(key: String(UnicodeScalar(byte + 0x20)), modifiers: modifiers.union(.shift))
             }
-            if let base = shiftedSymbols[character] {
-                return KeyChord(key: String(base), modifiers: modifiers.union(.shift))
-            }
-            if unshiftedKeys.contains(character) { return KeyChord(key: token, modifiers: modifiers) }
+            let base = shiftedBase[Int(byte)]
+            if base != 0 { return KeyChord(key: String(UnicodeScalar(base)), modifiers: modifiers.union(.shift)) }
+            if unshiftedBytes[Int(byte)] { return KeyChord(key: token, modifiers: modifiers) }
         }
-        let lower = token.lowercased()
-        if let name = namedKeyAliases[lower] ?? (namedKeys.contains(lower) ? lower : nil) {
+        let lower = token.utf8.contains(where: { $0 >= 0x41 && $0 <= 0x5A }) || !token.utf8.allSatisfy({ $0 < 0x80 })
+            ? token.lowercased() : token
+        // No alias is a key name: the names (the common case) first.
+        if let name = namedKeys.contains(lower) ? lower : namedKeyAliases[lower] {
             return KeyChord(key: name, modifiers: modifiers)
         }
         if token.contains("+") {
@@ -107,6 +109,20 @@ extension KeyChord {
         ("shift", .shift), ("⇧", .shift),
     ]
 
+    /// `modifierNames` as the UTF-8 bytes of `name+`.
+    private static let modifierPrefixes: [([UInt8], KeyModifiers)] = modifierNames.map { (Array(($0.0 + "+").utf8), $0.1) }
+
+    /// `bytes` starts with `prefix`, ASCII letters in any case (`prefix` is lowercase).
+    private static func hasPrefix(_ bytes: String.UTF8View, _ prefix: [UInt8]) -> Bool {
+        var index = bytes.startIndex
+        for expected in prefix {
+            let byte = bytes[index]
+            guard byte == expected || (byte >= 0x41 && byte <= 0x5A && byte + 0x20 == expected) else { return false }
+            index = bytes.index(after: index)
+        }
+        return true
+    }
+
     /// US-ANSI: shifted symbol → its unshifted key.
     static let shiftedSymbols: [Character: Character] = [
         "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7", "*": "8", "(": "9", ")": "0",
@@ -117,6 +133,18 @@ extension KeyChord {
 
     /// Unshifted printable keys of the US layout.
     static let unshiftedKeys: Set<Character> = Set("abcdefghijklmnopqrstuvwxyz0123456789-=[]\\;',./`")
+
+    /// `shiftedSymbols` and `unshiftedKeys` by ASCII byte, for `parse` (0: not a shifted symbol).
+    private static let shiftedBase: [UInt8] = {
+        var table = [UInt8](repeating: 0, count: 128)
+        for (symbol, base) in shiftedSymbols { table[Int(symbol.asciiValue!)] = base.asciiValue! }
+        return table
+    }()
+    private static let unshiftedBytes: [Bool] = {
+        var table = [Bool](repeating: false, count: 128)
+        for key in unshiftedKeys { table[Int(key.asciiValue!)] = true }
+        return table
+    }()
 
     /// Named keys reported by `KeyChord(event:)`.
     public static let namedKeys: Set<String> = {

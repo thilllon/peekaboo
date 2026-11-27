@@ -30,9 +30,9 @@ extension AppConfig {
     /// Parse a `config.toml` strictly: keys the file does not mention keep their built-in defaults, and
     /// `ConfigError` lists every unknown table, key, value, chord or action with its line.
     public init(toml text: String, fileName: String = "config.toml") throws {
-        let (config, warnings) = try Self.read(toml: text, fileName: fileName)
-        if !warnings.isEmpty { throw ConfigError(fileName: fileName, errors: warnings) }
-        self = config
+        let reading = try Self.read(toml: text, fileName: fileName)
+        if !reading.unknown.isEmpty { throw ConfigError(fileName: fileName, errors: reading.unknown) }
+        self = reading.config
     }
 
     /// Parse a `config.toml` the way the app loads it: unknown tables and keys (a typo, a setting from a
@@ -40,32 +40,59 @@ extension AppConfig {
     /// "view.fit"`, and the rest of the file applies. Throws `ConfigError` for everything else (bad
     /// values, chords, actions, TOML syntax), listing each problem with its line.
     public static func parse(toml text: String, fileName: String = "config.toml") throws -> (config: AppConfig, warnings: [String]) {
-        let (config, warnings) = try read(toml: text, fileName: fileName)
-        let sorted = warnings.sorted { ($0.line, $0.column) < ($1.line, $1.column) }
-        return (config, sorted.map { "\(fileName):\($0.line): ignored \($0.message)" })
+        let reading = try read(toml: text, fileName: fileName)
+        return (reading.config, reading.warnings(fileName: fileName))
     }
 
-    /// The config plus the skipped unknown tables and keys; throws for the other errors.
-    private static func read(toml text: String, fileName: String) throws -> (AppConfig, [TOMLError]) {
+    /// The config plus what the file holds (the skipped unknown tables and keys, its generation, the default bindings of
+    /// later generations it leaves the keys free for); throws for the other errors.
+    static func read(toml text: String, fileName: String = "config.toml", schema: ConfigSchema? = nil) throws -> ConfigReading {
         let document: TOMLDocument
         do {
             document = try TOMLDocument(parsing: text)
         } catch let error as TOMLError {
             throw ConfigError(fileName: fileName, errors: [error])
         }
-        var reader = ConfigReader()
+        var reader = ConfigReader(schema: schema)
         let config = reader.read(document)
         if !reader.errors.isEmpty { throw ConfigError(fileName: fileName, errors: reader.errors + reader.unknown) }
-        return (config, reader.unknown)
+        return ConfigReading(config: config, unknown: reader.unknown, document: document, generation: reader.generation,
+                             added: reader.added)
+    }
+}
+
+/// A config file read without errors: what it applies, and what an upgrade of it needs to know.
+struct ConfigReading {
+    let config: AppConfig
+    /// The unknown tables and keys it skipped.
+    let unknown: [TOMLError]
+    let document: TOMLDocument
+    /// `[keymap] generation`: which settings and default bindings of later versions a full file has (nil: none).
+    let generation: Int?
+    /// The default bindings of later generations on the keys a full file of an older generation leaves free, each with
+    /// those keys only: its keymap got them (`[keymap] defaults = false`), or has them through the built-in one (`true`).
+    let added: [Keymap.DefaultBinding]
+
+    func warnings(fileName: String) -> [String] {
+        unknown.sorted { ($0.line, $0.column) < ($1.line, $1.column) }.map { "\(fileName):\($0.line): ignored \($0.message)" }
     }
 }
 
 /// Maps a TOML document onto `AppConfig`, collecting errors instead of stopping at the first one.
 private struct ConfigReader {
+    /// The settings and default bindings of the version reading (nil: this one's, built only when a file of an older
+    /// generation needs its later bindings: never for a file of this generation at launch).
+    let schema: ConfigSchema?
     var errors: [TOMLError] = []
     /// Unknown tables and keys: skipped, so they are warnings when loading leniently.
     var unknown: [TOMLError] = []
     var config = AppConfig()
+    /// `keymap.generation`.
+    var generation: Int?
+    /// See `ConfigReading.added`.
+    var added: [Keymap.DefaultBinding] = []
+
+    init(schema: ConfigSchema?) { self.schema = schema }
 
     private static let tables: Set<[String]> = [
         ["view"], ["fullscreen"], ["hud"], ["cache"], ["rating"], ["keymap"], ["decode"], ["debug"], ["slots"], ["apps"],
@@ -87,18 +114,20 @@ private struct ConfigReader {
                                      message: "unknown table [\(table.path.joined(separator: "."))]"))
         }
         var keyEntries: [(entry: TOMLEntry, context: KeyContext, chord: String)] = []
+        keyEntries.reserveCapacity(document.entries.count)
         for entry in document.entries {
             let path = entry.path
-            let name = path.joined(separator: ".")
-            switch path.first {
-            case "keys":
+            if path.first == "keys" {
                 switch path.count {
                 case 2: keyEntries.append((entry, .normal, path[1]))
                 case 3 where path[1] == "zoomed": keyEntries.append((entry, .zoomed, path[2]))
                 case 3 where path[1] == "normal": keyEntries.append((entry, .normal, path[2]))
-                default: skip(entry, "unknown key \"\(name)\" (bindings go in [keys] or [keys.zoomed])")
+                default: skip(entry, "unknown key \"\(path.joined(separator: "."))\" (bindings go in [keys] or [keys.zoomed])")
                 }
                 continue
+            }
+            let name = path.joined(separator: ".")
+            switch path.first {
             case "slots", "apps":
                 guard path.count == 2 else { skip(entry, "unknown key \"\(name)\""); continue }
                 guard case .string(let value) = entry.value, !value.trimmingCharacters(in: .whitespaces).isEmpty else {
@@ -136,6 +165,7 @@ private struct ConfigReader {
             case "rating.auto_advance": if let v = bool(entry) { config.autoAdvance = v }
             case "keymap.defaults": if let v = bool(entry) { config.keymapDefaults = v }
             case "keymap.vim": if let v = bool(entry) { config.vimKeys = v }
+            case "keymap.generation": if let v = integer(entry, 1...1_000_000) { generation = v }
             case "decode.hdr": if let v = bool(entry) { config.decodeHDR = v }
             case "decode.fast_path": if let v = bool(entry) { config.fastPath = v }
             case "debug.trace": if let v = bool(entry) { config.trace = v }
@@ -151,12 +181,7 @@ private struct ConfigReader {
     }
 
     /// Every settings key, for hints about misplaced keys.
-    private static let settingKeys = [
-        "view.background", "view.keep_zoom", "view.zoom_step", "view.refine_delay_ms", "fullscreen.mode",
-        "fullscreen.avoid_notch", "hud.mode", "cache.memory_mb", "rating.storage", "rating.star",
-        "rating.auto_advance", "keymap.defaults", "keymap.vim", "decode.hdr", "decode.fast_path", "debug.trace",
-        "updates.check", "updates.auto_install",
-    ]
+    private static let settingKeys = ConfigFile.settings.map { "\($0.table).\($0.key)" } + ["keymap.defaults", "keymap.generation"]
 
     /// ` (it belongs under [view])` for a known key in the wrong table, ` (key bindings go under [keys])`
     /// for a chord outside `[keys]`.
@@ -171,19 +196,40 @@ private struct ConfigReader {
 
     // MARK: Keys
 
+    /// The file's bindings on top of the built-in layers `[keymap]` selects. With `defaults = false` (the file lists the
+    /// keymap) the vim layer is under the file's bindings; with `true`, the built-in keymap with the vim layer on top.
+    /// A full file of an older generation gets the default bindings of the later ones on the keys its own lines and the
+    /// vim layer leave free (in `added`, for `ConfigStore.upgradeFile` to write in); they apply at once with
+    /// `defaults = false`, and with `true` the built-in keymap has them already. `auto_advance` applies to the file's
+    /// plain rating, label and flag keys in a file that lists the keymap or that Peekaboo wrote (it has a generation);
+    /// an older file of overrides keeps its own entries as they are.
     private mutating func buildKeymap(_ entries: [(entry: TOMLEntry, context: KeyContext, chord: String)],
                                       defaults: Bool, vim: Bool, autoAdvance: Bool) -> Keymap {
-        var keymap = defaults && !vim && !autoAdvance ? Keymap.default
-            : Keymap.build(defaults: defaults, vim: vim, autoAdvance: autoAdvance)
+        var keymap = defaults && !vim && !autoAdvance && schema == nil ? Keymap.default
+            : Keymap.build(defaults ? schema?.bindings ?? Keymap.defaultBindings : [], vim: vim,
+                           autoAdvance: defaults && autoAdvance)
+        let older = generation.map { $0 < schema?.generation ?? ConfigFile.generation } ?? false
+        // With the built-in keymap under the file, the file's own lines and the vim layer: what later bindings must leave
+        // free (built only for a full file of an older generation, never at launch for one of this generation).
+        var own = older && defaults ? Keymap.build([], vim: vim, autoAdvance: false) : nil
         var lineOf: [KeyContext: [[KeyChord]: Int]] = [:]
+        func bind(_ sequence: [KeyChord], _ actions: [Action], _ entry: TOMLEntry, _ context: KeyContext) {
+            if let earlier = lineOf[context, default: [:]].updateValue(entry.line, forKey: sequence) {
+                lineOf[context]?[sequence] = earlier
+                fail(entry, "\"\(KeyChord.spec(of: sequence))\" is already bound on line \(earlier)")
+                return
+            }
+            keymap.bind(sequence, to: actions, context: context)
+            own?.bind(sequence, to: actions, context: context)
+        }
         for (entry, context, spec) in entries {
             // Two spellings: "chord" = action(s), or "action" = chord(s) to give one action several keys.
-            var bindings: [(sequence: [KeyChord], actions: [Action])] = []
             if let action = Action(id: spec) {
                 guard validate(action, entry), let specs = keySpecs(entry) else { continue }
+                let actions = [action]
                 for keys in specs {
                     do {
-                        bindings.append((try KeyChord.parseSequence(keys), [action]))
+                        bind(try KeyChord.parseSequence(keys), actions, entry, context)
                     } catch {
                         fail(entry, "\"\(keys)\": \(error)")
                     }
@@ -192,25 +238,42 @@ private struct ConfigReader {
                 do {
                     let sequence = try KeyChord.parseSequence(spec)
                     guard let actions = actions(entry) else { continue }
-                    bindings.append((sequence, actions))
+                    bind(sequence, actions, entry, context)
                 } catch {
                     fail(entry, "\"\(spec)\": \(error)"); continue
                 }
             }
-            for (sequence, actions) in bindings {
-                if let earlier = lineOf[context]?[sequence] {
-                    fail(entry, "\"\(KeyChord.spec(of: sequence))\" is already bound on line \(earlier)"); continue
-                }
-                lineOf[context, default: [:]][sequence] = entry.line
-                keymap.bind(sequence, to: actions, context: context)
+        }
+        if let generation, older {
+            if var own {
+                addLaterBindings(after: generation, to: &own, used: lineOf)
+            } else {
+                addLaterBindings(after: generation, to: &keymap, used: lineOf)
             }
         }
+        if autoAdvance, !defaults || generation != nil { keymap.applyAutoAdvance() }
         for conflict in keymap.conflicts() {
             let line = [conflict.sequence, conflict.prefix].compactMap { lineOf[.normal]?[$0] ?? lineOf[.zoomed]?[$0] }.first ?? 0
             errors.append(TOMLError(line: line, column: 1, message:
                 "\"\(KeyChord.spec(of: conflict.sequence))\" conflicts with \"\(KeyChord.spec(of: conflict.prefix))\" (a bound key cannot start a sequence; unbind it with \"none\")"))
         }
         return keymap
+    }
+
+    /// The default bindings of the generations after `generation`, bound in `keymap` on each of their keys that the file
+    /// does not mention (in either table, `"none"` included) and that no binding of `keymap` starts or is the start of
+    /// (the file's and the vim layer's), and listed in `added`.
+    private mutating func addLaterBindings(after generation: Int, to keymap: inout Keymap,
+                                           used: [KeyContext: [[KeyChord]: Int]]) {
+        for binding in (schema ?? .current).bindings where binding.generation > generation {
+            var keys: [String] = []
+            for (key, sequence) in zip(binding.keys, binding.sequences)
+            where used[.normal]?[sequence] == nil && used[.zoomed]?[sequence] == nil && keymap.leavesFree(sequence) {
+                keymap.bind(sequence, to: binding.actions, context: binding.context)
+                keys.append(key)
+            }
+            if !keys.isEmpty { added.append(Keymap.DefaultBinding(binding.context, binding.actions, keys, generation: binding.generation)) }
+        }
     }
 
     private mutating func actions(_ entry: TOMLEntry) -> [Action]? {
@@ -240,11 +303,12 @@ private struct ConfigReader {
         return actions
     }
 
-    /// Move/copy targets must be a path, `ask`, `last` or a slot defined under `[slots]`.
+    /// Move/copy targets must be a path, `ask`, `last`, a slot defined under `[slots]` or one of the slots 1…9 that the
+    /// default keys name (`FileOperations.isKnownTarget`).
     private mutating func validate(_ action: Action, _ entry: TOMLEntry) -> Bool {
         switch action {
         case .move(let target), .copy(let target), .copyPicks(let target):
-            if !FileOperations.isPathLike(target), target != "ask", target != "last", config.slots[target] == nil {
+            if !FileOperations.isKnownTarget(target, slots: config.slots) {
                 fail(entry, "unknown slot \"\(target)\" (add it under [slots])")
                 return false
             }

@@ -116,16 +116,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             self.viewer?.showEmpty(nil)
         }
         // In-app updates start a second after launch, behind the first frame and its sharp tier; the first check
-        // waits 10 s more. The first launch's folder-access prompts start then too, and a copy just installed from a disk
-        // image ejects the disk images then.
+        // waits 10 s more. The first launch's folder-access prompts start then too, a copy just installed from a disk
+        // image ejects the disk images then, and config.toml is brought up to date.
         if selfTest == nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
                 self?.startUpdates()
                 self?.watchDiskImages()
                 self?.requestFolderAccess()
                 self?.ejectDiskImages()
+                self?.upgradeConfigFile()
             }
         }
+    }
+
+    /// A second after launch, on the config store's queue: an untouched starter file of an earlier version becomes the
+    /// file of every setting and the whole keymap, and such a file of an older generation gets what later versions
+    /// added (`ConfigStore.upgradeFile`). Never headless: a test never writes a config file it did not make.
+    private func upgradeConfigFile() {
+        guard presentation == .interactive else { return }
+        configStore.upgradeFile()
     }
 
     /// From a second after launch: a newer Peekaboo on a disk image the user opens is staged on a utility queue, and

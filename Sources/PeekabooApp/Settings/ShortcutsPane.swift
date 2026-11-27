@@ -7,8 +7,11 @@ import PeekabooCore
 /// + (or a key's menu › Change…) records the next key press, matched by physical key like the viewer does
 /// (`KeyChord(event:)`), so recording works with any input method. Keys another action uses are named, and pressing
 /// them again moves them (so does Move); keys that start a sequence, or a sequence that starts with them, are freed
-/// the same way. Removing a built-in key writes `"chord" = "none"`. The rows come from `Action.simpleIDs` and from
-/// what the keymaps bind (parameterized actions, action lists), so new actions appear here without changes.
+/// the same way. Every change is a minimal edit of config.toml (`ConfigEditor`): in the file Peekaboo writes, which
+/// lists the keymap, a key goes into its action's line, removing it deletes it there, and Change… replaces it in place;
+/// in an older file of overrides, removing a built-in key writes `"chord" = "none"`. The rows come from
+/// `Action.simpleIDs` and from what the keymaps bind (parameterized actions, action lists), so new actions appear here
+/// without changes.
 final class ShortcutsPane: SettingsForm, SettingsPane, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
     struct Row: Equatable {
         let actions: [Action]
@@ -50,8 +53,8 @@ final class ShortcutsPane: SettingsForm, SettingsPane, NSTableViewDataSource, NS
     // MARK: Layout
 
     private func build() -> NSView {
-        let defaults = checkbox("Built-in shortcuts", "keymap", "defaults", default: true)
-        defaults.toolTip = "Off: only the keys below that you set (and the vim keys) apply."
+        let defaults = checkbox("Add built-in shortcuts config.toml does not list", "keymap", "defaults", default: true)
+        defaults.toolTip = "Off (as Peekaboo writes the file): [keys] in config.toml is the whole keymap, and the vim keys go where it leaves a key free. On: the built-in shortcuts apply, with [keys] on top."
         let vim = checkbox("Vim keys (h j k l, g g, G, d d, y y …)", "keymap", "vim", default: false)
         let layers = Self.hstack([defaults, vim], spacing: 20)
 
@@ -143,8 +146,11 @@ final class ShortcutsPane: SettingsForm, SettingsPane, NSTableViewDataSource, NS
         if let cached = cachedRows, cached.context == context, cached.added == added, cached.keymap == config.keymap {
             return cached.rows
         }
-        let builtIn = config.keymapDefaults && !config.vimKeys && !config.autoAdvance ? Keymap.default
-            : Keymap.build(defaults: config.keymapDefaults, vim: config.vimKeys, autoAdvance: config.autoAdvance)
+        // What "built-in keys" means for this file: the built-in keymap under the file's [keys], or, in a file that lists
+        // the keymap, the default lines it was written with (the vim layer under them).
+        let builtIn = !config.keymapDefaults ? Keymap.written(vim: config.vimKeys, autoAdvance: config.autoAdvance)
+            : !config.vimKeys && !config.autoAdvance ? Keymap.default
+            : Keymap.build(defaults: true, vim: config.vimKeys, autoAdvance: config.autoAdvance)
         let bound = config.keymap.bindingsByActions(context)
         let defaults = builtIn.bindingsByActions(context)
         var lists = Action.simpleIDs.compactMap(Action.init(id:)).filter { $0 != .none }.map { [$0] }
@@ -306,8 +312,11 @@ final class ShortcutsPane: SettingsForm, SettingsPane, NSTableViewDataSource, NS
         let taken = conflicts.map { $0.actions.map(KeyLabels.title).joined(separator: " + ") }
         model.edit({ editor in
             for conflict in conflicts where conflict.isPrefix { try editor.unbind(conflict.sequence, context: conflict.context) }
-            if let replacing { try editor.unbind(replacing, context: context) }
-            try editor.bind(sequence, to: actions, context: context)
+            if let replacing {
+                try editor.rebind(replacing, to: sequence, actions: actions, context: context)
+            } else {
+                try editor.bind(sequence, to: actions, context: context)
+            }
         }, done: { [weak self] in
             self?.showStatus("\(label) runs “\(title)”" + (taken.isEmpty ? "." : " (moved from “\(taken.joined(separator: "”, “"))”)."))
         })
@@ -341,7 +350,7 @@ final class ShortcutsPane: SettingsForm, SettingsPane, NSTableViewDataSource, NS
     func remove(_ sequence: [KeyChord], from row: Row) {
         let context = self.context
         let label = Self.label(sequence)
-        model.edit({ try $0.unbind(sequence, context: context) },
+        model.edit({ try $0.unbind(sequence, from: row.actions, context: context) },
                    done: { [weak self] in self?.showStatus("Removed \(label) from “\(row.title)”.") })
     }
 
@@ -360,7 +369,7 @@ final class ShortcutsPane: SettingsForm, SettingsPane, NSTableViewDataSource, NS
         }
         switch action {
         case .move(let target), .copy(let target), .copyPicks(let target):
-            guard FileOperations.isPathLike(target) || ["ask", "last"].contains(target) || model.config.slots[target] != nil else {
+            guard FileOperations.isKnownTarget(target, slots: model.config.slots) else {
                 showStatus("There is no destination “\(target)”: add it in Files › Move and copy destinations.")
                 return
             }
@@ -379,7 +388,9 @@ final class ShortcutsPane: SettingsForm, SettingsPane, NSTableViewDataSource, NS
     @objc private func confirmResetAll() {
         let alert = NSAlert()
         alert.messageText = "Reset all shortcuts?"
-        alert.informativeText = "This removes every entry of [keys] and [keys.zoomed] from config.toml: the built-in shortcuts apply again."
+        alert.informativeText = model.config.keymapDefaults
+            ? "This removes every entry of [keys] and [keys.zoomed] from config.toml: the built-in shortcuts apply again."
+            : "This writes [keys] and [keys.zoomed] of config.toml anew with the built-in shortcuts, in place of what they hold now."
         alert.addButton(withTitle: "Reset All")
         alert.addButton(withTitle: "Cancel")
         let reset: (NSApplication.ModalResponse) -> Void = { [weak self] response in

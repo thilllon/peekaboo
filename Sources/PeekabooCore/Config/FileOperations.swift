@@ -754,6 +754,15 @@ public final class FileOperations {
         target.contains("/") || target.hasPrefix("~") || target.hasPrefix(".")
     }
 
+    /// A `file.move:` / `file.copy:` / `file.copy_picks:` target a binding may name: a path, `ask`, `last`, a slot of
+    /// `slots`, or one of the slots 1…9, which the default keys (opt+N, opt+shift+N) name whether set or not (unset,
+    /// using one says so). Any other name is a typo of a slot.
+    public static func isKnownTarget(_ target: String, slots: [String: String]) -> Bool {
+        isPathLike(target) || target == "ask" || target == "last" || slots[target] != nil || numberedSlots.contains(target)
+    }
+
+    private static let numberedSlots: Set<String> = Set((1...9).map(String.init))
+
     /// The folder for a `file.move:` / `file.copy:` target: a slot name (looked up in `slots`) or a path.
     /// `~` expands; relative paths resolve against the image's folder. The result is absolute with every
     /// `.` and `..` resolved. Nil for an unknown slot or an empty target.

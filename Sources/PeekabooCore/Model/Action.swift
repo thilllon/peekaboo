@@ -1,3 +1,5 @@
+import Foundation
+
 /// Everything a key, gesture or menu item can trigger. The keymap maps chords
 /// (or chord sequences) to one action or a list of actions; the app executes them.
 ///
@@ -67,14 +69,17 @@ public enum Action: Hashable, Sendable {
 
     /// Parse a config id. Returns nil for unknown ids or invalid arguments.
     public init?(id raw: String) {
-        let id = raw.trimmingCharacters(in: .whitespaces)
+        // The config parses a hundred ids (and chords, which are not ids) at launch: trim only when there is something
+        // to trim, and look for the colon only when the bytes have one.
+        let id = Self.hasOuterWhitespace(raw) ? raw.trimmingCharacters(in: .whitespaces) : raw
         if let action = Action.simple[id] { self = action; return }
         if id.hasPrefix("exec:") {
             let command = String(id.dropFirst(5))
             guard !command.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
             self = .exec(command); return
         }
-        guard let colon = id.firstIndex(of: ":") else { return nil }
+        // An ASCII colon always starts a character: its UTF-8 index is a character index.
+        guard let colon = id.utf8.firstIndex(of: UInt8(ascii: ":")) else { return nil }
         let name = String(id[..<colon])
         let arg = String(id[id.index(after: colon)...])
         guard !arg.isEmpty else { return nil }
@@ -103,6 +108,15 @@ public enum Action: Hashable, Sendable {
             self = .flag(arg)
         default: return nil
         }
+    }
+
+    /// `raw` starts or ends with what `trimmingCharacters(in: .whitespaces)` removes.
+    private static func hasOuterWhitespace(_ raw: String) -> Bool {
+        func isWhitespace(_ scalar: Unicode.Scalar?) -> Bool {
+            guard let scalar else { return false }
+            return scalar.isASCII ? scalar == " " || scalar == "\t" : CharacterSet.whitespaces.contains(scalar)
+        }
+        return isWhitespace(raw.unicodeScalars.first) || isWhitespace(raw.unicodeScalars.last)
     }
 
     public static let labels = ["red", "orange", "yellow", "green", "blue", "purple", "gray", "none"]
