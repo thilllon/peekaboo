@@ -38,7 +38,8 @@ public enum FolderScanner {
     }
 
     /// What to browse for an opened URL: a folder lists its images; a file lists its siblings
-    /// and returns its own index. Several files browse exactly that set.
+    /// and returns its own index. Several URLs browse the images of every folder and file among them, in their order
+    /// (`BrowseSet`); that throws only when nothing is left to browse because a folder could not be listed.
     public static func browse(_ urls: [URL]) throws -> (files: [ImageFile], index: Int) {
         if urls.count == 1, let url = urls.first {
             if (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
@@ -46,10 +47,9 @@ public enum FolderScanner {
             }
             return opened(url, in: try scan(url.deletingLastPathComponent()))
         }
-        let files = urls.filter(isSupported).map { url in
-            ImageFile(url: url, name: url.lastPathComponent, byteSize: 0, modified: 0, fileID: 0)
-        }
-        return (files, 0)
+        let listing = BrowseSet.list(urls)
+        if listing.files.isEmpty, let failure = listing.failures.first { throw failure.error }
+        return (listing.files, 0)
     }
 
     /// The opened file's place in its folder's listing. The path as typed may differ from the name on disk in letter

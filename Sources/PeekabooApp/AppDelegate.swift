@@ -295,7 +295,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = true
         panel.allowedContentTypes = [.image]
-        panel.message = "Choose images or a folder"
+        panel.message = "Choose images or folders"
         panel.begin { [weak self] response in
             guard response == .OK, !panel.urls.isEmpty else { return }
             self?.open(panel.urls, dedupe: false)

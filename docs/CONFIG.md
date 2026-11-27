@@ -484,7 +484,9 @@ For culling a large shoot: pick with `p` (or `shift+p`, which picks and advances
 alone. There is no database: a pick is the Finder tag `Pick` on the file. Peekaboo reads the folder's tags once,
 in the background after the first image is on screen (about 40 ms for 5,000 photos), and keeps them current as
 you mark. When the folder changes, it reads only the files that are new, changed (another app saved them anew,
-which can drop their tags) or back (moved out and put back).
+which can drop their tags) or back (moved out and put back). With several folders open together (dropped or chosen
+together), the picks are those of every folder: the counter, the picks-only view and copying the picks work across
+them, in the order they browse, and a name two folders share is copied under a number.
 
 - **Counter.** While the folder has picks the HUD says how many: `IMG_0042.jpg · 42/5000 · Picks 37 · …`. It
   shows once the folder's tags are read.

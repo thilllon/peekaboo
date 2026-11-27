@@ -203,7 +203,33 @@ viewers score 21–26 dB and alias 10–25× more.
 ## 5. App & UX
 
 - One chrome-less window (transparent title bar, black background). Opening one file browses its folder in Finder
-  order; several files browse that set; a folder browses its images. Folder listing happens after the first pixel.
+  order; a folder browses its images; several URLs (dropped or chosen together, or given on the command line) browse
+  the images of every folder and file among them as one set. Folder listing happens after the first pixel.
+- Several folders (`BrowseSet`): each folder's images in Finder order, the folders in the order they came, the image
+  files among them at their place. Every file has one place: a folder reached again under any path (the same device
+  and inode) is listed once, at its first place; a file inside one of the folders is browsed with that folder, in its
+  order and under its rules (a hidden one stays out); any other file once, at its first place. The set lists item after
+  item, so the item of a file follows from its path (one dictionary lookup, which also knows each folder under the
+  other paths the listing met it by, a symbolic link or another letter case, and under its resolved paths, the ones
+  Finder opens its files by) and an item's files are found with two binary searches (~25 lookups for 6,000 files): a
+  rescan of one folder lists that folder alone and replaces its files only if they changed, and an undo puts a file
+  back among its folder's files in Finder order without sorting the whole set again. First pixel first: the first image
+  file before any folder (a video or a document may come before it) decodes before anything is listed; otherwise the
+  first folder is listed first (when every URL before it is a folder without images) and handed to the pipeline, so its
+  first image decodes while the same user-initiated thread lists the rest; at launch that first image (or folder) is in
+  the launch's turn, as one file's or folder's is. Nothing per URL on the main thread: another thread builds the set's
+  shape from the URLs alongside the listing (no file-system access) and hands it over with the image files before the
+  first folder as placeholders, so several files dropped together browse at once, before every one is `stat`ed (a
+  network volume makes that slow); the whole listing follows. The set is then a browsing set like a folder's: picks,
+  the picks-only view, copying every pick and file operations with undo work across it; each folder has its own vnode
+  watcher (the first 64: a descriptor each), whose rescans list that folder alone and merge it in. The photo on screen
+  moved by Finder to another folder of the set stays on screen (found by its file ID with `fsgetpath`, and that folder
+  lists with the same rescan), as a rename within one folder keeps it; Finder opening a file of the set that it has not
+  listed yet (new in a folder past the watched ones, or before the watcher's rescan) shows it within the set and lists
+  its folder again. A folder Peekaboo may not read shows its toast while the others are browsed (a set of nothing but
+  such folders says it in its message), is listed again when the window becomes key and joins once allowed; the HUD and
+  the title name the folder of the image on screen (`Trip › IMG_0042.jpg`) when the set spans folders. One file or one
+  folder never takes this path: their open is the same code as before.
 - Keys: one `NSEvent` local monitor; chords match the **physical key** through the ASCII-capable layout, so
   bindings work under the Korean input method. Keymap contexts `normal` / `zoomed`, chord sequences ("g g").
 - Navigation never shows a blank frame or spinner: the title/HUD switches to the target in the same frame; the
