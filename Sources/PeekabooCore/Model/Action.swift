@@ -21,6 +21,8 @@ public enum Action: Hashable, Sendable {
     case playPause, frameNext, framePrevious
     /// Toggle the picks-only view: browse only the photos flagged Pick (the folder's order).
     case picksOnly
+    /// Open or close the image list at the right edge of the window (every image of the browsing set).
+    case imageList
     // file
     case trash, delete, reveal, copyPath, copyName, copyImage, openWithChooser
     /// Move / copy the current file: a slot name, a path (`~` and `./relative` allowed), `ask` or `last`.
@@ -55,7 +57,7 @@ public enum Action: Hashable, Sendable {
         "view.rotate_cw": .rotateClockwise, "view.rotate_ccw": .rotateCounterClockwise,
         "view.flip_h": .flipHorizontal, "view.flip_v": .flipVertical,
         "view.play_pause": .playPause, "view.frame_next": .frameNext, "view.frame_prev": .framePrevious,
-        "view.picks_only": .picksOnly,
+        "view.picks_only": .picksOnly, "view.image_list": .imageList,
         "file.trash": .trash, "file.delete": .delete, "file.reveal": .reveal, "file.copy_path": .copyPath,
         "file.copy_name": .copyName, "file.copy_image": .copyImage, "file.open_with_chooser": .openWithChooser,
         "app.undo": .undo, "app.redo": .redo, "app.config": .config, "app.config_file": .configFile,

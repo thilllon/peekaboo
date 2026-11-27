@@ -385,6 +385,23 @@ final class SettingsWindowTests: ViewerTestCase {
         }
     }
 
+    /// The image list's action is listed under View with its built-in key, and that key is named when it is recorded for
+    /// another action.
+    func testTheImageListActionIsListedWithItsKey() throws {
+        let controller = try makeController(toml: "")
+        let pane = shortcuts(controller)
+        let row = try XCTUnwrap(pane.rows().first { $0.actions == [.imageList] })
+        XCTAssertEqual(row.group, "view")
+        XCTAssertEqual(row.title, "Show Image List")
+        XCTAssertEqual(row.id, "view.image_list")
+        XCTAssertEqual(row.sequences, [try KeyChord.parseSequence("t")])
+        XCTAssertFalse(row.modified)
+        pane.record([.copyName])
+        pane.recorded(key(controller.window, kVK_ANSI_T, "t"))
+        XCTAssertTrue(pane.status.stringValue.contains("T is used by “Show Image List”"), pane.status.stringValue)
+        pane.cancelRecording()
+    }
+
     /// The window handles text editing shortcuts itself (the app menu has no Edit › Paste), and ⌘W closes it rather
     /// than the viewer.
     func testCommandWClosesTheSettingsWindow() throws {

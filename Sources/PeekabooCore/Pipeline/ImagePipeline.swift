@@ -394,6 +394,13 @@ public final class ImagePipeline {
 
     // MARK: Introspection (tests, bench, HUD)
 
+    /// The `.preview` tier of `file` when it is cached: the image list makes its thumbnail from it, without reading or
+    /// decoding the file.
+    public func preview(for file: ImageFile) -> DecodedImage? {
+        guard let i = slotIndex(of: file) else { return nil }
+        return slots[i].preview
+    }
+
     /// Tiers of `file` currently cached.
     public func cachedTiers(for file: ImageFile) -> [Tier] {
         guard let i = slotIndex(of: file) else { return [] }

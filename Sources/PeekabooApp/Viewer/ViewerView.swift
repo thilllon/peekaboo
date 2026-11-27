@@ -47,12 +47,26 @@ final class PresentationTrackingLayer: CAMetalLayer {
 }
 
 /// Window content: black, hosts the viewer view (inset below the notch in instant full
-/// screen) and accepts dropped files and folders anywhere in the window.
+/// screen) and the panel at its right edge (the image list), and accepts dropped files and
+/// folders anywhere in the window.
 final class ViewerRootView: NSView {
     weak var delegate: ViewerViewDelegate?
     let viewerView: ViewerView
     /// Top inset for the image area (camera housing in notch-aware full screen).
     var topInset: CGFloat = 0 { didSet { if topInset != oldValue { needsLayout = true; layoutSubtreeIfNeeded() } } }
+    /// Width given to the panel at the right edge; the viewer view gets the rest (it refits the image). Set before
+    /// the panel exists, it keeps the room for it (the image list open at launch is built once the image is sharp).
+    var sidebarWidth: CGFloat = 0 { didSet { if sidebarWidth != oldValue { needsLayout = true; layoutSubtreeIfNeeded() } } }
+    /// The panel at the right edge, `sidebarWidth` wide; hidden while that is 0.
+    var sidebar: NSView? {
+        didSet {
+            guard sidebar !== oldValue else { return }
+            oldValue?.removeFromSuperview()
+            if let sidebar { addSubview(sidebar) }
+            needsLayout = true
+            layoutSubtreeIfNeeded()
+        }
+    }
     private var trackingArea: NSTrackingArea?
     private var dropHighlight = false { didSet { updateDropHighlight() } }
 
@@ -74,7 +88,19 @@ final class ViewerRootView: NSView {
 
     override func layout() {
         super.layout()
-        let frame = NSRect(x: 0, y: topInset, width: bounds.width, height: max(bounds.height - topInset, 1))
+        // At most half the window: the image keeps the larger part.
+        let side = min(sidebarWidth, (bounds.width / 2).rounded(.down))
+        let height = max(bounds.height - topInset, 1)
+        let frame = NSRect(x: 0, y: topInset, width: max(bounds.width - side, 1), height: height)
+        // The panel first: resizing the viewer view refits the image and updates the panel, at its new size.
+        if let sidebar {
+            // Closed, the panel keeps its frame (nothing to lay out again) and is hidden.
+            if side > 0 {
+                let panel = NSRect(x: frame.maxX, y: topInset, width: side, height: height)
+                if sidebar.frame != panel { sidebar.frame = panel }
+            }
+            if sidebar.isHidden != (side == 0) { sidebar.isHidden = side == 0 }
+        }
         if viewerView.frame != frame { viewerView.frame = frame }
     }
 

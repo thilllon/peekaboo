@@ -35,7 +35,7 @@ final class KeymapTests: XCTestCase {
             ("shift+6", [.label("red"), .next]), ("shift+9", [.label("blue"), .next]),
             ("p", [.flag("pick")]), ("x", [.flag("reject")]), ("u", [.flag("none")]),
             ("shift+p", [.flag("pick"), .next]), ("shift+x", [.flag("reject"), .next]), ("shift+u", [.flag("none"), .next]),
-            ("v", [.picksOnly]), ("shift+c", [.copyPicks("ask")]),
+            ("v", [.picksOnly]), ("shift+c", [.copyPicks("ask")]), ("t", [.imageList]),
             ("cmd+,", [.config]), ("?", [.help]), ("cmd+/", [.help]), ("cmd+w", [.close]), ("q", [.close]),
             ("cmd+q", [.quit]), ("cmd+o", [.open]),
         ]
@@ -148,6 +148,27 @@ final class KeymapTests: XCTestCase {
         }
         let picks = try config("[slots]\nselects = \"~/Selects\"\n[keys]\n\"k\" = \"file.copy_picks:selects\"\n").keymap
         XCTAssertEqual(resolve(picks, "k"), .actions([.copyPicks("selects")]))
+    }
+
+    /// `t` (the image list) is bound once, in the default layer: no other layer or context uses it, alone or to start a
+    /// sequence (vim, auto-advance, the zoomed table, which falls back to it).
+    func testTheImageListKeyIsFreeInEveryLayer() throws {
+        let t = seq("t")
+        for (vim, autoAdvance) in [(false, false), (true, false), (false, true), (true, true)] {
+            let map = Keymap.build(defaults: true, vim: vim, autoAdvance: autoAdvance)
+            let layer = "vim \(vim), auto-advance \(autoAdvance)"
+            XCTAssertEqual(map.resolve(t, context: .normal), .actions([.imageList]), layer)
+            XCTAssertEqual(map.resolve(t, context: .zoomed), .actions([.imageList]), layer)
+            XCTAssertNil(map.bindings[.zoomed]?[t], layer)
+            let others = map.bindings.values.flatMap { $0 }
+                .filter { $0.value != [.imageList] && $0.key.contains { $0.key == "t" } }
+            XCTAssertTrue(others.isEmpty, "\(layer): \(others.map { KeyChord.spec(of: $0.key) })")
+            XCTAssertEqual(map.sequences(for: .imageList), [t], layer)
+            XCTAssertTrue(map.conflicts().isEmpty, layer)
+        }
+        XCTAssertEqual(Keymap.build(defaults: false, vim: true, autoAdvance: false).resolve(t, context: .normal), .unbound)
+        // The starter file's examples leave it alone.
+        XCTAssertEqual(try config(ConfigStore.sampleTemplate).keymap.resolve(t, context: .normal), .actions([.imageList]))
     }
 
     func testDefaultsOffStartsEmpty() throws {

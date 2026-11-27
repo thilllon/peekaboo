@@ -234,7 +234,16 @@ Ids are `namespace.verb`, optionally followed by `:argument`.
 | `view.play_pause` | play or pause an animation (GIF, APNG, WebP, HEIC / AVIF sequence); after its last loop, play again |
 | `view.frame_next`, `view.frame_prev` | pause the animation and step one frame (wraps around; hold to keep stepping) |
 | `view.picks_only` | browse only the photos flagged Pick, or every photo again (see [picks](#picks)) |
+| `view.image_list` | open or close the image list at the right edge of the window (below) |
 | `view.help` | the key cheat sheet |
+
+The **image list** (`view.image_list`, `t`, View › Show Image List) shows every image being browsed at the right
+edge of the window, with its thumbnail and name; picks carry a ⚑, and in the picks-only view it lists the picks. The
+image on screen is the selected row and stays in view; a click on a row shows that image. Opening it narrows the image
+area and the image refits (nothing is decoded again). It is built the first time you open it, and whether it is open is
+remembered across launches, in Peekaboo's defaults (`PeekabooImageListOpen`), not in this file. Thumbnails are made in
+the background, for the rows on screen only, from the viewer's own previews or the files' embedded previews where they
+have one.
 
 ### Files
 
@@ -292,6 +301,7 @@ Ids are `namespace.verb`, optionally followed by `:argument`.
 | `app.escape` | `esc` |
 | `view.hud` / `view.hud_hide` | `i` / `tab` |
 | `view.background` | `b` |
+| `view.image_list` | `t` |
 | `view.rotate_cw` / `view.rotate_ccw` | `r` `cmd+r` `>` / `shift+r` `cmd+l` `<` |
 | `view.flip_h` / `view.flip_v` | `\|` / `_` |
 | `view.play_pause` / `view.frame_prev` / `view.frame_next` | `k` / `,` / `.` |
