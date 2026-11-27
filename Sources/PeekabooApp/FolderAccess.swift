@@ -15,6 +15,10 @@ import PeekabooCore
 /// that touched its folder until it is answered. Only when LaunchServices started the app from its bundle: never in
 /// tests (`.headless`), the self-test, scripted runs (`PEEKABOO_ACTIONS` set, even empty), a run from a shell or
 /// outside an app bundle.
+///
+/// Each prompt is a window of UserNotificationCenter, which comes to the front with it and keeps the keyboard; after
+/// the last one it stays in front with no window, so a key pressed then (⌘O to open a folder) reaches no app (#92).
+/// `start` therefore says on the main thread when the listing has ended, and the app delegate takes the front back.
 struct FolderAccessRequest {
     /// Set once every folder was listed, whatever the answers: later launches ask nothing.
     static let doneKey = "PeekabooFolderAccessRequested"
@@ -50,8 +54,9 @@ struct FolderAccessRequest {
             && bundleURL.pathExtension == "app" && !isDone()
     }
 
-    /// Lists the folders on a utility queue when `shouldRequest`, then sets the flag; returns whether it started.
-    func start(presentation: Presentation, selfTest: Bool) -> Bool {
+    /// Lists the folders on a utility queue when `shouldRequest`, then sets the flag and calls `finished` on the main
+    /// queue (every prompt has been answered by then); returns whether it started.
+    func start(presentation: Presentation, selfTest: Bool, finished: @escaping () -> Void = {}) -> Bool {
         guard shouldRequest(presentation: presentation, selfTest: selfTest) else { return false }
         let folders = Self.folders, touch = touch, markDone = markDone
         DispatchQueue.global(qos: .utility).async {
@@ -62,8 +67,19 @@ struct FolderAccessRequest {
                                  readable ? "readable" : "not readable", Trace.ms(since: started)))
             }
             markDone()
+            DispatchQueue.main.async(execute: finished)
         }
         return true
+    }
+
+    /// What the app does once the listing has ended (`start`'s `finished`): take the front back only from
+    /// UserNotificationCenter (the prompts' app, left in front with no window) or from itself, never from an app the
+    /// user went to meanwhile; and with nothing opened yet, show the open panel, which is what the first launch was
+    /// for (the user may have pressed ⌘O while a prompt had the keyboard).
+    static func afterListing(frontmost: String?, ownIdentifier: String?, openedSomething: Bool)
+        -> (activate: Bool, openPanel: Bool) {
+        let mayActivate = frontmost == nil || frontmost == "com.apple.UserNotificationCenter" || frontmost == ownIdentifier
+        return (mayActivate, mayActivate && !openedSomething)
     }
 
     /// Reads the names in `folder`: the access macOS asks about.

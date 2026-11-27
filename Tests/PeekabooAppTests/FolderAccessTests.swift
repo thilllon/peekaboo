@@ -198,6 +198,71 @@ final class FolderAccessTests: XCTestCase {
         XCTAssertTrue(FolderAccessRequest().scripted)
     }
 
+    /// Once every folder is listed (every prompt answered) and the flag set, `finished` comes once, on the main queue:
+    /// the app delegate takes the front back from the prompts there (#92).
+    func testFinishedComesOnTheMainQueueOnceEveryFolderIsListed() {
+        let lock = NSLock()
+        var touched = 0
+        let request = firstLaunch { _ in
+            lock.lock()
+            touched += 1
+            lock.unlock()
+            return true
+        }
+        var calls = 0
+        var onMain = false
+        var listedBefore = 0
+        var flaggedBefore = false
+        let finished = expectation(description: "finished")
+        XCTAssertTrue(request.start(presentation: .interactive, selfTest: false) {
+            calls += 1
+            onMain = Thread.isMainThread
+            lock.lock()
+            listedBefore = touched
+            lock.unlock()
+            flaggedBefore = self.flag.isSet
+            finished.fulfill()
+        })
+        wait(for: [finished], timeout: 5)
+        let later = expectation(description: "nothing more")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { later.fulfill() }
+        wait(for: [later], timeout: 5)
+        XCTAssertEqual(calls, 1)
+        XCTAssertTrue(onMain, "finished must come on the main queue")
+        XCTAssertEqual(listedBefore, FolderAccessRequest.folders.count, "finished before every folder was listed")
+        XCTAssertTrue(flaggedBefore, "finished before the flag was set")
+    }
+
+    /// A launch that asks nothing (asked before, headless, scripted, the self-test) never calls `finished`.
+    func testFinishedNeverComesWhenNothingIsAsked() {
+        flag.set()
+        var calls = 0
+        let request = firstLaunch { _ in true }
+        XCTAssertFalse(request.start(presentation: .interactive, selfTest: false) { calls += 1 })
+        XCTAssertFalse(firstLaunch { _ in true }.start(presentation: .headless, selfTest: false) { calls += 1 })
+        let later = expectation(description: "past a listing")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { later.fulfill() }
+        wait(for: [later], timeout: 5)
+        XCTAssertEqual(calls, 0)
+    }
+
+    /// After the listing the app takes the front back only from UserNotificationCenter (the prompts' app, left in front
+    /// with no window) or from itself, never from an app the user went to meanwhile; with nothing opened yet it shows
+    /// the open panel too.
+    func testAfterTheListingTheAppTakesTheFrontBackFromThePromptsOnly() {
+        let own = "com.thilllon.Peekaboo"
+        func next(_ frontmost: String?, opened: Bool) -> [Bool] {
+            let next = FolderAccessRequest.afterListing(frontmost: frontmost, ownIdentifier: own, openedSomething: opened)
+            return [next.activate, next.openPanel]
+        }
+        XCTAssertEqual(next("com.apple.UserNotificationCenter", opened: false), [true, true])
+        XCTAssertEqual(next("com.apple.UserNotificationCenter", opened: true), [true, false], "a folder is open already")
+        XCTAssertEqual(next(own, opened: false), [true, true])
+        XCTAssertEqual(next(nil, opened: false), [true, true])
+        XCTAssertEqual(next("com.google.Chrome", opened: false), [false, false], "the user went to another app")
+        XCTAssertEqual(next("com.apple.finder", opened: true), [false, false])
+    }
+
     /// The default listing reads a folder's names (temporary folders here, never a protected one).
     func testTheListingReadsTheFolder() throws {
         let folder = FileManager.default.temporaryDirectory
@@ -256,6 +321,15 @@ final class FolderAccessTests: XCTestCase {
 /// A folder Peekaboo may not list: the opened image shows on its own and says why and how to allow it, at the ends of
 /// the set too, and the folder lists again once it is allowed and the window becomes key.
 final class UnreadableFolderTests: ViewerTestCase {
+    /// A headless app delegate (tests) neither activates nor shows the open panel when the first launch's listing ends:
+    /// this test case fails if the process activates or a window comes on screen.
+    func testTheAppDelegateDoesNothingHeadlessWhenTheListingEnds() {
+        let delegate = AppDelegate()
+        delegate.presentation = .headless
+        delegate.folderAccessFinished(frontmost: "com.apple.UserNotificationCenter")
+        XCTAssertFalse(NSApp.windows.contains { $0 is NSOpenPanel })
+    }
+
     /// `count` images in `folder`, which then lists no more (-wx--x--x: the images open by name, the listing fails
     /// with EACCES; macOS privacy protection refuses with EPERM). Skipped where permissions are not enforced.
     private func refusedFolder(_ count: Int) throws -> (urls: [URL], refusal: String) {
