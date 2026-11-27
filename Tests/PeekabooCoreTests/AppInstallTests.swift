@@ -580,6 +580,46 @@ final class AppInstallTests: XCTestCase {
                        [], "this user's image holding a file shown stays as before")
     }
 
+    func testAVolumeIsWhatItsMountTableEntrySays() {
+        // Entries made by hand: nothing is mounted. The ejector and the disk-image scan rely on `isReadOnly` and `isLocal`
+        // to leave writable drives and network shares alone, and the CI test's real image is read-only and local, so only
+        // entries like these tell whether each is read from its own bit, whatever else is set.
+        func entry(_ path: String, flags: Int32, owner: uid_t) -> statfs {
+            var entry = statfs()
+            entry.f_flags = UInt32(bitPattern: flags)
+            entry.f_owner = owner
+            withUnsafeMutableBytes(of: &entry.f_mntonname) { $0.copyBytes(from: Array(path.utf8)) }
+            withUnsafeMutableBytes(of: &entry.f_mntfromname) { $0.copyBytes(from: Array("/dev/disk9s1".utf8)) }
+            return entry
+        }
+        let url = URL(fileURLWithPath: "/Volumes/Peekaboo 20261126-517cb0", isDirectory: true)
+        let me = getuid(), other = Self.anotherUser
+        func volume(readOnly: Bool, local: Bool, owner: uid_t) -> AppInstall.Volume {
+            AppInstall.Volume(url: url, isReadOnly: readOnly, isLocal: local, owner: owner)
+        }
+        XCTAssertEqual(AppInstall.Volume(entry(url.path, flags: MNT_RDONLY | MNT_LOCAL, owner: me)),
+                       volume(readOnly: true, local: true, owner: me), "a disk image")
+        XCTAssertEqual(AppInstall.Volume(entry(url.path, flags: MNT_LOCAL, owner: other)),
+                       volume(readOnly: false, local: true, owner: other), "a writable drive")
+        XCTAssertEqual(AppInstall.Volume(entry(url.path, flags: MNT_RDONLY, owner: 0)),
+                       volume(readOnly: true, local: false, owner: 0), "a network share")
+        // A disk image has more flags (`MNT_NOSUID`, `MNT_IGNORE_OWNERSHIP`, `MNT_QUARANTINE`, …): none of them counts.
+        let rest = ~(MNT_RDONLY | MNT_LOCAL)
+        XCTAssertEqual(AppInstall.Volume(entry(url.path, flags: rest, owner: me)),
+                       volume(readOnly: false, local: false, owner: me), "every other flag")
+        XCTAssertEqual(AppInstall.Volume(entry(url.path, flags: rest | MNT_RDONLY | MNT_LOCAL, owner: me)),
+                       volume(readOnly: true, local: true, owner: me), "every flag")
+        // The mount point, not the device, in UTF-8 as the kernel keeps it.
+        let named = URL(fileURLWithPath: "/Volumes/Photos d’été – 2026", isDirectory: true)
+        XCTAssertEqual(AppInstall.Volume(entry(named.path, flags: MNT_RDONLY | MNT_LOCAL, owner: me)).url, named)
+
+        // A real entry: the scratch folder's volume is writable and local.
+        var scratch = statfs()
+        XCTAssertEqual(statfs(directory.path, &scratch), 0)
+        XCTAssertFalse(AppInstall.Volume(scratch).isReadOnly)
+        XCTAssertTrue(AppInstall.Volume(scratch).isLocal)
+    }
+
     // MARK: Processes
 
     func testFindsTheProcessesThatRunABundle() throws {

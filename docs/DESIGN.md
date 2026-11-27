@@ -284,7 +284,7 @@ viewers score 21–26 dB and alias 10–25× more.
   Removable Volumes permission) with a Peekaboo.app of this identifier at its top, and holds no file it shows
   (`NSWorkspace.unmountAndEjectDevice`: 86 ms; an image still in use fails after ~1 s with `fBsyErr` and is tried
   once more 2 s later). Who mounted a volume comes with the list: one copy of the mount table (`getmntinfo_r_np`,
-  waiting for no file system: 2.1–2.3 µs, where `FileManager.mountedVolumeURLs` took 6.3–6.6 µs and 2.5–19 ms on its
+  waiting for no file system: 2.1–2.3 µs, where `FileManager.mountedVolumeURLs` took 6.3–7.6 µs and 2.5–19 ms on its
   first call) gives each volume's flags and `f_owner`, the uid that mounted it (0 for the system's; `st_uid` on a disk
   image, mounted with `MNT_IGNORE_OWNERSHIP`, shows whoever looks). Another account's images are neither asked about
   nor read, and the copies quit are this session's (`NSRunningApplication`): with two accounts logged in at once, the

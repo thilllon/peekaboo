@@ -340,7 +340,7 @@ public enum AppInstall {
     /// The mounted volumes that are not hidden (`MNT_DONTBROWSE`: a disk image attached with `-nobrowse`, `/dev`,
     /// `/System/Volumes/…`), from one copy of the mount table (`getmntinfo_r_np`) that waits for no file system, so a
     /// network share that does not answer holds nothing up. 2.1–2.3 µs (M4 Pro, release build); the list read before,
-    /// `FileManager.mountedVolumeURLs` and two resource values, took 6.3–6.6 µs, and 2.5–19 ms on a first call.
+    /// `FileManager.mountedVolumeURLs` and two resource values, took 6.3–7.6 µs, and 2.5–19 ms on a first call.
     public static func mountedVolumes() -> [Volume] {
         var table: UnsafeMutablePointer<statfs>?
         let count = getmntinfo_r_np(&table, MNT_NOWAIT)
