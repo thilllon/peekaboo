@@ -279,11 +279,17 @@ viewers score 21–26 dB and alias 10–25× more.
   `--eject-disk-images=<pid>` (it never installs again; `--kept-newer` when nothing was installed), sends the files
   opened meanwhile after them, and quits. A second after launch, on a utility queue, the installed copy waits for that
   process to exit, quits the older Peekaboo copies that run from a disk image, and ejects every read-only local volume
-  under `/Volumes` that is a disk image (DiskArbitration's device model, 0.24–0.41 ms, asked before anything on the
-  volume is read: never an NTFS drive or a locked card, whose first read may have macOS ask for the Removable Volumes
-  permission) with a Peekaboo.app of this identifier at its top, and holds no file it shows
+  under `/Volumes` that this user mounted, is a disk image (DiskArbitration's device model, 0.24–0.41 ms, asked before
+  anything on the volume is read: never an NTFS drive or a locked card, whose first read may have macOS ask for the
+  Removable Volumes permission) with a Peekaboo.app of this identifier at its top, and holds no file it shows
   (`NSWorkspace.unmountAndEjectDevice`: 86 ms; an image still in use fails after ~1 s with `fBsyErr` and is tried
-  once more 2 s later). One toast says which version is installed where and names the images left. If the install
+  once more 2 s later). Who mounted a volume comes with the list: one copy of the mount table (`getmntinfo_r_np`,
+  waiting for no file system: 2.1–2.3 µs, where `FileManager.mountedVolumeURLs` took 6.3–6.6 µs and 2.5–19 ms on its
+  first call) gives each volume's flags and `f_owner`, the uid that mounted it (0 for the system's; `st_uid` on a disk
+  image, mounted with `MNT_IGNORE_OWNERSHIP`, shows whoever looks). Another account's images are neither asked about
+  nor read, and the copies quit are this session's (`NSRunningApplication`): with two accounts logged in at once, the
+  copy installed in one had ejected an image the other opened and tried to unmount the one the other's Peekaboo ran
+  from (#90). One toast says which version is installed where and names the images left. If the install
   or the start fails, the copy launches as usual, with a toast that gives the reason on its own line. Tests
   (headless), `--selftest` and `PEEKABOO_ACTIONS` never install or eject.
 - A newer Peekaboo opened while one runs (`DiskImageUpdate`): the downloaded copy is quarantined and was never opened,
@@ -292,7 +298,7 @@ viewers score 21–26 dB and alias 10–25× more.
   after launch, next to the updater, it is created (0.15–0.25 ms of main-thread time once, about what the updater's own
   setup costs right before it; 11–17 µs warm); its two workspace observers are registered on its utility queue, because
   on the main thread they cost 0.9–1.8 ms (0.21–0.32 ms CPU, the rest waiting on the system). On every mount, and once
-  for the volumes mounted already 2 s later, the queue looks at the disk images under `/Volumes` it has not seen
+  for the volumes mounted already 2 s later, the queue looks at this user's disk images under `/Volumes` not seen yet
   (read-only local volumes whose device DiskArbitration calls a disk image, then one `Info.plist` each: a locked card, a
   read-only drive or a network share is never read, so macOS never asks for the Removable or Network Volumes permission
   on Peekaboo's behalf) and stages the newest Peekaboo.app of this identifier above the running build that runs on this

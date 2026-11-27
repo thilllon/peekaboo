@@ -9,6 +9,8 @@ final class AppInstallTests: XCTestCase {
     private var directory: URL!
     private let adHoc = CodeSignature.updateRequirement(teamIdentifier: nil)!
     private static let quarantine = "com.apple.quarantine"
+    /// A uid other than this process's: the account logged in next to this one.
+    private static let anotherUser: uid_t = getuid() == 501 ? 502 : 501
 
     override func setUpWithError() throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("peekaboo-install-\(UUID().uuidString)")
@@ -465,15 +467,26 @@ final class AppInstallTests: XCTestCase {
         XCTAssertFalse(AppInstall.isOnReadOnlyVolume(app.path))
         XCTAssertTrue(hasQuarantine(executable))
 
-        let values = try mountPoint.resourceValues(forKeys: [.volumeIsReadOnlyKey, .volumeIsLocalKey])
-        let volume = AppInstall.Volume(url: mountPoint, isReadOnly: values.volumeIsReadOnly == true,
-                                       isLocal: values.volumeIsLocal == true)
+        // The image's entry in the mount table, as `mountedVolumes` reads it: read-only, local, and this user's, who
+        // attached it (`f_owner`; `st_uid` would show whoever looks). Attached with `-nobrowse`, it is not listed.
+        var entry = statfs()
+        XCTAssertEqual(statfs(mountPoint.path, &entry), 0)
+        let listed = AppInstall.Volume(entry)
+        XCTAssertEqual(listed.url.lastPathComponent, mountPoint.lastPathComponent)
+        XCTAssertTrue(listed.isReadOnly)
+        XCTAssertTrue(listed.isLocal)
+        XCTAssertEqual(listed.owner, getuid(), "a disk image this user attached is this user's")
+        XCTAssertFalse(AppInstall.mountedVolumes().contains { $0.url == listed.url }, "hidden")
+        // Under the scratch folder's name: the kernel's is /private/var/….
+        let volume = AppInstall.Volume(url: mountPoint, isReadOnly: listed.isReadOnly, isLocal: listed.isLocal, owner: listed.owner)
         // DiskArbitration tells a disk image from a drive: the startup disk is none.
         XCTAssertTrue(AppInstall.isDiskImage(mountPoint))
         XCTAssertFalse(AppInstall.isDiskImage(URL(fileURLWithPath: "/")))
         XCTAssertFalse(AppInstall.isDiskImage(directory), "a folder of the startup disk")
         XCTAssertEqual(AppInstall.diskImages(in: [volume], under: directory.path + "/"), [mountPoint],
                        "a Peekaboo disk image, as the system describes it")
+        XCTAssertEqual(AppInstall.diskImages(in: [volume], under: directory.path + "/", user: Self.anotherUser), [],
+                       "not another user's to eject")
         XCTAssertEqual(AppInstall.diskImages(in: [volume], under: directory.path + "/",
                                              keeping: [mountPoint.appendingPathComponent("Peekaboo.app/Contents/Info.plist")]), [],
                        "not while a file on it is shown")
@@ -488,13 +501,14 @@ final class AppInstallTests: XCTestCase {
     // MARK: Eject
 
     func testOnlyReadOnlyPeekabooImagesAreEjected() throws {
+        // Every volume here is this user's (another user's: `testOnlyTheImagesThisUserMountedAreEjected`).
         let root = directory.appendingPathComponent("Volumes", isDirectory: true)
         func volume(_ name: String, app: String? = "com.thilllon.Peekaboo", readOnly: Bool = true, local: Bool = true,
                     at folder: URL? = nil) throws -> AppInstall.Volume {
             let url = (folder ?? root).appendingPathComponent(name, isDirectory: true)
             try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
             if let app { try makeApp(url.appendingPathComponent("Peekaboo.app"), version: releaseVersion(26), identifier: app, sign: false) }
-            return AppInstall.Volume(url: url, isReadOnly: readOnly, isLocal: local)
+            return AppInstall.Volume(url: url, isReadOnly: readOnly, isLocal: local, owner: getuid())
         }
         let current = try volume("Peekaboo 20261126-85dff6")
         let older = try volume("Peekaboo 20261126-69a847")
@@ -528,9 +542,42 @@ final class AppInstallTests: XCTestCase {
         // By default only volumes under /Volumes count: never the system volume, nor one mounted elsewhere.
         asked = []
         XCTAssertEqual(AppInstall.diskImages(in: volumes, isDiskImage: isDiskImage), [])
-        XCTAssertEqual(AppInstall.diskImages(in: [AppInstall.Volume(url: URL(fileURLWithPath: "/"), isReadOnly: true, isLocal: true)],
-                                             isDiskImage: isDiskImage), [])
+        let startup = AppInstall.Volume(url: URL(fileURLWithPath: "/"), isReadOnly: true, isLocal: true, owner: 0)
+        XCTAssertEqual(AppInstall.diskImages(in: [startup], user: 0, isDiskImage: isDiskImage), [])
         XCTAssertEqual(asked, [])
+    }
+
+    func testOnlyTheImagesThisUserMountedAreEjected() throws {
+        // Two accounts logged in at once (#90): the copy one of them installed ejected the image the other had opened,
+        // and tried to unmount the one the other's Peekaboo ran from. Peekaboo images all, read-only, local, under the
+        // root; only who mounted them differs.
+        let root = directory.appendingPathComponent("Volumes", isDirectory: true)
+        func image(_ name: String, owner: uid_t) throws -> AppInstall.Volume {
+            let url = root.appendingPathComponent(name, isDirectory: true)
+            try makeApp(url.appendingPathComponent("Peekaboo.app"), version: releaseVersion(26), sign: false)
+            return AppInstall.Volume(url: url, isReadOnly: true, isLocal: true, owner: owner)
+        }
+        let me = getuid(), other = Self.anotherUser
+        let theirs = try image("Peekaboo 20261126-6c7b06", owner: other)
+        let mine = try image("Peekaboo 20261126-517cb0", owner: me)
+        let running = try image("Peekaboo 20261126-85dff6", owner: other)  // the other account's Peekaboo runs from it
+        let byRoot = try image("Peekaboo 20261126-69a847", owner: 0)  // attached by root (`sudo hdiutil attach`)
+        let volumes = [theirs, mine, running, byRoot]
+        var asked: [String] = []
+        let isDiskImage = { (url: URL) -> Bool in
+            asked.append(url.lastPathComponent)
+            return true
+        }
+        XCTAssertEqual(AppInstall.diskImages(in: volumes, under: root.path + "/", isDiskImage: isDiskImage), [mine.url],
+                       "this process's user's only")
+        XCTAssertEqual(asked, [mine.url.lastPathComponent], "another user's volume is not even asked about")
+        // The user is the one compared: the other account's copy would eject its own images, and only those.
+        XCTAssertEqual(AppInstall.diskImages(in: volumes, under: root.path + "/", user: other, isDiskImage: { _ in true }),
+                       [theirs.url, running.url])
+        XCTAssertEqual(AppInstall.diskImages(in: volumes, under: root.path + "/", user: 0, isDiskImage: { _ in true }), [byRoot.url])
+        XCTAssertEqual(AppInstall.diskImages(in: volumes, under: root.path + "/", keeping: [mine.url.appendingPathComponent("IMG_0001.HEIC")],
+                                             user: me, isDiskImage: { _ in true }),
+                       [], "this user's image holding a file shown stays as before")
     }
 
     // MARK: Processes
@@ -599,7 +646,12 @@ final class AppInstallTests: XCTestCase {
     }
 
     func testMountedVolumesListTheStartupDisk() {
-        // The listing reads the mount table only (no volume's files).
-        XCTAssertTrue(AppInstall.mountedVolumes().contains { $0.url.path == "/" && $0.isLocal })
+        // The listing reads the mount table only (no volume's files): the startup disk, mounted by the system (owner 0,
+        // whoever runs the test), and no hidden volume (devfs is mounted `nobrowse` at /dev).
+        let volumes = AppInstall.mountedVolumes()
+        let startup = volumes.first { $0.url.path == "/" }
+        XCTAssertEqual(startup?.isLocal, true)
+        XCTAssertEqual(startup?.owner, 0, "the system mounted it")
+        XCTAssertFalse(volumes.contains { $0.url.path == "/dev" }, "hidden")
     }
 }
