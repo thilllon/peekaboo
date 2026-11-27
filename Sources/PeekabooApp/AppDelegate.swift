@@ -165,10 +165,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     /// First launch only: macOS asks for Desktop, Documents and Downloads now, not in the middle of browsing.
     private func requestFolderAccess() {
         let started = Trace.now()
-        guard folderAccess.start(presentation: presentation, selfTest: selfTest != nil) else { return }
+        guard folderAccess.start(presentation: presentation, selfTest: selfTest != nil, finished: { [weak self] in
+            self?.folderAccessFinished()
+        }) else { return }
         let ms = Trace.ms(since: started)
         Trace.log(String(format: "folder access: first launch, listing %@ on a utility queue (main thread %.3f ms)",
                          FolderAccessRequest.folders.map(\.lastPathComponent).joined(separator: ", "), ms))
+    }
+
+    /// The first launch's folder prompts are answered (main thread). The last one leaves UserNotificationCenter in front
+    /// with no window, where a key pressed now (⌘O) would reach no app: take the front back, and with nothing opened
+    /// yet show the open panel (`FolderAccessRequest.afterListing`, #92). Interactive only, like the request itself.
+    func folderAccessFinished(frontmost: String? = NSWorkspace.shared.frontmostApplication?.bundleIdentifier) {
+        guard presentation == .interactive else { return }
+        let next = FolderAccessRequest.afterListing(frontmost: frontmost, ownIdentifier: Bundle.main.bundleIdentifier,
+                                                    openedSomething: openedSomething)
+        Trace.log("folder access: done; in front: \(frontmost ?? "none"); activate \(next.activate), open panel \(next.openPanel)")
+        if next.activate { activate() }
+        if next.openPanel { showOpenPanel() }
     }
 
     private func startUpdates() {
