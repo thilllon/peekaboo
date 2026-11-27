@@ -198,17 +198,17 @@ final class Installation {
 
 /// The installed copy, started by the copy that installed it (`--eject-disk-images=<pid>`): a second after launch, on a
 /// utility queue, it waits for that copy to quit, quits the older Peekaboo copies that still run from a Peekaboo disk
-/// image, ejects the images (`AppInstall.diskImages`: never one that holds a file this copy shows) and says so in one
-/// toast, naming the images it could not eject.
+/// image, ejects the images this user mounted (`AppInstall.diskImages`: never another user's, nor one that holds a file
+/// this copy shows) and says so in one toast, naming the images it could not eject.
 final class DiskImageEjector {
     /// Everything that touches the system (tests replace all of it).
     struct Hooks {
         /// Wait until the process has quit (false: it still runs).
         var waitForExit: (pid_t) -> Bool
-        /// The Peekaboo disk images, but those that hold one of `keeping` (the files this copy shows).
+        /// The Peekaboo disk images this user mounted, but those that hold one of `keeping` (the files this copy shows).
         var diskImages: (_ keeping: [URL]) -> [URL]
-        /// Quit the Peekaboo copies of this build or older that run from one of `images` (each keeps its image in
-        /// use), and wait a moment for them.
+        /// Quit the Peekaboo copies of this build or older that run from one of `images` in this session (each keeps its
+        /// image in use), and wait a moment for them.
         var quitCopies: (_ images: [URL]) -> Void
         var eject: (URL) throws -> Void
 
@@ -282,7 +282,8 @@ final class DiskImageEjector {
     }
 
     /// Quit the Peekaboo copies other than this one, of this build or older, that run from one of `images`, and wait
-    /// up to `timeout` for them to exit.
+    /// up to `timeout` for them to exit. `NSRunningApplication` lists this session's apps only: another account's copy
+    /// is never asked to quit.
     static func quitCopies(on images: [URL], timeout: TimeInterval) {
         let roots = images.map { $0.resolvingSymlinksInPath().path + "/" }
         let build = Int(BuildInfo.build ?? "") ?? 0

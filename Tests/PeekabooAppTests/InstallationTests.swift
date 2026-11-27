@@ -408,6 +408,49 @@ final class InstallationTests: ViewerTestCase {
         XCTAssertFalse(DiskImageEjector.isBusy(NSError(domain: NSOSStatusErrorDomain, code: -36)))
     }
 
+    func testTheEjectorLeavesTheImagesAnotherUserMounted() throws {
+        // Two accounts logged in at once (#90): the copy installed in one ejected the image the other had opened, tried
+        // to unmount the one the other's Peekaboo ran from, and its toast would have named both. The images here are the
+        // ones `AppInstall.diskImages` finds, for this process's user, among volumes faked as folders of the test's.
+        let volumes = root.appendingPathComponent("Volumes", isDirectory: true)
+        let other: uid_t = getuid() == 501 ? 502 : 501
+        func image(_ name: String, owner: uid_t) throws -> AppInstall.Volume {
+            let url = volumes.appendingPathComponent(name, isDirectory: true)
+            _ = try fakePeekabooApp(in: url, version: releaseVersion(26))
+            return AppInstall.Volume(url: url, isReadOnly: true, isLocal: true, owner: owner)
+        }
+        let theirs = [try image("Peekaboo 20261126-6c7b06", owner: other), try image("Peekaboo 20261126-85dff6", owner: other)]
+        let mine = try image("Peekaboo 20261126-517cb0", owner: getuid())
+        let lock = NSLock()
+        var quit: [[String]] = [], ejected: [String] = []
+        /// Run an ejector over `mounted`, every eject failing as an image in use (so that each one tried is named in the
+        /// toast); the images that stay.
+        func eject(_ mounted: [AppInstall.Volume]) -> [DiskImageEjector.Failure]? {
+            var result: [DiskImageEjector.Failure]?
+            DiskImageEjector(hooks: .init(waitForExit: { _ in true }, diskImages: { keeping in
+                AppInstall.diskImages(in: mounted, under: volumes.path + "/", keeping: keeping, isDiskImage: { _ in true })
+            }, quitCopies: { images in lock.withLock { quit.append(images.map(\.lastPathComponent)) } }, eject: { url in
+                lock.withLock { ejected.append(url.lastPathComponent) }
+                throw NSError(domain: NSOSStatusErrorDomain, code: -47)
+            }), retryDelay: 0).run(after: 4242, keeping: { [] }) { result = $0 }
+            XCTAssertTrue(spin(5) { result != nil })
+            return result
+        }
+
+        let failures = try XCTUnwrap(eject([theirs[0], mine, theirs[1]]))
+        XCTAssertEqual(lock.withLock { quit }, [[mine.url.lastPathComponent]], "only the copies that run from this user's image")
+        XCTAssertEqual(lock.withLock { ejected }, [mine.url.lastPathComponent, mine.url.lastPathComponent], "in use: tried twice")
+        let toast = DiskImageEjector.toast("Installed", failures: failures)
+        XCTAssertEqual(toast, "Installed\n“Peekaboo 20261126-517cb0” is in use: quit the app that uses it, then eject it in Finder")
+        for volume in theirs { XCTAssertFalse(toast.contains(volume.url.lastPathComponent), volume.url.lastPathComponent) }
+
+        // Only the other user's images mounted: nothing is quit or ejected, and the toast names none.
+        lock.withLock { (quit, ejected) = ([], []) }
+        XCTAssertEqual(eject(theirs), [])
+        XCTAssertEqual(lock.withLock { quit }, [])
+        XCTAssertEqual(lock.withLock { ejected }, [])
+    }
+
     func testTheInstalledCopySaysWhatItIsAndWhere() {
         let home = URL(fileURLWithPath: "/home/someone", isDirectory: true)
         let system = URL(fileURLWithPath: "/Applications/Peekaboo.app", isDirectory: true)

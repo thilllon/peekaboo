@@ -5,7 +5,7 @@ import Foundation
 /// Always one Peekaboo.app. A copy started from a disk image, or from the read-only path App Translocation runs a
 /// quarantined app from, cannot update itself, and every downloaded version left one more Peekaboo behind. Such a copy
 /// installs itself into Applications (`install`), opens its files in the installed copy and quits; the installed
-/// copy then ejects the Peekaboo disk images (`diskImages`).
+/// copy then ejects the Peekaboo disk images this user mounted (`diskImages`).
 ///
 /// A normal launch pays two C string comparisons on its executable's path (`needsInstalling(executable:)`), a copy kept
 /// on a writable drive under /Volumes one `statfs` more; everything else runs only for a copy that needs installing,
@@ -312,43 +312,65 @@ public enum AppInstall {
 
     // MARK: Eject
 
-    /// A mounted volume as the system lists it (nothing on it is read).
+    /// A mounted volume as the mount table lists it (nothing on it is read).
     public struct Volume: Equatable, Sendable {
         public var url: URL
         public var isReadOnly: Bool
         public var isLocal: Bool
+        /// The user who mounted it (`statfs`'s `f_owner`): the one who opened a disk image, 0 for the system's volumes.
+        /// `st_uid` cannot tell: a disk image is mounted with `MNT_IGNORE_OWNERSHIP`, where every file on it seems to
+        /// belong to whoever looks.
+        public var owner: uid_t
 
-        public init(url: URL, isReadOnly: Bool, isLocal: Bool) {
+        public init(url: URL, isReadOnly: Bool, isLocal: Bool, owner: uid_t) {
             self.url = url
             self.isReadOnly = isReadOnly
             self.isLocal = isLocal
+            self.owner = owner
+        }
+
+        /// The volume an entry of the mount table describes.
+        init(_ entry: statfs) {
+            let path = withUnsafeBytes(of: entry.f_mntonname) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+            self.init(url: URL(fileURLWithPath: path, isDirectory: true), isReadOnly: entry.f_flags & UInt32(MNT_RDONLY) != 0,
+                      isLocal: entry.f_flags & UInt32(MNT_LOCAL) != 0, owner: entry.f_owner)
         }
     }
 
-    /// The mounted volumes that are not hidden (a disk image attached with `-nobrowse` is).
+    /// The mounted volumes that are not hidden (`MNT_DONTBROWSE`: a disk image attached with `-nobrowse`, `/dev`,
+    /// `/System/Volumes/…`), from one copy of the mount table (`getmntinfo_r_np`) that waits for no file system, so a
+    /// network share that does not answer holds nothing up. 2.1–2.3 µs (M4 Pro, release build); the list read before,
+    /// `FileManager.mountedVolumeURLs` and two resource values, took 6.3–7.6 µs, and 2.5–19 ms on a first call.
     public static func mountedVolumes() -> [Volume] {
-        let keys: [URLResourceKey] = [.volumeIsReadOnlyKey, .volumeIsLocalKey]
-        let urls = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: keys, options: [.skipHiddenVolumes]) ?? []
-        return urls.map { url in
-            let values = try? url.resourceValues(forKeys: Set(keys))
-            return Volume(url: url, isReadOnly: values?.volumeIsReadOnly == true, isLocal: values?.volumeIsLocal == true)
+        var table: UnsafeMutablePointer<statfs>?
+        let count = getmntinfo_r_np(&table, MNT_NOWAIT)
+        defer { free(table) }
+        guard count > 0, table != nil else { return [] }
+        return UnsafeBufferPointer(start: table, count: Int(count)).compactMap { entry in
+            entry.f_flags & UInt32(MNT_DONTBROWSE) == 0 ? Volume(entry) : nil
         }
     }
 
-    /// The Peekaboo disk images among `volumes`: read-only local volumes mounted under `root`, holding none of the files
-    /// in `keeping` (the ones the installed copy shows), that are disk images indeed (`isDiskImage`), not a drive macOS
-    /// mounts read-only (NTFS, a locked card, a disc), with a Peekaboo.app of this bundle identifier at the top, as
-    /// every Peekaboo disk image has it. Only a volume that passes the first checks is asked about (DiskArbitration),
-    /// and only a disk image is read (one `Info.plist`): the first read of a card or a drive may have macOS ask the
-    /// user for the Removable Volumes permission on Peekaboo's behalf. The system volumes, writable drives and network
-    /// shares are neither asked about nor read.
+    /// The Peekaboo disk images among `volumes` that `user` mounted: read-only local volumes mounted under `root`,
+    /// holding none of the files in `keeping` (the ones the installed copy shows), that are disk images indeed
+    /// (`isDiskImage`), not a drive macOS mounts read-only (NTFS, a locked card, a disc), with a Peekaboo.app of this
+    /// bundle identifier at the top, as every Peekaboo disk image has it. Only a volume that passes the first checks is
+    /// asked about (DiskArbitration), and only a disk image is read (one `Info.plist`): the first read of a card or a
+    /// drive may have macOS ask the user for the Removable Volumes permission on Peekaboo's behalf. The system volumes,
+    /// writable drives, network shares and the volumes another user mounted are neither asked about nor read: with two
+    /// accounts logged in at once, the copy one of them installed must not eject the images the other opened (#90).
     public static func diskImages(in volumes: [Volume], under root: String = "/Volumes/", keeping: [URL] = [],
-                                  isDiskImage: (URL) -> Bool = isDiskImage) -> [URL] {
+                                  user: uid_t = getuid(), isDiskImage: (URL) -> Bool = isDiskImage) -> [URL] {
         let kept = keeping.map { $0.standardizedFileURL.path }
         return volumes.filter { volume in
             let path = volume.url.standardizedFileURL.path
-            return volume.isReadOnly && volume.isLocal && path.hasPrefix(root) && !kept.contains { $0.hasPrefix(path + "/") }
-                && isDiskImage(volume.url)
+            guard volume.isReadOnly, volume.isLocal, path.hasPrefix(root), !kept.contains(where: { $0.hasPrefix(path + "/") })
+            else { return false }
+            guard volume.owner == user else {
+                Trace.log("eject: \(path) was mounted by another user (uid \(volume.owner)): left")
+                return false
+            }
+            return isDiskImage(volume.url)
                 && peekabooBuild(volume.url.appendingPathComponent("Peekaboo.app", isDirectory: true)) != nil
         }.map(\.url)
     }

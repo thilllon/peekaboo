@@ -148,11 +148,14 @@ There is always one Peekaboo.app (`Sources/PeekabooCore/Update/AppInstall.swift`
 replace the Peekaboo there), verified like an update and without its quarantine flag, after quitting an older copy
 that runs there; a newer copy in either Applications folder is kept instead. It opens its files in the installed copy
 with `--eject-disk-images=<pid>` (and `--kept-newer` when it installed nothing) and quits; the installed copy quits
-the older copies that run from the disk images and ejects every read-only disk image with a Peekaboo.app of this
-bundle identifier at its top. Keep the disk image's layout (Peekaboo.app at the top of the volume) and those arguments
-stable: every released version relies on them. main.swift decides before any warm-up: a normal launch pays two C
-string comparisons on `argv[0]` for it, a copy on a writable drive under `/Volumes` one `statfs` more. To try it,
-open the app from a disk image of `mise run dmg`: it replaces `/Applications/Peekaboo.app`.
+the older copies that run from the disk images and ejects every read-only disk image this user mounted with a
+Peekaboo.app of this bundle identifier at its top. A disk image another account mounted is never ejected, nor installed
+from (below): `statfs`'s `f_owner` names the user who mounted a volume (`AppInstall.Volume.owner`), while `st_uid`
+cannot tell, as disk images are mounted with `MNT_IGNORE_OWNERSHIP` (#90). Keep the disk image's layout (Peekaboo.app
+at the top of the volume) and those arguments stable: every released version relies on them. main.swift decides before
+any warm-up: a normal launch pays two C string comparisons on `argv[0]` for it, a copy on a writable drive under
+`/Volumes` one `statfs` more. To try it, open the app from a disk image of `mise run dmg`: it replaces
+`/Applications/Peekaboo.app`.
 
 A freshly downloaded copy never gets that far while another Peekaboo runs: it is quarantined and was never opened, so
 Finder hands its launch to Gatekeeper (CoreServicesUIAgent), which only brings the running copy to the front

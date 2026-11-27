@@ -24,8 +24,8 @@ extension Updater: UpdateInstalling {}
 /// never opened, so Finder hands its launch to Gatekeeper's first-launch path (CoreServicesUIAgent), which brings the
 /// running Peekaboo to the front instead of starting the new one (`SETFRONT`): the new copy never runs, so this one acts.
 ///
-/// When a disk image under /Volumes with a newer Peekaboo.app at its top is mounted (or is mounted already a few seconds
-/// after launch), a utility queue stages that copy like a downloaded update: next to the updater's downloads,
+/// When the user mounts a disk image under /Volumes with a newer Peekaboo.app at its top (or has it mounted already a few
+/// seconds after launch), a utility queue stages that copy like a downloaded update: next to the updater's downloads,
 /// without its quarantine flag, verified against the running app's Developer ID requirement (`AppInstall.stage`). The
 /// next time the app comes to the front, which is what that double-click does, the update installer replaces this bundle
 /// with the staged copy and relaunches it on the photo shown, with `--eject-disk-images=<installer pid>`: the relaunched
@@ -83,6 +83,9 @@ final class DiskImageUpdate {
     private let cache: URL?
     /// Disk images are mounted under it.
     private let volumesRoot: String
+    /// Only the disk images this user mounted count (`AppInstall.Volume.owner`): with two accounts logged in at once, a
+    /// copy is never staged from an image the other one opened (#90).
+    let user: uid_t
     private let hooks: Hooks
     private weak var updates: UpdateInstalling?
     /// The volumes mounted at launch are looked at this long after `start`.
@@ -138,12 +141,14 @@ final class DiskImageUpdate {
     private var newest: AppVersion?
 
     init(app: URL, current: AppVersion, cache: URL?, updates: UpdateInstalling?, volumesRoot: String = "/Volumes/",
-         scanDelay: TimeInterval = 2, activationDelay: TimeInterval = 0.25, settleDelay: TimeInterval = 2.5, hooks: Hooks) {
+         user: uid_t = getuid(), scanDelay: TimeInterval = 2, activationDelay: TimeInterval = 0.25,
+         settleDelay: TimeInterval = 2.5, hooks: Hooks) {
         self.app = app
         self.current = current
         self.cache = cache
         self.updates = updates
         self.volumesRoot = volumesRoot
+        self.user = user
         self.scanDelay = scanDelay
         self.activationDelay = activationDelay
         self.settleDelay = settleDelay
@@ -256,17 +261,22 @@ final class DiskImageUpdate {
         return prepared == true
     }
 
-    /// The Peekaboo.app at the top of each disk image (a read-only local volume under `volumesRoot`) not looked at yet,
-    /// if it is newer than this build and than the one staged, and runs on this macOS: newest first. Only a disk image
-    /// is read (one `Info.plist`): never a locked card, a read-only drive or a network share, whose first read may have
-    /// macOS ask the user for the Removable or Network Volumes permission. A Peekaboo.app that is a symbolic link is
+    /// The Peekaboo.app at the top of each disk image this user mounted (a read-only local volume under `volumesRoot`)
+    /// not looked at yet, if it is newer than this build and than the one staged, and runs on this macOS: newest first.
+    /// Only a disk image is read (one `Info.plist`): never a locked card, a read-only drive or a network share, whose
+    /// first read may have macOS ask the user for the Removable or Network Volumes permission. A volume another user
+    /// mounted is neither asked about nor read, nor counted as looked at (that user's unmount may never be posted here,
+    /// and an image of this user's mounted at its place later must count). A Peekaboo.app that is a symbolic link is
     /// left: it could point anywhere, a folder of the user's or a copy someone else may change later.
     private func newerCopies() -> [(app: URL, version: AppVersion)] {
         hooks.volumes().compactMap { volume -> (app: URL, version: AppVersion)? in
             let path = volume.url.standardizedFileURL.path
-            guard volume.isReadOnly, volume.isLocal, path.hasPrefix(volumesRoot), inspected.insert(path).inserted,
-                  hooks.isDiskImage(volume.url)
-            else { return nil }
+            guard volume.isReadOnly, volume.isLocal, path.hasPrefix(volumesRoot) else { return nil }
+            guard volume.owner == user else {
+                Trace.log("disk image: \(path) was mounted by another user (uid \(volume.owner)): left")
+                return nil
+            }
+            guard inspected.insert(path).inserted, hooks.isDiskImage(volume.url) else { return nil }
             let copy = volume.url.appendingPathComponent("Peekaboo.app", isDirectory: true)
             guard !AppInstall.isSymbolicLink(copy) else {
                 Trace.log("disk image: \(copy.path) is a symbolic link: left")

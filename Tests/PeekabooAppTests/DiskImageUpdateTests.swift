@@ -13,6 +13,7 @@ final class DiskImageUpdateTests: ViewerTestCase {
         private let lock = NSLock()
         private var mounted: [AppInstall.Volume] = []
         private var plainVolumes: Set<String> = []
+        private var askedVolumes: [String] = []
         private var stageCalls: [AppVersion] = []
         private var failingVersions: Set<AppVersion> = []
         private var stageGate: DispatchSemaphore?
@@ -34,6 +35,8 @@ final class DiskImageUpdateTests: ViewerTestCase {
             get { lock.withLock { plainVolumes } }
             set { lock.withLock { plainVolumes = newValue } }
         }
+        /// Names of the volumes DiskArbitration was asked about, in order.
+        var asked: [String] { lock.withLock { askedVolumes } }
         /// Versions staging was asked for, in order.
         var staged: [AppVersion] { lock.withLock { stageCalls } }
         /// Versions whose copy fails its checks.
@@ -60,6 +63,7 @@ final class DiskImageUpdateTests: ViewerTestCase {
                 return volumes
             }, isDiskImage: { [unowned self] url in
                 XCTAssertFalse(Thread.isMainThread)
+                lock.withLock { askedVolumes.append(url.lastPathComponent) }
                 return !notDiskImages.contains(url.standardizedFileURL.path)
             }, stage: { [unowned self] app, version, root in
                 XCTAssertFalse(Thread.isMainThread, "staging runs off the main thread")
@@ -140,12 +144,15 @@ final class DiskImageUpdateTests: ViewerTestCase {
         super.tearDown()
     }
 
-    private func makeUpdate(system: System? = nil, updater: FakeUpdater? = nil, scanDelay: TimeInterval = 60,
-                            activationDelay: TimeInterval = 0) -> DiskImageUpdate {
+    private func makeUpdate(system: System? = nil, updater: FakeUpdater? = nil, user: uid_t = getuid(),
+                            scanDelay: TimeInterval = 60, activationDelay: TimeInterval = 0) -> DiskImageUpdate {
         DiskImageUpdate(app: running, current: releaseVersion(25), cache: cache, updates: updater ?? self.updater,
-                        volumesRoot: root.path + "/Volumes/", scanDelay: scanDelay, activationDelay: activationDelay,
+                        volumesRoot: root.path + "/Volumes/", user: user, scanDelay: scanDelay, activationDelay: activationDelay,
                         settleDelay: 0, hooks: (system ?? self.system).hooks())
     }
+
+    /// A uid other than this process's: the account logged in next to this one.
+    private static let anotherUser: uid_t = getuid() == 501 ? 502 : 501
 
     /// The staged copy of `version`.
     private func staged(_ version: AppVersion) -> URL {
@@ -154,13 +161,13 @@ final class DiskImageUpdateTests: ViewerTestCase {
 
     /// A volume of the test's with a Peekaboo.app of `version` at its top (nil: none; another bundle identifier with
     /// `identifier`, the macOS it needs with `minimumSystemVersion`; with `linked`, the Peekaboo.app on the volume is a
-    /// symbolic link to that bundle, kept outside the volume), mounted in `system` from now on: a disk image unless
-    /// `diskImage` is false; `post` sends the mount notification.
+    /// symbolic link to that bundle, kept outside the volume), mounted in `system` from now on by `owner` (this process's
+    /// user by default): a disk image unless `diskImage` is false; `post` sends the mount notification.
     @discardableResult
     private func mount(_ name: String, _ version: AppVersion?, identifier: String = CodeSignature.bundleIdentifier,
                        minimumSystemVersion: String? = nil, linked: Bool = false, readOnly: Bool = true, local: Bool = true,
-                       diskImage: Bool = true, under parent: String = "Volumes", in system: System? = nil,
-                       post: Bool = true) throws -> AppInstall.Volume {
+                       diskImage: Bool = true, owner: uid_t = getuid(), under parent: String = "Volumes",
+                       in system: System? = nil, post: Bool = true) throws -> AppInstall.Volume {
         let system = system ?? self.system!
         let url = root.appendingPathComponent("\(parent)/\(name)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -177,7 +184,7 @@ final class DiskImageUpdateTests: ViewerTestCase {
             }
         }
         if !diskImage { system.notDiskImages.insert(url.standardizedFileURL.path) }
-        let volume = AppInstall.Volume(url: url, isReadOnly: readOnly, isLocal: local)
+        let volume = AppInstall.Volume(url: url, isReadOnly: readOnly, isLocal: local, owner: owner)
         system.volumes.append(volume)
         if post { notify(NSWorkspace.didMountNotification, url, in: system) }
         return volume
@@ -233,6 +240,7 @@ final class DiskImageUpdateTests: ViewerTestCase {
         let found = try XCTUnwrap(update(bundle: bundle))  // never started: nothing is registered
         XCTAssertEqual(found.app, running)
         XCTAssertEqual(found.current, releaseVersion(25))
+        XCTAssertEqual(found.user, getuid(), "only the disk images this user mounts count")
         XCTAssertNil(update(.headless, bundle: bundle), "tests")
         XCTAssertNil(update(selfTest: true, bundle: bundle))
         XCTAssertNil(update(installing: true, bundle: bundle), "a copy that installs itself")
@@ -292,6 +300,43 @@ final class DiskImageUpdateTests: ViewerTestCase {
         try mount("Peekaboo 27", releaseVersion(29))
         XCTAssertTrue(spin(5) { update.pending?.version == releaseVersion(29) }, "the volume mounted there again was not read")
         XCTAssertEqual(system.staged, [releaseVersion(26), releaseVersion(28), releaseVersion(27), releaseVersion(29)])
+    }
+
+    func testADiskImageAnotherUserMountedIsNeverStagedFrom() throws {
+        // Two accounts logged in at once (#90): a newer Peekaboo on a disk image the other account opened is not this
+        // user's to install. Such a volume is neither asked about (DiskArbitration) nor read.
+        let other = Self.anotherUser
+        let update = makeUpdate()
+        watch(update)
+        try mount("Peekaboo 27", releaseVersion(27), owner: other, post: false)
+        try mount("Peekaboo 28", releaseVersion(28), owner: 0)  // attached by root (`sudo hdiutil attach`)
+        XCTAssertTrue(spin(5) { update.looking == 0 })
+        XCTAssertEqual(system.asked, [])
+        XCTAssertEqual(system.staged, [])
+        XCTAssertNil(update.pending)
+
+        // This user's image is staged as before; the others' are still left.
+        try mount("Peekaboo 26", releaseVersion(26))
+        XCTAssertTrue(spin(5) { update.pending?.version == releaseVersion(26) && update.looking == 0 })
+        XCTAssertEqual(system.asked, ["Peekaboo 26"])
+        XCTAssertEqual(system.staged, [releaseVersion(26)])
+
+        // The other account ejects its image (that unmount need not be posted here) and this user opens one at the same
+        // place: never counted as looked at, the place is looked at now.
+        system.volumes.removeAll { $0.owner == other }
+        try mount("Peekaboo 27", releaseVersion(27))
+        XCTAssertTrue(spin(5) { update.pending?.version == releaseVersion(27) }, "this user's image was taken for the other's")
+        XCTAssertEqual(system.staged, [releaseVersion(26), releaseVersion(27)])
+
+        // The user given is the one compared: the other account's copy stages from its own images only.
+        let theirs = System()
+        let theirUpdate = makeUpdate(system: theirs, user: other)
+        watch(theirUpdate)
+        try mount("Peekaboo 29", releaseVersion(29), in: theirs, post: false)  // this process's user's
+        try mount("Peekaboo 28", releaseVersion(28), owner: other, in: theirs)
+        XCTAssertTrue(spin(5) { theirUpdate.pending?.version == releaseVersion(28) && theirUpdate.looking == 0 })
+        XCTAssertEqual(theirs.asked, ["Peekaboo 28"])
+        XCTAssertEqual(theirs.staged, [releaseVersion(28)])
     }
 
     func testTheStartupScanStagesACopyMountedBeforeAndClearsStaleOnes() throws {
