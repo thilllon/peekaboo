@@ -321,6 +321,22 @@ final class PipelineTests: PipelineTestCase {
         XCTAssertEqual(pipeline.currentFile?.url, files[2].url)
     }
 
+    /// Folders that share their names (camera folders opened together): every file is found at its own place, by name
+    /// or, for a name that repeats, by URL; a URL listed twice is found at its first place.
+    func testEveryFileOfFoldersSharingTheirNamesIsFoundAtItsPlace() {
+        let pipeline = makePipeline(FakeDecoder())
+        let files = (0..<3).flatMap { folder in
+            (0..<50).map { i in
+                let name = String(format: "IMG_%04d.jpg", i)
+                return ImageFile(url: URL(fileURLWithPath: "/peekaboo-test/\(folder)/\(name)"), name: name, byteSize: 1000,
+                                 modified: 1, fileID: UInt64(folder * 100 + i + 1))
+            }
+        }
+        pipeline.setFiles(files + [files[120]], index: 0)
+        for (i, file) in files.enumerated() { XCTAssertEqual(pipeline.index(of: file.url), i, file.url.path) }
+        XCTAssertNil(pipeline.index(of: URL(fileURLWithPath: "/peekaboo-test/3/IMG_0000.jpg")))
+    }
+
     func testOpenedFileSurvivesFolderListing() {
         let decoder = FakeDecoder(latencyMs: [.preview: 5, .screen: 80, .full: 100])
         let pipeline = makePipeline(decoder)

@@ -98,8 +98,8 @@ Settings › Updates or under [`[updates]`](docs/CONFIG.md#updates).
 
 ## Usage
 
-Open an image from Finder (Open With → Peekaboo), drop files or a folder on the window or Dock icon, or press ⌘O.
-Opening one image browses its whole folder.
+Open an image from Finder (Open With → Peekaboo), drop files or folders on the window or Dock icon, or press ⌘O.
+Opening one image browses its whole folder; several folders browse one after another, as one set.
 
 | Keys | Action |
 |---|---|

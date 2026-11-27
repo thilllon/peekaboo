@@ -56,7 +56,8 @@ struct FileTags: Equatable {
 /// One viewer window: owns the renderer, the pipeline and the browsing state, turns key
 /// presses, gestures and menu items into actions, and draws the HUD above the image.
 final class ViewerWindowController: NSWindowController, NSWindowDelegate, ViewerViewDelegate {
-    private enum BrowseSource { case none, folder(URL), files }
+    /// One folder (the opened folder, or an opened file's), or a set opened from several URLs (#91).
+    private enum BrowseSource { case none, folder(URL), set(BrowseSet) }
 
     private let rootView: ViewerRootView
     private let viewerView: ViewerView
@@ -345,7 +346,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
 
     // MARK: Opening
 
-    /// Show `urls`: one file browses its folder, a folder browses its images, several files browse that set.
+    /// Show `urls`: one file browses its folder, a folder browses its images, several URLs browse the images of every
+    /// folder and file among them (`openSet`).
     func open(_ urls: [URL]) {
         guard let first = urls.first else { return }
         wakeFromClosed()
@@ -361,6 +363,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         refusedListing = nil
         forgetPicks(replacingFiles: true)
         listingPending = true
+        if urls.count > 1 { return openSet(urls, generation: generation, opened: opened) }
         // First pixel first: decode the opened file before listing its folder, and submit that decode before the
         // window is ordered in and flushed (window-server work it can overlap). Decide "file or folder" from the URL
         // alone (no file-system access on the main thread). A file of a type the folder listing skips (an SVG, a
@@ -371,7 +374,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             beginNavigation()
             replaceFiles([Self.placeholder(for: first)], index: 0)
         } else {
-            browseSource = urls.count == 1 ? .folder(first) : .files
+            browseSource = .folder(first)
         }
         let folder = currentFolder
         showWindow(nil)
@@ -516,9 +519,11 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         return statfs(path, &volume) == 0 && volume.f_flags & UInt32(MNT_LOCAL) == 0
     }
 
-    /// Index of `url` in the browsing set (`browsingSet`) when it is a listed file of the folder being browsed.
+    /// Index of `url` in the browsing set (`browsingSet`) when it is a listed file of the folder (or set) being browsed.
     private func indexInBrowsingSet(_ url: URL) -> Int? {
-        guard !listingPending, isInBrowsedFolder(url) else { return nil }
+        guard !listingPending else { return nil }
+        if case .set(let set) = browseSource { return set.index(of: url, in: browsingSet) }
+        guard isInBrowsedFolder(url) else { return nil }
         let name = url.lastPathComponent
         return browsingSet.firstIndex { $0.name == name }
     }
@@ -589,6 +594,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         renderFrame()
         if let folder {
             hud.setMessage(refusedListing ?? "No images in “\(folder.lastPathComponent)”\nDrop images here or press ⌘O")
+        } else if case .set(let set) = browseSource, !set.folders.isEmpty {
+            hud.setMessage(setRefusal ?? Self.noImages(in: set))
         } else {
             hud.setMessage("Drop images or a folder here\nor press ⌘O to open")
         }
@@ -895,7 +902,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
             // Shown once the folder's first tag read has landed: before, it would count only the picks seen so far.
             if picksKnown, !picks.isEmpty { counter = "Picks \(picks.count)" }
         }
-        var parts = [file.name, position]
+        let name = displayName(of: file)
+        var parts = [name, position]
         if let counter { parts.append(counter) }
         let info = pipeline.info(for: file)
         let onScreen = isShowing(file) ? renderer.image : nil
@@ -910,7 +918,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         var content = HUDContent(line: parts.joined(separator: "  ·  "))
         if hud.mode == .full { content.details = detailRows(file, info, onScreen) }
         hud.setContent(content)
-        setTitle("\(file.name) — \(position)")
+        setTitle("\(name) — \(position)")
     }
 
     /// The title is hidden (Window menu and Mission Control only) and costs ~0.5 ms to set, so it
@@ -1053,7 +1061,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         Trace.log(String(format: "picks: %d of %d files (%d read in %.1f ms)", picks.count, read.listing.count, read.read,
                          ms))
         if picksOnly, picks.isEmpty {
-            leavePicksOnly(toast: "No picks in this folder")
+            leavePicksOnly(toast: spansFolders ? "No picks in these folders" : "No picks in this folder")
             return
         }
         guard picks.urls != before || !wasKnown else { return }
@@ -1083,7 +1091,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         }
         guard let current = pipeline.currentFile else { return }
         guard !listingPending else {
-            hud.showToast("Still listing the folder")
+            hud.showToast(spansFolders ? "Still listing the folders" : "Still listing the folder")
             return
         }
         guard !picks.isEmpty || !picksKnown else {
@@ -1195,7 +1203,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         }
         guard let file = pipeline.currentFile else { return }
         guard !listingPending, picksKnown else {
-            hud.showToast("Still reading the folder's tags: try again in a moment")
+            hud.showToast("Still reading the \(spansFolders ? "folders'" : "folder's") tags: try again in a moment")
             return
         }
         let context = FileActionContext(file: file, index: pipeline.index, count: pipeline.files.count, window: window)
@@ -1555,8 +1563,12 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         var files = browsingSet
         listingEpoch &+= 1
         if !files.contains(file) {
-            files.append(file)
-            files = NaturalSort.sort(files, by: \.name)
+            if case .set(let set) = browseSource, let i = set.insertionIndex(for: file, in: files) {
+                files.insert(file, at: i)  // among its folder's files, or at its own place in the set
+            } else {
+                files.append(file)
+                files = NaturalSort.sort(files, by: \.name)
+            }
         }
         hud.setMessage(nil)
         beginNavigation()
@@ -1587,9 +1599,9 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         return url.deletingLastPathComponent().standardizedFileURL.path == folder.standardizedFileURL.path
     }
 
-    /// `file` belongs to what is browsed: a file of its folder, or any file of an explicitly opened set.
+    /// `file` belongs to what is browsed: a file of its folder, or of a folder or file of the set opened.
     private func isInBrowsingSet(_ file: ImageFile) -> Bool {
-        if case .files = browseSource { return true }
+        if case .set(let set) = browseSource { return set.item(of: file.url) != nil }
         return isInBrowsedFolder(file.url)
     }
 
@@ -1597,7 +1609,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private func isBrowsed(_ file: ImageFile) -> Bool {
         switch browseSource {
         case .folder: return isInBrowsedFolder(file.url)
-        case .files: return browsingSet.contains(file)
+        case .set(let set): return set.item(of: file.url) != nil
         case .none: return false
         }
     }
@@ -1968,6 +1980,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         scheduleIdleCheck()
         // Back from System Settings, where the folder may have been allowed: list it again (off the main thread).
         if refusedListing != nil { rescanFolder() }
+        if case .set(let set) = browseSource, !set.refused.isEmpty { rescanSet(set.refused) }
     }
 
     func windowDidChangeScreen(_ notification: Notification) {
@@ -1990,8 +2003,10 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     private func watchFolder() {
         guard case .folder(let folder) = browseSource else {
             folderWatcher = nil
+            watchFolders()  // a set of several: each of its folders
             return
         }
+        folderWatchers = [:]
         if folderWatcher?.directory == folder { return }
         folderWatcher = FolderWatcher(directory: folder) { [weak self] in self?.rescanFolder() }
         if folderWatcher == nil { Trace.log("cannot watch \(folder.lastPathComponent)") }
@@ -2000,6 +2015,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
     /// Re-list the browsed folder off the main thread and apply additions, removals and changed
     /// versions, keeping the current file (a `FolderWatcher` callback can call this directly).
     func rescanFolder() {
+        if case .set = browseSource { return rescanSet() }
         guard case .folder(let folder) = browseSource, !listingPending else { return }
         guard !rescanInFlight else {
             rescanQueued = true
@@ -2025,11 +2041,13 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         }
     }
 
-    private func applyRescan(_ listed: [ImageFile], of folder: URL) {
+    /// `listed`: the folder's new listing, or the whole new set of a set of several (`folder` nil: `applySetRescan`
+    /// compared it already, folder by folder).
+    private func applyRescan(_ listed: [ImageFile], of folder: URL?) {
         // A folder that was refused lists now (allowed in System Settings, its permissions changed): browse it, and
         // watch it, which needed the same access.
         let allowed = refusedListing != nil
-        if allowed {
+        if allowed, let folder {
             refusedListing = nil
             watchFolder()
             Trace.log("folder readable now: \(folder.lastPathComponent)")
@@ -2044,7 +2062,7 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         }
         let fingerprint = { (list: [ImageFile]) in list.map { $0.url.path + "|" + $0.version } }
         if picksOnly { mergeViewIntoAllFiles() }
-        guard allowed || fingerprint(files) != fingerprint(browsingSet) else { return }
+        guard allowed || folder == nil || fingerprint(files) != fingerprint(browsingSet) else { return }
         if files.isEmpty {
             showEmpty(folder)
             return
@@ -2087,6 +2105,208 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate, Viewer
         // New files (a rename gives a file a new name) may carry tags: read them.
         readPicks()
         Trace.log("folder rescanned: \(files.count) files")
+    }
+
+    // MARK: Several folders and files (#91)
+
+    /// The folders of a set of several, each watched on its own, by item.
+    private var folderWatchers: [Int: FolderWatcher] = [:]
+    /// Folders of the set to list again: their watcher fired, they were refused, a file of the set was opened.
+    private var setRescans: Set<Int> = []
+    /// `listingEpoch` when the set began to show: a file action since then changed what the listing in flight hands
+    /// over (a file moved away would come back), which then lists again.
+    private var setListingEpoch = 0
+    /// The set's first image (or the file opened first) is on screen: the whole listing keeps it there.
+    private var setShown = false
+    /// What a folder of the set Peekaboo may not read says, and how to allow it: a toast when the set lists, the message
+    /// of a set left without images.
+    private var setRefusal: String?
+    /// A vnode watcher holds a descriptor: a set of more folders watches the first ones (the others list again when a
+    /// file of the set is opened).
+    static let maximumWatchedFolders = 64
+
+    /// Several URLs: the images of every folder and file among them, item after item (`BrowseSet`). First pixel first:
+    /// an image file opened first decodes before anything is listed; a folder opened first is listed first, and its
+    /// first image decodes while the rest is listed. Off the main thread, except at launch the first folder, in this
+    /// turn as one folder is.
+    private func openSet(_ urls: [URL], generation: Int, opened: UInt64) {
+        browseSource = .set(BrowseSet(unlisted: urls))
+        folderWatcher = nil
+        folderWatchers = [:]
+        setRescans = []
+        setRefusal = nil
+        let first = urls[0]
+        setShown = !first.hasDirectoryPath && FolderScanner.isSupported(first)
+        if setShown {
+            beginNavigation()
+            replaceFiles([Self.placeholder(for: first)], index: 0)
+        }
+        setListingEpoch = listingEpoch
+        showWindow(nil)
+        makeKeyAndOrderFront()
+        hud.setMessage(nil)
+        let synchronous = presentsSynchronously
+        if synchronous { CATransaction.flush() }
+        var lister = BrowseSet.Lister(urls)
+        let fileFirst = setShown
+        if fileFirst {
+            presentCurrent()
+            if synchronous { presentFirstFrameNow() }
+        } else if synchronous, let images = lister.firstImages() {
+            showFirstImages(images, opened: opened)
+            presentFirstFrameNow()
+        }
+        updateHUD()
+        listSet(lister, urls: urls, firstImages: !fileFirst && !synchronous, generation: generation, opened: opened)
+    }
+
+    /// List the set off the main thread: its first folder as soon as it is listed (`firstImages`), then all of it.
+    private func listSet(_ lister: BrowseSet.Lister, urls: [URL], firstImages: Bool, generation: Int, opened: UInt64) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var lister = lister
+            if firstImages, let images = lister.firstImages() {
+                DispatchQueue.main.async {
+                    guard let self, generation == self.openGeneration, self.listingPending else { return }
+                    self.showFirstImages(images, opened: opened)
+                }
+            }
+            let listing = lister.finish()
+            // Built here, with the listing: naming a volume's switch asks the volume for its type.
+            let refusal = listing.failures.lazy.compactMap { Self.accessDeniedToast($0.error, folder: $0.folder) }.first
+            DispatchQueue.main.async {
+                guard let self, generation == self.openGeneration else { return }
+                self.applySetListing(listing, refusal: refusal, urls: urls, generation: generation, opened: opened)
+            }
+        }
+    }
+
+    /// The first folder of the set is listed: its first image decodes now, while the rest is listed.
+    private func showFirstImages(_ images: [ImageFile], opened: UInt64) {
+        beginNavigation()
+        replaceFiles(images, index: 0)
+        setShown = true
+        setListingEpoch = listingEpoch
+        presentCurrent()
+        updateHUD()
+        Trace.log(String(format: "first folder listed: %d files, %.1f ms after open", images.count, Trace.ms(since: opened)))
+    }
+
+    /// The whole set is listed: browse it, on the image on screen if the set showed one already. A folder Peekaboo may
+    /// not read says so in a toast; a set left without images says it in its message, as one folder does.
+    private func applySetListing(_ listing: BrowseSet.Listing, refusal: String?, urls: [URL], generation: Int,
+                                 opened: UInt64) {
+        guard setListingEpoch == listingEpoch else {
+            setListingEpoch = listingEpoch
+            return listSet(BrowseSet.Lister(urls), urls: urls, firstImages: false, generation: generation, opened: opened)
+        }
+        let started = Trace.now()
+        browseSource = .set(listing.set)
+        setRefusal = refusal
+        let shown = setShown ? pipeline.currentFile : nil
+        let index = shown.flatMap { listing.set.index(of: $0.url, in: listing.files) } ?? 0
+        applyListing((.success((listing.files, index)), nil), urls: urls, singleFile: false, opened: opened)
+        if let refusal, !listing.files.isEmpty { hud.showToast(refusal, seconds: Self.accessDeniedToastSeconds) }
+        Trace.log(String(format: "set listed: %d items, %d files, main thread %.2f ms", listing.set.items.count,
+                         listing.files.count, Trace.ms(since: started)))
+    }
+
+    /// The set spans several folders: the HUD names the folder of the image on screen.
+    private var spansFolders: Bool {
+        if case .set(let set) = browseSource { return set.spansFolders }
+        return false
+    }
+
+    /// The name of `file`, after its folder's when the set spans several folders (`Trip › IMG_0042.jpg`).
+    private func displayName(of file: ImageFile) -> String {
+        spansFolders ? BrowseSet.folderName(of: file.url) + " › " + file.name : file.name
+    }
+
+    /// The message of a set of several without images.
+    private static func noImages(in set: BrowseSet) -> String {
+        let folders = set.folders
+        let place = folders.count == 1 ? "“\(folders[0].url.lastPathComponent)”" : "these \(folders.count) folders"
+        return "No images in \(place)\nDrop images here or press ⌘O"
+    }
+
+    /// Watch each folder of the set that lists (the first `maximumWatchedFolders`): a change lists that folder again.
+    private func watchFolders() {
+        guard case .set(let set) = browseSource else {
+            folderWatchers = [:]
+            return
+        }
+        for (k, url) in set.folders where folderWatchers[k] == nil && !set.refused.contains(k) {
+            guard folderWatchers.count < Self.maximumWatchedFolders else {
+                Trace.log("watching \(Self.maximumWatchedFolders) of \(set.folders.count) folders")
+                return
+            }
+            folderWatchers[k] = FolderWatcher(directory: url) { [weak self] in self?.rescanSet([k]) }
+            if folderWatchers[k] == nil { Trace.log("cannot watch \(url.lastPathComponent)") }
+        }
+    }
+
+    /// List folders of the set again off the main thread (by item; all of them by default), one batch at a time, and
+    /// merge what changed into the set (`applySetRescan`).
+    private func rescanSet(_ folders: [Int]? = nil) {
+        guard case .set(let set) = browseSource, !listingPending else { return }
+        setRescans.formUnion(folders ?? set.folders.map(\.item))
+        guard !rescanInFlight else {
+            rescanQueued = true
+            return
+        }
+        guard !setRescans.isEmpty else { return }
+        let batch = setRescans.sorted()
+        setRescans.removeAll()
+        rescanInFlight = true
+        let generation = openGeneration
+        let epoch = listingEpoch
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let listed = batch.map { (item: $0, result: set.list($0)) }
+            let refusal = listed.lazy.compactMap { entry -> String? in
+                guard case .failure(let error) = entry.result else { return nil }
+                return Self.accessDeniedToast(error, folder: set.items[entry.item].url)
+            }.first
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.rescanInFlight = false
+                let session = generation == self.openGeneration && !self.listingPending
+                if session, epoch == self.listingEpoch {
+                    self.applySetRescan(listed, refusal: refusal)
+                } else if session {
+                    self.setRescans.formUnion(batch)  // a file action during the listing: list again
+                }
+                if self.rescanQueued || (session && epoch != self.listingEpoch) {
+                    self.rescanQueued = false
+                    if case .set = self.browseSource { self.rescanSet([]) } else { self.rescanFolder() }
+                }
+            }
+        }
+    }
+
+    /// New listings of some folders of the set: each replaces its folder's files where they changed (a folder that may
+    /// be read now joins, and is watched); the other folders keep theirs as they are.
+    private func applySetRescan(_ listed: [(item: Int, result: Result<[ImageFile], Error>)], refusal: String?) {
+        guard case .set(var set) = browseSource else { return }
+        // The picks-only view's newer stamps first: the folders not listed again keep them.
+        if picksOnly { mergeViewIntoAllFiles() }
+        var files = browsingSet
+        var changed = false
+        for (k, result) in listed.reversed() {
+            guard case .success(let listing) = result else { continue }  // still not readable: as it was
+            if let i = set.refused.firstIndex(of: k) {
+                set.refused.remove(at: i)
+                changed = true
+                Trace.log("folder readable now: \(set.items[k].url.lastPathComponent)")
+            }
+            let range = set.range(of: k, in: files)
+            guard !BrowseSet.sameFiles(files[range], listing) else { continue }
+            files.replaceSubrange(range, with: listing)
+            changed = true
+        }
+        guard changed else { return }
+        browseSource = .set(set)
+        setRefusal = set.refused.isEmpty ? nil : refusal ?? setRefusal
+        watchFolders()
+        applyRescan(files, of: nil)
     }
 
     // MARK: System events
